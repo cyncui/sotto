@@ -17,6 +17,8 @@
 //! - [`state`] - shared application state ([`state::AppState`])
 //! - [`error`] - server error type
 
+#![allow(clippy::double_must_use)]
+
 pub mod account;
 pub mod audit;
 pub mod auth;
@@ -26,10 +28,28 @@ pub mod cloud_coverage_reconciliation;
 pub mod cloud_coverage_store;
 pub mod cloud_provider;
 pub mod cloud_provider_refresh;
+#[doc(hidden)]
+pub mod cloud_provider_refresh_jobs;
+#[doc(hidden)]
+pub mod cloud_provider_refresh_worker;
 pub mod cloud_provider_stripe;
+#[doc(hidden)]
+pub mod cloud_provider_stripe_authority;
+#[doc(hidden)]
+pub mod cloud_provider_stripe_corrections;
+#[doc(hidden)]
+pub mod cloud_provider_stripe_coverage;
 // Dormant Stripe history transport; it remains unwired until the complete-history contract lands.
 #[doc(hidden)]
+pub mod cloud_provider_stripe_adapter;
+#[doc(hidden)]
 pub mod cloud_provider_stripe_http;
+#[doc(hidden)]
+pub mod cloud_provider_stripe_renewal_store;
+#[doc(hidden)]
+pub mod cloud_provider_stripe_renewals;
+#[doc(hidden)]
+pub mod cloud_provider_stripe_repair;
 pub mod community;
 pub mod config;
 pub mod db;

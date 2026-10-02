@@ -57,6 +57,9 @@ const ORGANISATION_DELETION_RETENTION_ENV: &str = "SOTTO_ORGANISATION_DELETION_R
 const ORGANISATION_DELETION_WORKER_ENV: &str = "SOTTO_ORGANISATION_DELETION_WORKER_ENABLED";
 const ORGANISATION_DELETION_METRICS_TOKEN_ENV: &str = "SOTTO_ORGANISATION_DELETION_METRICS_TOKEN";
 const ORGANISATION_DELETION_OPERATOR_TOKEN_ENV: &str = "SOTTO_ORGANISATION_DELETION_OPERATOR_TOKEN";
+const PROVIDER_REFRESH_INGEST_ENV: &str = "SOTTO_PROVIDER_REFRESH_INGEST_ENABLED";
+const PROVIDER_REFRESH_WORKER_ENV: &str = "SOTTO_PROVIDER_REFRESH_WORKER_ENABLED";
+const PROVIDER_REFRESH_RECONCILIATION_ENV: &str = "SOTTO_PROVIDER_REFRESH_RECONCILIATION_ENABLED";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -80,6 +83,12 @@ pub struct Config {
     pub organisation_deletion_metrics_token: Option<String>,
     /// Bearer token for the protected operator-observation endpoint.
     pub organisation_deletion_operator_token: Option<String>,
+    /// Whether verified provider changes may enqueue durable refresh work.
+    pub provider_refresh_ingest_enabled: bool,
+    /// Whether a runtime worker may claim and process durable refresh work.
+    pub provider_refresh_worker_enabled: bool,
+    /// Whether the periodic registered-source repair scan is enabled.
+    pub provider_refresh_reconciliation_enabled: bool,
 }
 
 /// Anonymous version-ping telemetry settings (see [`crate::telemetry`]).
@@ -204,6 +213,15 @@ impl Config {
             env_nonempty(ORGANISATION_DELETION_METRICS_TOKEN_ENV);
         let organisation_deletion_operator_token =
             env_nonempty(ORGANISATION_DELETION_OPERATOR_TOKEN_ENV);
+        let provider_refresh_ingest_enabled =
+            feature_flag_is_enabled(std::env::var(PROVIDER_REFRESH_INGEST_ENV).ok().as_deref());
+        let provider_refresh_worker_enabled =
+            feature_flag_is_enabled(std::env::var(PROVIDER_REFRESH_WORKER_ENV).ok().as_deref());
+        let provider_refresh_reconciliation_enabled = feature_flag_is_enabled(
+            std::env::var(PROVIDER_REFRESH_RECONCILIATION_ENV)
+                .ok()
+                .as_deref(),
+        );
 
         Ok(Self {
             database_url,
@@ -216,6 +234,9 @@ impl Config {
             organisation_deletion_worker_enabled,
             organisation_deletion_metrics_token,
             organisation_deletion_operator_token,
+            provider_refresh_ingest_enabled,
+            provider_refresh_worker_enabled,
+            provider_refresh_reconciliation_enabled,
         })
     }
 }
@@ -223,6 +244,12 @@ impl Config {
 /// Enable the destructive worker only for the exact opt-in value, so empty or unexpected values
 /// keep the staged lifecycle disabled until an operator has completed the enablement checklist.
 fn organisation_deletion_worker_is_enabled(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// Provider refresh switches are deliberately exact and independently opt-in. Empty, malformed,
+/// or whitespace-padded values leave the corresponding path disabled during rollout.
+fn feature_flag_is_enabled(value: Option<&str>) -> bool {
     value == Some("1")
 }
 
@@ -304,10 +331,10 @@ fn env_nonempty(name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        billing_return_url, organisation_deletion_retention_from_env_result,
-        organisation_deletion_worker_is_enabled, parse_organisation_deletion_retention_days,
-        telemetry_ping_enabled, DeploymentMode, DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
-        MAX_ORGANISATION_DELETION_RETENTION_DAYS,
+        billing_return_url, feature_flag_is_enabled,
+        organisation_deletion_retention_from_env_result, organisation_deletion_worker_is_enabled,
+        parse_organisation_deletion_retention_days, telemetry_ping_enabled, DeploymentMode,
+        DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS, MAX_ORGANISATION_DELETION_RETENTION_DAYS,
     };
 
     #[test]
@@ -426,5 +453,14 @@ mod tests {
         assert!(!organisation_deletion_worker_is_enabled(Some("true")));
         assert!(!organisation_deletion_worker_is_enabled(Some(" 1 ")));
         assert!(organisation_deletion_worker_is_enabled(Some("1")));
+    }
+
+    #[test]
+    fn provider_refresh_switches_require_independent_exact_opt_in() {
+        assert!(!feature_flag_is_enabled(None));
+        assert!(!feature_flag_is_enabled(Some("")));
+        assert!(!feature_flag_is_enabled(Some("true")));
+        assert!(!feature_flag_is_enabled(Some(" 1 ")));
+        assert!(feature_flag_is_enabled(Some("1")));
     }
 }

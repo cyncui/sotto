@@ -17,9 +17,14 @@ use crate::billing::STRIPE_API_VERSION;
 use crate::cloud_provider::ProviderEnvironment;
 use crate::cloud_provider_stripe::{
     decode_invoice_payment, validate_personal_invoice_observation, StripeAllocationBinding,
-    StripeContractError, StripeCoverageConfig, StripePersonalInvoiceFacts,
+    StripeContractError, StripeCoverageConfig, StripeInterval, StripePersonalInvoiceFacts,
     StripePersonalInvoiceObservation, STRIPE_ALLOCATION_METADATA_KEY,
 };
+use crate::cloud_provider_stripe_corrections::{
+    evaluate_personal_invoice_access, StripePersonalInvoiceAccessDecision,
+    StripePersonalInvoiceCorrectionEvidence, StripeRetainedPaidTerm, StripeUnresolvedCorrections,
+};
+use crate::cloud_provider_stripe_renewals::StripeRenewalFailureEvidence;
 
 const STRIPE_ORIGIN: &str = "https://api.stripe.com/";
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -247,6 +252,7 @@ impl StripeReadClient {
             deadline: Instant::now() + self.limits.session_timeout,
             attempts: 0,
             bytes: 0,
+            pages: 0,
             records: 0,
             account_verified: false,
             identity: Arc::clone(&self.identity),
@@ -326,6 +332,28 @@ impl StripeReadClient {
         }
         validate_mode(resource.livemode, self.environment)?;
         Ok(resource)
+    }
+
+    /// Retrieve one immutable event through the authenticated, bounded API session.
+    ///
+    /// The repair decoder owns event-shape validation. This method only binds the response to the
+    /// requested event identifier and preserves the session's request, byte and deadline bounds.
+    #[doc(hidden)]
+    pub async fn event_payload(
+        &self,
+        session: &mut StripeReadSession,
+        event_id: &str,
+    ) -> Result<Value, StripeReadError> {
+        self.ensure_account(session).await?;
+        validate_identifier(event_id)?;
+        let path = format!("v1/events/{event_id}");
+        let value = self.request_json(session, Method::GET, &path, &[]).await?;
+        if value.get("object").and_then(Value::as_str) != Some("event")
+            || value.get("id").and_then(Value::as_str) != Some(event_id)
+        {
+            return Err(StripeReadError::ContextMismatch);
+        }
+        Ok(value)
     }
 
     pub async fn subscription_invoices(
@@ -492,12 +520,40 @@ impl StripeReadClient {
         binding: &StripeAllocationBinding,
     ) -> Result<StripePersonalInvoiceObservation, StripeReadError> {
         let invoice = self.invoice(session, invoice_id).await?;
+        self.personal_invoice_observation_from_invoice(session, invoice, binding)
+            .await
+    }
+
+    async fn personal_invoice_observation_from_invoice(
+        &self,
+        session: &mut StripeReadSession,
+        invoice: StripeInvoiceResource,
+        binding: &StripeAllocationBinding,
+    ) -> Result<StripePersonalInvoiceObservation, StripeReadError> {
+        if invoice.parent_type.as_deref() != Some("subscription_details")
+            || invoice.subscription_id.is_none()
+        {
+            return Err(StripeReadError::Observation(
+                StripeContractError::ContextMismatch,
+            ));
+        }
         if invoice.status.as_deref() != Some("paid") {
             return Err(StripeReadError::Observation(
                 StripeContractError::UnpaidInvoice,
             ));
         }
-        let lines = self.invoice_lines(session, invoice_id).await?;
+        let lines = self.invoice_lines(session, &invoice.id).await?;
+        self.personal_invoice_observation_from_invoice_and_lines(session, invoice, binding, lines)
+            .await
+    }
+
+    async fn personal_invoice_observation_from_invoice_and_lines(
+        &self,
+        session: &mut StripeReadSession,
+        invoice: StripeInvoiceResource,
+        binding: &StripeAllocationBinding,
+        lines: Vec<StripeInvoiceLineResource>,
+    ) -> Result<StripePersonalInvoiceObservation, StripeReadError> {
         if lines.len() != 1 {
             return Err(StripeReadError::Observation(
                 StripeContractError::UnsupportedQuantity,
@@ -535,7 +591,7 @@ impl StripeReadClient {
                 StripeContractError::UnsupportedPrice,
             ));
         }
-        let payments = self.invoice_payments(session, invoice_id).await?;
+        let payments = self.invoice_payments(session, &invoice.id).await?;
         if payments.len() != 1 {
             return Err(StripeReadError::Observation(
                 StripeContractError::UnsupportedSettlement("invoice has an ambiguous payment list"),
@@ -596,6 +652,377 @@ impl StripeReadClient {
         .map_err(StripeReadError::Observation)
     }
 
+    /// Enumerate every invoice returned for one trusted personal subscription under one session.
+    ///
+    /// Non-paid invoices remain observations and do not become coverage or renewal recovery.
+    /// Exhausting pagination does not establish an atomic Stripe snapshot.
+    #[doc(hidden)]
+    pub async fn personal_invoice_history(
+        &self,
+        session: &mut StripeReadSession,
+        binding: &StripeAllocationBinding,
+    ) -> Result<StripePersonalInvoiceHistoryResult, StripeReadError> {
+        self.subscription(session, binding.subscription_id(), binding.customer_id())
+            .await?;
+        let invoices = self
+            .subscription_invoices(
+                session,
+                binding.subscription_id(),
+                Some(binding.customer_id()),
+            )
+            .await?;
+        let mut entries = Vec::new();
+        let mut unresolved = Vec::new();
+
+        for listed in invoices {
+            let invoice_id = listed.id.clone();
+            if listed.customer_id.is_none() {
+                unresolved.push(
+                    StripePersonalInvoiceHistoryUnresolved::InvoiceMissingCustomer {
+                        invoice_id: invoice_id.clone(),
+                    },
+                );
+            }
+            if listed.parent_type.is_none()
+                || (listed.parent_type.as_deref() == Some("subscription_details")
+                    && listed.subscription_id.is_none())
+            {
+                unresolved.push(
+                    StripePersonalInvoiceHistoryUnresolved::InvoiceMissingSubscriptionParent {
+                        invoice_id: invoice_id.clone(),
+                    },
+                );
+            } else if listed.parent_type.as_deref() != Some("subscription_details") {
+                unresolved.push(
+                    StripePersonalInvoiceHistoryUnresolved::InvoiceUnknownSubscriptionParent {
+                        invoice_id: invoice_id.clone(),
+                        parent_type: listed.parent_type.clone(),
+                    },
+                );
+            }
+            if listed
+                .customer_id
+                .as_deref()
+                .is_some_and(|customer_id| customer_id != binding.customer_id())
+            {
+                return Err(StripeReadError::ContextMismatch);
+            }
+            if listed
+                .subscription_id
+                .as_deref()
+                .is_some_and(|subscription_id| subscription_id != binding.subscription_id())
+            {
+                return Err(StripeReadError::ContextMismatch);
+            }
+
+            let Some(status) = listed.status.as_deref() else {
+                unresolved.push(
+                    StripePersonalInvoiceHistoryUnresolved::InvoiceMissingStatus { invoice_id },
+                );
+                continue;
+            };
+            match status {
+                "draft" | "open" | "void" | "uncollectible" => {
+                    if unresolved
+                        .iter()
+                        .any(|reason| history_reason_invoice_id(reason) == listed.id.as_str())
+                    {
+                        continue;
+                    }
+                    entries.push(StripePersonalInvoiceHistoryEntry::NonPaid(
+                        StripeNonPaidInvoice {
+                            invoice_id: listed.id,
+                            status: status.to_owned(),
+                        },
+                    ));
+                }
+                "paid" => {
+                    if unresolved
+                        .iter()
+                        .any(|reason| history_reason_invoice_id(reason) == listed.id.as_str())
+                    {
+                        continue;
+                    }
+                    let detailed = self.invoice(session, &listed.id).await?;
+                    validate_invoice_ownership(&detailed, binding)?;
+                    if !invoice_headers_match(&listed, &detailed) {
+                        unresolved.push(
+                            StripePersonalInvoiceHistoryUnresolved::InvoiceChangedDuringRead {
+                                invoice_id: listed.id,
+                            },
+                        );
+                        continue;
+                    }
+                    let evidence = self
+                        .personal_invoice_correction_evidence_from_invoice(
+                            session, detailed, binding,
+                        )
+                        .await?;
+                    match evaluate_personal_invoice_access(&evidence) {
+                        StripePersonalInvoiceAccessDecision::RetainPaidTerm(term) => {
+                            entries.push(StripePersonalInvoiceHistoryEntry::Paid(term));
+                        }
+                        StripePersonalInvoiceAccessDecision::NeedsEvidence(evidence) => {
+                            unresolved.push(
+                                StripePersonalInvoiceHistoryUnresolved::InvoiceCorrections {
+                                    invoice_id: listed.id,
+                                    evidence,
+                                },
+                            );
+                        }
+                    }
+                }
+                status => unresolved.push(
+                    StripePersonalInvoiceHistoryUnresolved::InvoiceUnknownStatus {
+                        invoice_id,
+                        status: status.to_owned(),
+                    },
+                ),
+            }
+        }
+
+        if !unresolved.is_empty() {
+            unresolved.sort_by(|left, right| left.sort_key().cmp(&right.sort_key()));
+            return Ok(StripePersonalInvoiceHistoryResult::NeedsEvidence(
+                StripePersonalInvoiceHistoryNeedsEvidence {
+                    subscription_id: binding.subscription_id().to_owned(),
+                    customer_id: binding.customer_id().to_owned(),
+                    reasons: unresolved,
+                },
+            ));
+        }
+        entries.sort_by(|left, right| {
+            history_entry_invoice_id(left).cmp(history_entry_invoice_id(right))
+        });
+        Ok(StripePersonalInvoiceHistoryResult::Observed(
+            StripePersonalInvoiceHistory {
+                account_id: self.account_id.clone(),
+                environment: self.environment,
+                subscription_id: binding.subscription_id().to_owned(),
+                customer_id: binding.customer_id().to_owned(),
+                entries,
+            },
+        ))
+    }
+
+    /// Assemble one invoice and its bounded correction reads without deciding access eligibility.
+    #[doc(hidden)]
+    pub async fn personal_invoice_correction_evidence(
+        &self,
+        session: &mut StripeReadSession,
+        invoice_id: &str,
+        binding: &StripeAllocationBinding,
+    ) -> Result<
+        crate::cloud_provider_stripe_corrections::StripePersonalInvoiceCorrectionEvidence,
+        StripeReadError,
+    > {
+        let observation = self
+            .personal_invoice_observation(session, invoice_id, binding)
+            .await?;
+        self.personal_invoice_correction_evidence_from_observation(session, observation)
+            .await
+    }
+
+    /// Observe the current state of a historically failed personal renewal under one bounded
+    /// session. This is evidence only: it never assigns recovery or writes coverage.
+    #[doc(hidden)]
+    pub async fn personal_renewal_observation(
+        &self,
+        session: &mut StripeReadSession,
+        binding: &StripeAllocationBinding,
+        failure: &StripeRenewalFailureEvidence,
+    ) -> Result<StripeRenewalObservationResult, StripeReadError> {
+        if failure.provider_account_id() != self.account_id
+            || failure.environment() != self.environment
+            || failure.allocation_reference() != binding.allocation_reference()
+            || failure.customer_id() != binding.customer_id()
+            || failure.subscription_id() != binding.subscription_id()
+            || failure.provider_item_id() != binding.provider_item_id()
+            || binding.payer_kind() != crate::cloud_provider::PayerKind::Personal
+        {
+            return Err(StripeReadError::ContextMismatch);
+        }
+        let first_subscription = self
+            .subscription(session, binding.subscription_id(), binding.customer_id())
+            .await?;
+        if first_subscription.status.is_none() {
+            return Ok(StripeRenewalObservationResult::NeedsEvidence(
+                StripeRenewalNeedsEvidence::IncompleteCurrentShape("subscription.status"),
+            ));
+        }
+        if !supported_subscription_status(first_subscription.status.as_deref().unwrap()) {
+            return Ok(StripeRenewalObservationResult::NeedsEvidence(
+                StripeRenewalNeedsEvidence::UnsupportedSubscriptionStatus(
+                    first_subscription.status.clone().unwrap_or_default(),
+                ),
+            ));
+        }
+        let cancellation = cancellation_facts(&first_subscription)?;
+        let first_invoice = self.invoice(session, failure.invoice_id()).await?;
+        validate_current_invoice(&first_invoice, binding)?;
+        if let Err(error) = validate_current_invoice_cycle(&first_invoice) {
+            match error {
+                CurrentInvoiceCycleError::Malformed(field) => {
+                    return Err(StripeReadError::MalformedResponse(field));
+                }
+                CurrentInvoiceCycleError::Unsupported { field, value } => {
+                    return Ok(StripeRenewalObservationResult::NeedsEvidence(
+                        StripeRenewalNeedsEvidence::UnsupportedInvoiceField { field, value },
+                    ));
+                }
+            }
+        }
+        let lines = self.invoice_lines(session, &first_invoice.id).await?;
+        validate_current_line(&lines, failure, binding, &self.coverage, self.environment)?;
+
+        let state = match first_invoice.status.as_deref() {
+            Some("paid") => {
+                if first_invoice.amount_remaining != Some(0) {
+                    return Ok(StripeRenewalObservationResult::NeedsEvidence(
+                        StripeRenewalNeedsEvidence::UnsupportedSettlement,
+                    ));
+                }
+                let evidence = self
+                    .personal_invoice_correction_evidence_from_invoice_and_lines(
+                        session,
+                        first_invoice.clone(),
+                        binding,
+                        lines,
+                    )
+                    .await?;
+                let term = match evaluate_personal_invoice_access(&evidence) {
+                    StripePersonalInvoiceAccessDecision::RetainPaidTerm(term) => term,
+                    StripePersonalInvoiceAccessDecision::NeedsEvidence(_) => {
+                        return Ok(StripeRenewalObservationResult::NeedsEvidence(
+                            StripeRenewalNeedsEvidence::UnsupportedSettlement,
+                        ));
+                    }
+                };
+                StripeRenewalCurrentState::Paid {
+                    evidence: Box::new(evidence),
+                    term: Box::new(term),
+                }
+            }
+            Some("open") => {
+                if !open_invoice_amounts_valid(&first_invoice) {
+                    return Ok(StripeRenewalObservationResult::NeedsEvidence(
+                        StripeRenewalNeedsEvidence::UnsupportedSettlement,
+                    ));
+                }
+                StripeRenewalCurrentState::Open
+            }
+            Some("void") | Some("uncollectible") => {
+                if !closed_invoice_amounts_valid(&first_invoice) {
+                    return Ok(StripeRenewalObservationResult::NeedsEvidence(
+                        StripeRenewalNeedsEvidence::UnsupportedSettlement,
+                    ));
+                }
+                StripeRenewalCurrentState::ClosedUnpaid {
+                    status: first_invoice.status.clone().unwrap_or_default(),
+                }
+            }
+            Some(status) => {
+                return Ok(StripeRenewalObservationResult::NeedsEvidence(
+                    StripeRenewalNeedsEvidence::UnsupportedStatus(status.to_owned()),
+                ));
+            }
+            None => {
+                return Ok(StripeRenewalObservationResult::NeedsEvidence(
+                    StripeRenewalNeedsEvidence::IncompleteCurrentShape("invoice.status"),
+                ));
+            }
+        };
+        let second_invoice = self.invoice(session, failure.invoice_id()).await?;
+        let second_subscription = self
+            .subscription(session, binding.subscription_id(), binding.customer_id())
+            .await?;
+        if first_invoice != second_invoice {
+            let fields = invoice_diff_fields(&first_invoice, &second_invoice);
+            return Ok(StripeRenewalObservationResult::NeedsEvidence(
+                StripeRenewalNeedsEvidence::ChangedDuringRead {
+                    resource: "invoice",
+                    fields,
+                },
+            ));
+        }
+        if first_subscription != second_subscription {
+            let fields = subscription_diff_fields(&first_subscription, &second_subscription);
+            return Ok(StripeRenewalObservationResult::NeedsEvidence(
+                StripeRenewalNeedsEvidence::ChangedDuringRead {
+                    resource: "subscription",
+                    fields,
+                },
+            ));
+        }
+        Ok(StripeRenewalObservationResult::Observed(Box::new(
+            StripeRenewalObservation {
+                renewal_id: failure.renewal_id().to_owned(),
+                invoice_id: failure.invoice_id().to_owned(),
+                event_id: failure.event_id().to_owned(),
+                provider_account_id: failure.provider_account_id().to_owned(),
+                environment: failure.environment(),
+                allocation_reference: failure.allocation_reference().to_owned(),
+                customer_id: failure.customer_id().to_owned(),
+                subscription_id: failure.subscription_id().to_owned(),
+                provider_item_id: failure.provider_item_id().to_owned(),
+                period_start: failure.renewal_period_start(),
+                period_end: failure.renewal_period_end(),
+                state,
+                cancellation,
+            },
+        )))
+    }
+
+    pub(crate) async fn personal_invoice_correction_evidence_from_invoice(
+        &self,
+        session: &mut StripeReadSession,
+        invoice: StripeInvoiceResource,
+        binding: &StripeAllocationBinding,
+    ) -> Result<StripePersonalInvoiceCorrectionEvidence, StripeReadError> {
+        let observation = self
+            .personal_invoice_observation_from_invoice(session, invoice, binding)
+            .await?;
+        self.personal_invoice_correction_evidence_from_observation(session, observation)
+            .await
+    }
+
+    async fn personal_invoice_correction_evidence_from_invoice_and_lines(
+        &self,
+        session: &mut StripeReadSession,
+        invoice: StripeInvoiceResource,
+        binding: &StripeAllocationBinding,
+        lines: Vec<StripeInvoiceLineResource>,
+    ) -> Result<StripePersonalInvoiceCorrectionEvidence, StripeReadError> {
+        let observation = self
+            .personal_invoice_observation_from_invoice_and_lines(session, invoice, binding, lines)
+            .await?;
+        self.personal_invoice_correction_evidence_from_observation(session, observation)
+            .await
+    }
+
+    async fn personal_invoice_correction_evidence_from_observation(
+        &self,
+        session: &mut StripeReadSession,
+        observation: StripePersonalInvoiceObservation,
+    ) -> Result<StripePersonalInvoiceCorrectionEvidence, StripeReadError> {
+        let refunds = self
+            .payment_intent_refunds(session, observation.payment_intent_id())
+            .await?;
+        let disputes = self
+            .payment_intent_disputes(session, observation.payment_intent_id())
+            .await?;
+        let credit_notes = self
+            .invoice_credit_notes(session, observation.invoice_id())
+            .await?;
+        crate::cloud_provider_stripe_corrections::assemble(
+            observation,
+            refunds,
+            disputes,
+            credit_notes,
+            self.environment,
+        )
+    }
+
     async fn list<T, F>(
         &self,
         session: &mut StripeReadSession,
@@ -609,11 +1036,8 @@ impl StripeReadClient {
         let mut output = Vec::new();
         let mut ids = HashSet::new();
         let mut cursor: Option<String> = None;
-        let mut pages = 0usize;
         loop {
-            if pages == self.limits.max_pages {
-                return Err(StripeReadError::PageBoundExceeded);
-            }
+            session.add_page(self.limits.max_pages)?;
             let mut query = base_query.clone();
             query.push(("limit".to_owned(), "100".to_owned()));
             if let Some(cursor) = cursor.as_deref() {
@@ -649,7 +1073,6 @@ impl StripeReadClient {
             }
             let last_id = parsed.last().map(|(id, _)| id.clone());
             output.extend(parsed.into_iter().map(|(_, value)| value));
-            pages += 1;
             if !has_more {
                 return Ok(output);
             }
@@ -781,6 +1204,7 @@ pub struct StripeReadSession {
     deadline: Instant,
     attempts: usize,
     bytes: usize,
+    pages: usize,
     records: usize,
     account_verified: bool,
     identity: Arc<()>,
@@ -792,6 +1216,7 @@ impl fmt::Debug for StripeReadSession {
             .debug_struct("StripeReadSession")
             .field("attempts", &self.attempts)
             .field("bytes", &self.bytes)
+            .field("pages", &self.pages)
             .field("records", &self.records)
             .field("account_verified", &self.account_verified)
             .finish()
@@ -828,6 +1253,17 @@ impl StripeReadSession {
         Ok(())
     }
 
+    fn add_page(&mut self, limit: usize) -> Result<(), StripeReadError> {
+        self.pages = self
+            .pages
+            .checked_add(1)
+            .ok_or(StripeReadError::PageBoundExceeded)?;
+        if self.pages > limit {
+            return Err(StripeReadError::PageBoundExceeded);
+        }
+        Ok(())
+    }
+
     fn add_records(&mut self, records: usize, limit: usize) -> Result<(), StripeReadError> {
         self.records = self
             .records
@@ -852,6 +1288,13 @@ pub struct StripeSubscriptionResource {
     pub customer_id: Option<String>,
     pub status: Option<String>,
     pub livemode: Option<bool>,
+    pub cancel_at_period_end: Option<bool>,
+    pub cancel_at: Option<i64>,
+    pub canceled_at: Option<i64>,
+    pub ended_at: Option<i64>,
+    cancel_at_present: bool,
+    canceled_at_present: bool,
+    ended_at_present: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -859,14 +1302,456 @@ pub struct StripeInvoiceResource {
     pub id: String,
     pub customer_id: Option<String>,
     pub subscription_id: Option<String>,
+    pub legacy_subscription_id: Option<String>,
+    pub parent_type: Option<String>,
+    pub billing_reason: Option<String>,
+    pub collection_method: Option<String>,
     pub status: Option<String>,
     pub currency: Option<String>,
     pub amount_paid: Option<i64>,
     pub amount_due: Option<i64>,
+    pub amount_remaining: Option<i64>,
     pub amount_overpaid: Option<i64>,
     pub amount_paid_off_stripe: Option<i64>,
     pub allocation_reference: Option<String>,
     pub livemode: Option<bool>,
+    billing_reason_present: bool,
+    collection_method_present: bool,
+}
+
+/// A non-paid invoice retained by personal history collection without becoming coverage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StripeNonPaidInvoice {
+    invoice_id: String,
+    status: String,
+}
+
+impl StripeNonPaidInvoice {
+    pub fn invoice_id(&self) -> &str {
+        &self.invoice_id
+    }
+
+    pub fn status(&self) -> &str {
+        &self.status
+    }
+}
+
+/// One invoice accounted for by a bounded personal history traversal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StripePersonalInvoiceHistoryEntry {
+    Paid(StripeRetainedPaidTerm),
+    NonPaid(StripeNonPaidInvoice),
+}
+
+/// Every invoice returned by Stripe was accounted for under one shared read session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StripePersonalInvoiceHistory {
+    account_id: String,
+    environment: ProviderEnvironment,
+    subscription_id: String,
+    customer_id: String,
+    entries: Vec<StripePersonalInvoiceHistoryEntry>,
+}
+
+impl StripePersonalInvoiceHistory {
+    pub fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
+    pub const fn environment(&self) -> ProviderEnvironment {
+        self.environment
+    }
+
+    pub fn subscription_id(&self) -> &str {
+        &self.subscription_id
+    }
+
+    pub fn customer_id(&self) -> &str {
+        &self.customer_id
+    }
+
+    pub fn entries(&self) -> &[StripePersonalInvoiceHistoryEntry] {
+        &self.entries
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        account_id: &str,
+        environment: ProviderEnvironment,
+        subscription_id: &str,
+        customer_id: &str,
+        entries: Vec<StripePersonalInvoiceHistoryEntry>,
+    ) -> Self {
+        Self {
+            account_id: account_id.into(),
+            environment,
+            subscription_id: subscription_id.into(),
+            customer_id: customer_id.into(),
+            entries,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StripePersonalInvoiceHistoryUnresolved {
+    InvoiceMissingCustomer {
+        invoice_id: String,
+    },
+    InvoiceMissingSubscriptionParent {
+        invoice_id: String,
+    },
+    InvoiceUnknownSubscriptionParent {
+        invoice_id: String,
+        parent_type: Option<String>,
+    },
+    InvoiceMissingStatus {
+        invoice_id: String,
+    },
+    InvoiceUnknownStatus {
+        invoice_id: String,
+        status: String,
+    },
+    InvoiceCorrections {
+        invoice_id: String,
+        evidence: StripeUnresolvedCorrections,
+    },
+    InvoiceChangedDuringRead {
+        invoice_id: String,
+    },
+}
+
+impl StripePersonalInvoiceHistoryUnresolved {
+    fn sort_key(&self) -> (&str, u8) {
+        match self {
+            Self::InvoiceMissingCustomer { invoice_id } => (invoice_id, 0),
+            Self::InvoiceMissingSubscriptionParent { invoice_id } => (invoice_id, 1),
+            Self::InvoiceUnknownSubscriptionParent { invoice_id, .. } => (invoice_id, 2),
+            Self::InvoiceMissingStatus { invoice_id } => (invoice_id, 3),
+            Self::InvoiceUnknownStatus { invoice_id, .. } => (invoice_id, 4),
+            Self::InvoiceCorrections { invoice_id, .. } => (invoice_id, 5),
+            Self::InvoiceChangedDuringRead { invoice_id } => (invoice_id, 6),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StripePersonalInvoiceHistoryNeedsEvidence {
+    subscription_id: String,
+    customer_id: String,
+    reasons: Vec<StripePersonalInvoiceHistoryUnresolved>,
+}
+
+impl StripePersonalInvoiceHistoryNeedsEvidence {
+    pub fn subscription_id(&self) -> &str {
+        &self.subscription_id
+    }
+
+    pub fn customer_id(&self) -> &str {
+        &self.customer_id
+    }
+
+    pub fn reasons(&self) -> &[StripePersonalInvoiceHistoryUnresolved] {
+        &self.reasons
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StripePersonalInvoiceHistoryResult {
+    Observed(StripePersonalInvoiceHistory),
+    NeedsEvidence(StripePersonalInvoiceHistoryNeedsEvidence),
+}
+
+fn history_reason_invoice_id(reason: &StripePersonalInvoiceHistoryUnresolved) -> &str {
+    match reason {
+        StripePersonalInvoiceHistoryUnresolved::InvoiceMissingCustomer { invoice_id }
+        | StripePersonalInvoiceHistoryUnresolved::InvoiceMissingSubscriptionParent { invoice_id }
+        | StripePersonalInvoiceHistoryUnresolved::InvoiceUnknownSubscriptionParent {
+            invoice_id,
+            ..
+        }
+        | StripePersonalInvoiceHistoryUnresolved::InvoiceMissingStatus { invoice_id }
+        | StripePersonalInvoiceHistoryUnresolved::InvoiceUnknownStatus { invoice_id, .. }
+        | StripePersonalInvoiceHistoryUnresolved::InvoiceCorrections { invoice_id, .. }
+        | StripePersonalInvoiceHistoryUnresolved::InvoiceChangedDuringRead { invoice_id } => {
+            invoice_id
+        }
+    }
+}
+
+fn history_entry_invoice_id(entry: &StripePersonalInvoiceHistoryEntry) -> &str {
+    match entry {
+        StripePersonalInvoiceHistoryEntry::Paid(term) => term.invoice_id(),
+        StripePersonalInvoiceHistoryEntry::NonPaid(invoice) => invoice.invoice_id(),
+    }
+}
+
+fn invoice_headers_match(left: &StripeInvoiceResource, right: &StripeInvoiceResource) -> bool {
+    left.id == right.id
+        && left.customer_id == right.customer_id
+        && left.subscription_id == right.subscription_id
+        && left.legacy_subscription_id == right.legacy_subscription_id
+        && left.parent_type == right.parent_type
+        && left.status == right.status
+        && left.currency == right.currency
+        && left.amount_paid == right.amount_paid
+        && left.amount_due == right.amount_due
+        && left.amount_remaining == right.amount_remaining
+        && left.amount_overpaid == right.amount_overpaid
+        && left.amount_paid_off_stripe == right.amount_paid_off_stripe
+        && left.allocation_reference == right.allocation_reference
+        && left.livemode == right.livemode
+}
+
+fn cancellation_facts(
+    subscription: &StripeSubscriptionResource,
+) -> Result<StripeRenewalCancellationFacts, StripeReadError> {
+    if !subscription.cancel_at_present {
+        return Err(StripeReadError::MalformedResponse("subscription.cancel_at"));
+    }
+    if !subscription.canceled_at_present {
+        return Err(StripeReadError::MalformedResponse(
+            "subscription.canceled_at",
+        ));
+    }
+    if !subscription.ended_at_present {
+        return Err(StripeReadError::MalformedResponse("subscription.ended_at"));
+    }
+    let cancel_at_period_end =
+        subscription
+            .cancel_at_period_end
+            .ok_or(StripeReadError::MalformedResponse(
+                "subscription.cancel_at_period_end",
+            ))?;
+    for (value, field) in [
+        (subscription.cancel_at, "subscription.cancel_at"),
+        (subscription.canceled_at, "subscription.canceled_at"),
+        (subscription.ended_at, "subscription.ended_at"),
+    ] {
+        if value.is_some_and(|timestamp| timestamp < 0) {
+            return Err(StripeReadError::MalformedResponse(field));
+        }
+    }
+    Ok(StripeRenewalCancellationFacts {
+        status: subscription.status.clone(),
+        cancel_at_period_end,
+        cancel_at: subscription.cancel_at,
+        canceled_at: subscription.canceled_at,
+        ended_at: subscription.ended_at,
+    })
+}
+
+fn validate_current_invoice(
+    invoice: &StripeInvoiceResource,
+    binding: &StripeAllocationBinding,
+) -> Result<(), StripeReadError> {
+    if invoice.customer_id.as_deref() != Some(binding.customer_id())
+        || invoice.subscription_id.as_deref() != Some(binding.subscription_id())
+        || invoice.parent_type.as_deref() != Some("subscription_details")
+        || invoice.allocation_reference.as_deref() != Some(binding.allocation_reference())
+        || !invoice
+            .currency
+            .as_deref()
+            .is_some_and(|currency| currency.eq_ignore_ascii_case("gbp"))
+    {
+        return Err(StripeReadError::ContextMismatch);
+    }
+    Ok(())
+}
+
+enum CurrentInvoiceCycleError {
+    Malformed(&'static str),
+    Unsupported { field: &'static str, value: String },
+}
+
+fn validate_current_invoice_cycle(
+    invoice: &StripeInvoiceResource,
+) -> Result<(), CurrentInvoiceCycleError> {
+    if !invoice.billing_reason_present || invoice.billing_reason.is_none() {
+        return Err(CurrentInvoiceCycleError::Malformed(
+            "invoice.billing_reason",
+        ));
+    }
+    match invoice.billing_reason.as_deref() {
+        Some("subscription_cycle") => {}
+        Some(value) => {
+            return Err(CurrentInvoiceCycleError::Unsupported {
+                field: "billing_reason",
+                value: value.to_owned(),
+            });
+        }
+        None => unreachable!(),
+    }
+    if !invoice.collection_method_present || invoice.collection_method.is_none() {
+        return Err(CurrentInvoiceCycleError::Malformed(
+            "invoice.collection_method",
+        ));
+    }
+    if let Some(value) = invoice.collection_method.as_deref() {
+        if value != "charge_automatically" {
+            return Err(CurrentInvoiceCycleError::Unsupported {
+                field: "collection_method",
+                value: value.to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_current_line(
+    lines: &[StripeInvoiceLineResource],
+    failure: &StripeRenewalFailureEvidence,
+    binding: &StripeAllocationBinding,
+    config: &StripeCoverageConfig,
+    environment: ProviderEnvironment,
+) -> Result<(), StripeReadError> {
+    if lines.len() != 1 {
+        return Err(StripeReadError::Observation(
+            StripeContractError::UnsupportedQuantity,
+        ));
+    }
+    let line = &lines[0];
+    if line.id != failure.invoice_line_id()
+        || line.invoice_id.as_deref() != Some(failure.invoice_id())
+        || line.quantity != Some(1)
+        || line.subscription_id.as_deref() != Some(binding.subscription_id())
+        || line.subscription_item_id.as_deref() != Some(binding.provider_item_id())
+        || line.period_start != Some(failure.renewal_period_start())
+        || line.period_end != Some(failure.renewal_period_end())
+        || line.parent_type.as_deref() != Some("subscription_item_details")
+        || line.pricing_type.as_deref() != Some("price_details")
+        || line.livemode != Some(matches!(environment, ProviderEnvironment::Live))
+        || line.proration != Some(false)
+        || line
+            .legacy_subscription_id
+            .as_deref()
+            .is_some_and(|id| id != binding.subscription_id())
+        || line
+            .legacy_subscription_item_id
+            .as_deref()
+            .is_some_and(|id| id != binding.provider_item_id())
+    {
+        return Err(StripeReadError::Observation(
+            StripeContractError::ContextMismatch,
+        ));
+    }
+    let expected_price = match failure.interval() {
+        StripeInterval::Month => &config.monthly_price_id,
+        StripeInterval::Year => &config.annual_price_id,
+    };
+    if line.price_id.as_deref() != Some(expected_price.as_str()) {
+        return Err(StripeReadError::MalformedResponse("line.price"));
+    }
+    Ok(())
+}
+
+fn open_invoice_amounts_valid(invoice: &StripeInvoiceResource) -> bool {
+    matches!(
+        (invoice.amount_due, invoice.amount_remaining, invoice.amount_paid, invoice.amount_overpaid, invoice.amount_paid_off_stripe),
+        (Some(due), Some(remaining), Some(0), Some(0), Some(0)) if due > 0 && remaining == due
+    )
+}
+
+fn closed_invoice_amounts_valid(invoice: &StripeInvoiceResource) -> bool {
+    matches!(
+        (
+            invoice.amount_due,
+            invoice.amount_remaining,
+            invoice.amount_paid,
+            invoice.amount_overpaid,
+            invoice.amount_paid_off_stripe
+        ),
+        (Some(due), Some(remaining), Some(0), Some(0), Some(0))
+            if due >= 0 && remaining >= 0 && remaining <= due
+    )
+}
+
+fn supported_subscription_status(status: &str) -> bool {
+    matches!(
+        status,
+        "active"
+            | "trialing"
+            | "past_due"
+            | "canceled"
+            | "unpaid"
+            | "incomplete"
+            | "incomplete_expired"
+            | "paused"
+    )
+}
+
+fn invoice_diff_fields(
+    left: &StripeInvoiceResource,
+    right: &StripeInvoiceResource,
+) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    macro_rules! compare {
+        ($field:ident) => {
+            if left.$field != right.$field {
+                fields.push(stringify!($field));
+            }
+        };
+    }
+    compare!(id);
+    compare!(customer_id);
+    compare!(subscription_id);
+    compare!(legacy_subscription_id);
+    compare!(parent_type);
+    compare!(billing_reason);
+    compare!(collection_method);
+    compare!(status);
+    compare!(currency);
+    compare!(amount_paid);
+    compare!(amount_due);
+    compare!(amount_remaining);
+    compare!(amount_overpaid);
+    compare!(amount_paid_off_stripe);
+    compare!(allocation_reference);
+    compare!(livemode);
+    if left.billing_reason_present != right.billing_reason_present
+        && left.billing_reason == right.billing_reason
+    {
+        fields.push("billing_reason");
+    }
+    if left.collection_method_present != right.collection_method_present
+        && left.collection_method == right.collection_method
+    {
+        fields.push("collection_method");
+    }
+    fields
+}
+
+fn subscription_diff_fields(
+    left: &StripeSubscriptionResource,
+    right: &StripeSubscriptionResource,
+) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    macro_rules! compare {
+        ($field:ident) => {
+            if left.$field != right.$field {
+                fields.push(stringify!($field));
+            }
+        };
+    }
+    compare!(id);
+    compare!(customer_id);
+    compare!(status);
+    compare!(livemode);
+    compare!(cancel_at_period_end);
+    compare!(cancel_at);
+    compare!(canceled_at);
+    compare!(ended_at);
+    if left.cancel_at_present != right.cancel_at_present && left.cancel_at == right.cancel_at {
+        fields.push("cancel_at");
+    }
+    if left.canceled_at_present != right.canceled_at_present
+        && left.canceled_at == right.canceled_at
+    {
+        fields.push("canceled_at");
+    }
+    if left.ended_at_present != right.ended_at_present && left.ended_at == right.ended_at {
+        fields.push("ended_at");
+    }
+    fields
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -875,12 +1760,160 @@ pub struct StripeInvoiceLineResource {
     pub quantity: Option<i64>,
     pub subscription_id: Option<String>,
     pub subscription_item_id: Option<String>,
+    pub legacy_subscription_id: Option<String>,
+    pub legacy_subscription_item_id: Option<String>,
     pub price_id: Option<String>,
     pub parent_type: Option<String>,
     pub pricing_type: Option<String>,
     pub livemode: Option<bool>,
     pub period_start: Option<i64>,
     pub period_end: Option<i64>,
+    pub invoice_id: Option<String>,
+    pub proration: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StripeRenewalCancellationFacts {
+    status: Option<String>,
+    cancel_at_period_end: bool,
+    cancel_at: Option<i64>,
+    canceled_at: Option<i64>,
+    ended_at: Option<i64>,
+}
+
+impl StripeRenewalCancellationFacts {
+    pub fn status(&self) -> Option<&str> {
+        self.status.as_deref()
+    }
+
+    pub const fn cancel_at_period_end(&self) -> bool {
+        self.cancel_at_period_end
+    }
+    pub const fn cancel_at(&self) -> Option<i64> {
+        self.cancel_at
+    }
+    pub const fn canceled_at(&self) -> Option<i64> {
+        self.canceled_at
+    }
+    pub const fn ended_at(&self) -> Option<i64> {
+        self.ended_at
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StripeRenewalCurrentState {
+    Paid {
+        evidence: Box<StripePersonalInvoiceCorrectionEvidence>,
+        term: Box<StripeRetainedPaidTerm>,
+    },
+    Open,
+    ClosedUnpaid {
+        status: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StripeRenewalObservation {
+    renewal_id: String,
+    invoice_id: String,
+    event_id: String,
+    provider_account_id: String,
+    environment: ProviderEnvironment,
+    allocation_reference: String,
+    customer_id: String,
+    subscription_id: String,
+    provider_item_id: String,
+    period_start: i64,
+    period_end: i64,
+    state: StripeRenewalCurrentState,
+    cancellation: StripeRenewalCancellationFacts,
+}
+
+impl StripeRenewalObservation {
+    pub fn renewal_id(&self) -> &str {
+        &self.renewal_id
+    }
+    pub fn invoice_id(&self) -> &str {
+        &self.invoice_id
+    }
+    pub fn event_id(&self) -> &str {
+        &self.event_id
+    }
+    pub fn provider_account_id(&self) -> &str {
+        &self.provider_account_id
+    }
+    pub const fn environment(&self) -> ProviderEnvironment {
+        self.environment
+    }
+    pub fn allocation_reference(&self) -> &str {
+        &self.allocation_reference
+    }
+    pub fn customer_id(&self) -> &str {
+        &self.customer_id
+    }
+    pub fn subscription_id(&self) -> &str {
+        &self.subscription_id
+    }
+    pub fn provider_item_id(&self) -> &str {
+        &self.provider_item_id
+    }
+    pub const fn period_start(&self) -> i64 {
+        self.period_start
+    }
+    pub const fn period_end(&self) -> i64 {
+        self.period_end
+    }
+    pub fn state(&self) -> &StripeRenewalCurrentState {
+        &self.state
+    }
+    pub fn cancellation(&self) -> &StripeRenewalCancellationFacts {
+        &self.cancellation
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StripeRenewalNeedsEvidence {
+    UnsupportedStatus(String),
+    UnsupportedSubscriptionStatus(String),
+    UnsupportedInvoiceField {
+        field: &'static str,
+        value: String,
+    },
+    ChangedDuringRead {
+        resource: &'static str,
+        fields: Vec<&'static str>,
+    },
+    UnsupportedSettlement,
+    IncompleteCurrentShape(&'static str),
+}
+
+impl fmt::Display for StripeRenewalNeedsEvidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedStatus(status) => {
+                write!(formatter, "unsupported invoice status {status}")
+            }
+            Self::UnsupportedSubscriptionStatus(status) => {
+                write!(formatter, "unsupported subscription status {status}")
+            }
+            Self::UnsupportedInvoiceField { field, value } => {
+                write!(formatter, "unsupported invoice {field} {value}")
+            }
+            Self::ChangedDuringRead { resource, fields } => {
+                write!(formatter, "{resource} changed during read: {fields:?}")
+            }
+            Self::UnsupportedSettlement => formatter.write_str("current settlement is unsupported"),
+            Self::IncompleteCurrentShape(field) => {
+                write!(formatter, "required current field is unavailable: {field}")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StripeRenewalObservationResult {
+    Observed(Box<StripeRenewalObservation>),
+    NeedsEvidence(StripeRenewalNeedsEvidence),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1091,18 +2124,63 @@ fn parse_subscription(value: &Value) -> Result<StripeSubscriptionResource, Strip
         customer_id: optional_validated_ref(value.get("customer"), "subscription.customer")?,
         status: optional_string(value.get("status"), "subscription.status")?,
         livemode: optional_bool(value.get("livemode"), "subscription.livemode")?,
+        cancel_at_period_end: optional_bool(
+            value.get("cancel_at_period_end"),
+            "subscription.cancel_at_period_end",
+        )?,
+        cancel_at: optional_i64(value.get("cancel_at"), "subscription.cancel_at")?,
+        canceled_at: optional_i64(value.get("canceled_at"), "subscription.canceled_at")?,
+        ended_at: optional_i64(value.get("ended_at"), "subscription.ended_at")?,
+        cancel_at_present: value.get("cancel_at").is_some(),
+        canceled_at_present: value.get("canceled_at").is_some(),
+        ended_at_present: value.get("ended_at").is_some(),
     })
 }
 
 fn parse_invoice(value: &Value) -> Result<StripeInvoiceResource, StripeReadError> {
+    let parent = optional_object(value.get("parent"), "invoice.parent")?;
+    let parent_type = parent
+        .map(|parent| optional_string(parent.get("type"), "invoice.parent.type"))
+        .transpose()?
+        .flatten();
+    let parent_subscription_id = match parent.and_then(|parent| parent.get("subscription_details"))
+    {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(details)) => optional_validated_ref(
+            details.get("subscription"),
+            "invoice.parent.subscription_details.subscription",
+        )?,
+        Some(_) => {
+            return Err(StripeReadError::MalformedResponse(
+                "invoice.parent.subscription_details",
+            ));
+        }
+    };
+    let legacy_subscription_id =
+        optional_validated_ref(value.get("subscription"), "invoice.subscription")?;
+    if parent_subscription_id
+        .as_deref()
+        .zip(legacy_subscription_id.as_deref())
+        .is_some_and(|(nested, legacy)| nested != legacy)
+    {
+        return Err(StripeReadError::ContextMismatch);
+    }
     Ok(StripeInvoiceResource {
         id: required_id(value, "invoice.id")?,
         customer_id: optional_validated_ref(value.get("customer"), "invoice.customer")?,
-        subscription_id: optional_validated_ref(value.get("subscription"), "invoice.subscription")?,
+        subscription_id: parent_subscription_id,
+        legacy_subscription_id,
+        parent_type,
+        billing_reason: optional_string(value.get("billing_reason"), "invoice.billing_reason")?,
+        collection_method: optional_string(
+            value.get("collection_method"),
+            "invoice.collection_method",
+        )?,
         status: optional_string(value.get("status"), "invoice.status")?,
         currency: optional_string(value.get("currency"), "invoice.currency")?,
         amount_paid: optional_i64(value.get("amount_paid"), "invoice.amount_paid")?,
         amount_due: optional_i64(value.get("amount_due"), "invoice.amount_due")?,
+        amount_remaining: optional_i64(value.get("amount_remaining"), "invoice.amount_remaining")?,
         amount_overpaid: optional_i64(value.get("amount_overpaid"), "invoice.amount_overpaid")?,
         amount_paid_off_stripe: optional_i64(
             value.get("amount_paid_off_stripe"),
@@ -1110,7 +2188,27 @@ fn parse_invoice(value: &Value) -> Result<StripeInvoiceResource, StripeReadError
         )?,
         allocation_reference: optional_allocation_reference(value.get("metadata"))?,
         livemode: optional_bool(value.get("livemode"), "invoice.livemode")?,
+        billing_reason_present: value.get("billing_reason").is_some(),
+        collection_method_present: value.get("collection_method").is_some(),
     })
+}
+
+fn validate_invoice_ownership(
+    invoice: &StripeInvoiceResource,
+    binding: &StripeAllocationBinding,
+) -> Result<(), StripeReadError> {
+    if invoice
+        .customer_id
+        .as_deref()
+        .is_some_and(|customer_id| customer_id != binding.customer_id())
+        || invoice
+            .subscription_id
+            .as_deref()
+            .is_some_and(|subscription_id| subscription_id != binding.subscription_id())
+    {
+        return Err(StripeReadError::ContextMismatch);
+    }
+    Ok(())
 }
 
 fn parse_invoice_line(value: &Value) -> Result<StripeInvoiceLineResource, StripeReadError> {
@@ -1123,19 +2221,29 @@ fn parse_invoice_line(value: &Value) -> Result<StripeInvoiceLineResource, Stripe
         .and_then(|pricing| pricing.get("price_details"))
         .and_then(Value::as_object);
     let period = optional_object(value.get("period"), "line.period")?;
+    let legacy_subscription_id =
+        optional_validated_ref(value.get("subscription"), "line.subscription_legacy")?;
+    let legacy_subscription_item_id = optional_validated_ref(
+        value.get("subscription_item"),
+        "line.subscription_item_legacy",
+    )?;
+    let subscription_id = details
+        .map(|details| optional_validated_ref(details.get("subscription"), "line.subscription"))
+        .transpose()?
+        .flatten();
+    let subscription_item_id = details
+        .map(|details| {
+            optional_validated_ref(details.get("subscription_item"), "line.subscription_item")
+        })
+        .transpose()?
+        .flatten();
     Ok(StripeInvoiceLineResource {
         id: required_id(value, "invoice line.id")?,
         quantity: optional_i64(value.get("quantity"), "line.quantity")?,
-        subscription_id: details
-            .map(|details| optional_validated_ref(details.get("subscription"), "line.subscription"))
-            .transpose()?
-            .flatten(),
-        subscription_item_id: details
-            .map(|details| {
-                optional_validated_ref(details.get("subscription_item"), "line.subscription_item")
-            })
-            .transpose()?
-            .flatten(),
+        subscription_id,
+        subscription_item_id,
+        legacy_subscription_id,
+        legacy_subscription_item_id,
         price_id: price_details
             .map(|details| optional_validated_ref(details.get("price"), "line.price"))
             .transpose()?
@@ -1155,6 +2263,11 @@ fn parse_invoice_line(value: &Value) -> Result<StripeInvoiceLineResource, Stripe
             .flatten(),
         period_end: period
             .map(|period| optional_i64(period.get("end"), "line.period.end"))
+            .transpose()?
+            .flatten(),
+        invoice_id: optional_validated_ref(value.get("invoice"), "line.invoice")?,
+        proration: details
+            .map(|details| optional_bool(details.get("proration"), "line.proration"))
             .transpose()?
             .flatten(),
     })
