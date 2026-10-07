@@ -41,16 +41,25 @@ docker compose -f docker-compose.prod.yml up -d
 ```
 
 `SOTTO_DEPLOYMENT_MODE` identifies who operates the instance and defaults to `self_hosted`.
-Set it to `cloud` only on an instance operated by Sotto. It is currently discovery metadata only:
-it does not enable Stripe billing, remove the existing organisation limits, or change access by
-itself. Check the value after deployment with:
+Set it to `cloud` on the operated Sotto service. Stripe credentials with `self_hosted` are rejected
+at boot so a deployment cannot silently lose billing or accidentally apply the wrong entitlement
+policy. Check the value after deployment with:
 
 ```sh
 curl -fsS https://<your-domain>/server/info
 ```
 
 The response is safe to expose publicly and reports the deployment mode plus the current
-entitlement model. Stripe configuration does not select this mode.
+entitlement model. Stripe configuration must be paired with `cloud`; the mode remains an explicit operator setting.
+
+Human hosted action checks are shadow-only by default. They record would-deny decisions while
+existing ACL, grant, lifecycle, and export responses remain unchanged. Do not set
+`SOTTO_CLOUD_ACTION_ENFORCEMENT=1` until the Cloud transition and export gates have been
+rehearsed and approved.
+
+Hosted machine-token eligibility is separately dormant. Do not set
+`SOTTO_MACHINE_ELIGIBILITY_ENFORCEMENT=1` until the accountable-beneficiary migration and legacy
+token inventory have been reviewed; self-hosted machine access does not depend on Cloud billing.
 
 Database migrations run automatically on server boot. Pin a released version with
 `SOTTO_IMAGE_TAG=vX.Y.Z` in `.env` (default: `latest`). To build everything from source instead -
@@ -92,6 +101,14 @@ wrong. See [Uptime monitoring](#uptime-monitoring).
 
 Then open `https://<your-domain>` in a browser and sign in with GitHub. Point the CLI at your
 instance with `sotto login --server https://<your-domain>`.
+
+## Legacy billing transition
+
+Before changing an existing hosted account, run the read-only inventory and rehearsal in
+[`LEGACY-BILLING-CUTOVER-RUNBOOK.md`](./LEGACY-BILLING-CUTOVER-RUNBOOK.md). It reports aggregate
+legacy paid, trial, manual and contradictory cohorts plus token and link provenance without
+printing customer or provider identifiers. The inventory does not charge, backfill, revoke or
+change entitlements; an approved cohort and notice decision is required before a later cutover.
 
 ## Upgrading
 
@@ -140,6 +157,13 @@ Postgres holds only ciphertext and metadata, but losing it loses your users' syn
 [`backup.sh`](./backup.sh) takes a custom-format `pg_dump` inside the container, **verifies the
 archive** (`pg_restore --list`) before anything leaves the box, and uploads it to whatever
 object storage `SOTTO_BACKUP_BUCKET` names - the scheme picks the tool:
+
+It also uploads `sotto-<stamp>.tombstones.jsonl`, a cumulative sidecar containing the retention
+deletion journal. The sidecar is deliberately separate from the dump: a dump taken before a
+purge must not resurrect ciphertext when it is restored. It contains resource identifiers and
+ownership checks, never ciphertext or secret values, and is validated before upload by
+[`replay-retention-journal`](../scripts/replay-retention-journal). Keep both objects under the
+same bucket lifecycle policy; a dump without its sidecar is not a restorable backup.
 
 | `SOTTO_BACKUP_BUCKET` | Uploads with | Works for |
 |---|---|---|
@@ -305,7 +329,18 @@ gsutil rm gs://<bucket>/sotto-<stamp>.dump       # AccessDenied: needs storage.o
 ```
 
 Then rehearse the restore once against a scratch database - a backup that has never been restored
-is a hope, not a backup.
+is a hope, not a backup. Fetch the matching `.tombstones.jsonl` sidecar as well as the dump and,
+after the dump is restored, replay it before starting the server:
+
+```sh
+scripts/replay-retention-journal \
+  --database-url postgres://sotto@localhost:5432/restored \
+  --journal sotto-<stamp>.tombstones.jsonl
+```
+
+The replay is idempotent and checks owner, creation time and environment revision before each
+delete. Do not admit traffic or start workers until the restore checks and journal replay have
+both succeeded.
 
 ## Access logs
 
@@ -463,8 +498,9 @@ A backup nobody has restored is a hope. `backup.sh` validates each archive with
 cannot tell you the bytes survived the trip to the bucket, and it cannot tell you that what
 comes back is a database this code could run on. Only restoring one answers those.
 
-`deploy/restore-verification.yaml` does it monthly: fetch the newest object, restore it into a
-throwaway Postgres that dies with the build, and check what came back.
+`deploy/restore-verification.yaml` does it monthly: fetch the newest dump and newest cumulative
+sidecar, restore the dump into a throwaway Postgres that dies with the build, check what came back,
+then replay the sidecar before the heartbeat is sent.
 
 Where the dump goes is worth stating rather than leaving to inference. It is downloaded into the
 build's own workspace and restored into a container beside it, both inside your Cloud project,
@@ -475,6 +511,9 @@ this uploads only this repository's source, which is public.
 What it asserts, which is the rehearsal of 2026-08-31 written down:
 
 - `pg_restore` completes with no errors;
+- a retention sidecar exists and passes strict JSON-lines validation;
+- every deletion in that sidecar is replayed against the restored database with its ownership,
+  creation-time and revision guards, so purged rows cannot reappear;
 - every migration the dump recorded is marked successful, and none is a version this checkout
   does not carry. A deployment **behind** the branch passes: production is often a release or
   two back, and failing every month in between would train everyone to ignore the job. A
