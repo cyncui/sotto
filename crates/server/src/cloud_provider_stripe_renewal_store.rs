@@ -413,11 +413,13 @@ pub async fn accept_personal_renewal_failure(
     context: &ProviderContext,
     allocation: &VerifiedAllocation,
     evidence: &StripeRenewalFailureEvidence,
+    ingest_enabled: bool,
 ) -> Result<StripeRenewalFailureAcceptance, StripeRenewalFailureStoreError> {
     validate_evidence_context(context, allocation, evidence)?;
     let event = evidence.verified_event()?;
     let _event_disposition = record_verified_event(tx, context, &event).await?;
-    let invalidation = accept_provider_invalidation(tx, context, &event, allocation).await?;
+    let invalidation =
+        accept_provider_invalidation(tx, context, &event, allocation, ingest_enabled).await?;
     let accepted_generation = match invalidation {
         InvalidationDisposition::Accepted { generation }
         | InvalidationDisposition::AlreadyAccepted { generation } => generation,

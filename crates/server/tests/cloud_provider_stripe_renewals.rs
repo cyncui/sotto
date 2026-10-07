@@ -1006,7 +1006,14 @@ async fn signed_failure_round_trips_through_the_durable_store_and_bounds_history
     wrong_owner.provider_item_id = "forged-item".into();
     let mut reject_forged = pool.begin().await.unwrap();
     assert!(matches!(
-        accept_personal_renewal_failure(&mut reject_forged, &context, &wrong_owner, &first).await,
+        accept_personal_renewal_failure(
+            &mut reject_forged,
+            &context,
+            &wrong_owner,
+            &first,
+            true,
+        )
+        .await,
         Err(
             sotto_server::cloud_provider_stripe_renewal_store::StripeRenewalFailureStoreError::Provider(
                 sotto_server::cloud_provider::ProviderAdapterError::ProviderContextMismatch
@@ -1024,9 +1031,10 @@ async fn signed_failure_round_trips_through_the_durable_store_and_bounds_history
     assert_eq!(forged_receipt_count, 0);
 
     let mut accept = pool.begin().await.unwrap();
-    let accepted = accept_personal_renewal_failure(&mut accept, &context, &allocation, &first)
-        .await
-        .unwrap();
+    let accepted =
+        accept_personal_renewal_failure(&mut accept, &context, &allocation, &first, true)
+            .await
+            .unwrap();
     assert_eq!(
         accepted.disposition,
         StripeRenewalFailureDisposition::Accepted
@@ -1045,9 +1053,10 @@ async fn signed_failure_round_trips_through_the_durable_store_and_bounds_history
     assert_eq!(loaded, vec![first.clone()]);
 
     let mut replay = pool.begin().await.unwrap();
-    let replayed = accept_personal_renewal_failure(&mut replay, &context, &allocation, &first)
-        .await
-        .unwrap();
+    let replayed =
+        accept_personal_renewal_failure(&mut replay, &context, &allocation, &first, true)
+            .await
+            .unwrap();
     assert_eq!(
         replayed.disposition,
         StripeRenewalFailureDisposition::AlreadyAccepted
@@ -1070,6 +1079,7 @@ async fn signed_failure_round_trips_through_the_durable_store_and_bounds_history
             &first_context,
             &first_allocation,
             &first_evidence,
+            true,
         )
         .await;
         if result.is_ok() {
@@ -1092,6 +1102,7 @@ async fn signed_failure_round_trips_through_the_durable_store_and_bounds_history
             &second_context,
             &second_allocation,
             &second_evidence,
+            true,
         )
         .await;
         if result.is_ok() {
@@ -1175,7 +1186,7 @@ async fn signed_failure_round_trips_through_the_durable_store_and_bounds_history
     .unwrap();
     let mut conflict = pool.begin().await.unwrap();
     assert!(matches!(
-        accept_personal_renewal_failure(&mut conflict, &context, &allocation, &first).await,
+        accept_personal_renewal_failure(&mut conflict, &context, &allocation, &first, true).await,
         Err(
             sotto_server::cloud_provider_stripe_renewal_store::StripeRenewalFailureStoreError::EvidenceConflict
         )
