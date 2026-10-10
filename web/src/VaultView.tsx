@@ -448,6 +448,12 @@ export function VaultView({
     openEnv?.secrets.filter((secret) =>
       secret.name.toLocaleLowerCase().includes(normalizedSecretQuery),
     ) ?? [];
+  const secretSearchStatus =
+    normalizedSecretQuery === ""
+      ? `${filteredSecrets.length} secret ${filteredSecrets.length === 1 ? "name" : "names"} available.`
+      : filteredSecrets.length === 0
+        ? "No secret names match this search."
+        : `${filteredSecrets.length} secret ${filteredSecrets.length === 1 ? "name matches" : "names match"} this search.`;
 
   return (
     <Shell onLogout={onLogout}>
@@ -531,9 +537,16 @@ export function VaultView({
                   autoComplete="off"
                 />
               </label>
-              {filteredSecrets.length === 0 ? (
-                <p className="muted">No secret names match this search.</p>
-              ) : (
+              <p
+                className="muted"
+                role="status"
+                aria-live="polite"
+                aria-atomic="true"
+                aria-label="Secret search results"
+              >
+                {secretSearchStatus}
+              </p>
+              {filteredSecrets.length > 0 && (
                 <ul className="items">
               {filteredSecrets.map((s) => (
                 <li key={s.entry.id}>

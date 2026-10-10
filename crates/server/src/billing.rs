@@ -451,6 +451,7 @@ pub struct BillingState {
     webhook_secret: String,
     return_url: String,
     price_catalogue: Option<BillingPriceIds>,
+    cloud_sales_enabled: bool,
 }
 
 impl BillingState {
@@ -463,6 +464,10 @@ impl BillingState {
         self.price_catalogue.as_ref()
     }
 
+    pub fn cloud_sales_enabled(&self) -> bool {
+        self.cloud_sales_enabled
+    }
+
     pub fn from_config(config: BillingConfig) -> Self {
         let provider = StripeBilling {
             api_key: config.api_key.clone(),
@@ -473,6 +478,7 @@ impl BillingState {
             webhook_secret: config.webhook_secret,
             return_url: config.return_url,
             price_catalogue: config.price_catalogue,
+            cloud_sales_enabled: config.cloud_sales_enabled,
         }
     }
 
@@ -481,11 +487,22 @@ impl BillingState {
         webhook_secret: String,
         return_url: String,
     ) -> Self {
+        Self::with_provider_and_cloud_sales(provider, webhook_secret, return_url, false)
+    }
+
+    /// Construct billing with an injected provider and an explicit purchase decision.
+    pub fn with_provider_and_cloud_sales(
+        provider: Arc<dyn SubscriptionProvider>,
+        webhook_secret: String,
+        return_url: String,
+        cloud_sales_enabled: bool,
+    ) -> Self {
         Self {
             provider,
             webhook_secret,
             return_url,
             price_catalogue: None,
+            cloud_sales_enabled,
         }
     }
 
@@ -496,6 +513,7 @@ impl BillingState {
             webhook_secret: config.webhook_secret,
             return_url: config.return_url,
             price_catalogue: config.price_catalogue,
+            cloud_sales_enabled: config.cloud_sales_enabled,
         }
     }
 }
@@ -1157,6 +1175,30 @@ fn billing_config(state: &AppState) -> Result<&BillingState> {
         .ok_or_else(|| Error::NotConfigured("billing is not configured".into()))
 }
 
+fn cloud_sales_config(state: &AppState) -> Result<&BillingState> {
+    let billing = billing_config(state)?;
+    ensure_cloud_sales_enabled(billing.cloud_sales_enabled())?;
+    Ok(billing)
+}
+
+fn ensure_cloud_sales_for_operation(sales_enabled: bool, operation_exists: bool) -> Result<()> {
+    if operation_exists {
+        Ok(())
+    } else {
+        ensure_cloud_sales_enabled(sales_enabled)
+    }
+}
+
+fn ensure_cloud_sales_enabled(enabled: bool) -> Result<()> {
+    if enabled {
+        Ok(())
+    } else {
+        Err(Error::NotConfigured(
+            "hosted Cloud purchases are not enabled".into(),
+        ))
+    }
+}
+
 const SPONSORED_BILLING_ENABLED_ENV: &str = "SOTTO_SPONSORED_BILLING_ENABLED";
 const BILLING_CORRECTIONS_ENABLED_ENV: &str = "SOTTO_BILLING_CORRECTIONS_ENABLED";
 const BILLING_OPERATOR_TOKEN_ENV: &str = "SOTTO_BILLING_OPERATOR_TOKEN";
@@ -1177,6 +1219,12 @@ fn sponsored_billing_config(state: &AppState) -> Result<&BillingState> {
         ));
     }
     billing_config(state)
+}
+
+fn sponsored_sales_config(state: &AppState) -> Result<&BillingState> {
+    let billing = sponsored_billing_config(state)?;
+    ensure_cloud_sales_enabled(billing.cloud_sales_enabled())?;
+    Ok(billing)
 }
 
 /// Billing is admin+: the same bar as membership management, and a non-member sees a 404.
@@ -1345,7 +1393,7 @@ async fn sponsored_quote(
         ));
     }
     let offer = billing_offer(&request.offer)?;
-    let billing = sponsored_billing_config(&state)?;
+    let billing = sponsored_sales_config(&state)?;
     let catalogue = billing
         .price_catalogue()
         .ok_or_else(|| Error::NotConfigured("hosted sponsored billing is not configured".into()))?;
@@ -1391,6 +1439,20 @@ async fn sponsored_checkout(
     Json(input): Json<SponsoredCheckoutRequest>,
 ) -> Result<Json<SponsoredOperationView>> {
     let billing = sponsored_billing_config(&state)?;
+    let existing_operation = if billing.cloud_sales_enabled() {
+        false
+    } else {
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM billing_sponsored_operations \
+             WHERE organization_id = $1 AND actor_user_id = $2 AND idempotency_key = $3)",
+        )
+        .bind(&org_id)
+        .bind(&user.user_id)
+        .bind(&input.idempotency_key)
+        .fetch_one(&state.pool)
+        .await?
+    };
+    ensure_cloud_sales_for_operation(billing.cloud_sales_enabled(), existing_operation)?;
     let catalogue = billing
         .price_catalogue()
         .ok_or_else(|| Error::NotConfigured("hosted sponsored billing is not configured".into()))?;
@@ -1702,7 +1764,7 @@ async fn personal_quote(
     user: AuthUser,
     Query(query): Query<PersonalQuoteQuery>,
 ) -> Result<Json<PersonalQuoteView>> {
-    let billing = billing_config(&state)?;
+    let billing = cloud_sales_config(&state)?;
     let catalogue = billing
         .price_catalogue()
         .ok_or_else(|| Error::NotConfigured("hosted personal billing is not configured".into()))?;
@@ -1785,6 +1847,19 @@ async fn personal_checkout(
     Json(request): Json<PersonalCheckoutRequest>,
 ) -> Result<Json<PersonalCheckoutView>> {
     let billing = billing_config(&state)?;
+    let existing_operation = if billing.cloud_sales_enabled() {
+        false
+    } else {
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM billing_operations \
+             WHERE actor_user_id = $1 AND idempotency_key = $2)",
+        )
+        .bind(&user.user_id)
+        .bind(&request.idempotency_key)
+        .fetch_one(&state.pool)
+        .await?
+    };
+    ensure_cloud_sales_for_operation(billing.cloud_sales_enabled(), existing_operation)?;
     let catalogue = billing
         .price_catalogue()
         .ok_or_else(|| Error::NotConfigured("hosted personal billing is not configured".into()))?;
@@ -2342,7 +2417,7 @@ async fn create_checkout(
     user: AuthUser,
     Path(org_id): Path<String>,
 ) -> Result<Json<RedirectView>> {
-    let billing = billing_config(&state)?;
+    let billing = cloud_sales_config(&state)?;
     let mut tx = state.pool.begin().await?;
     // Keep the organisation lock through provider session creation so deletion cannot transition
     // between the lifecycle check and this billing side effect. The bounded provider timeout
@@ -4080,6 +4155,25 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sales_gate_blocks_new_purchase_actions_without_blocking_billing_config() {
+        assert!(matches!(
+            ensure_cloud_sales_enabled(false),
+            Err(Error::NotConfigured(_))
+        ));
+        assert!(ensure_cloud_sales_enabled(true).is_ok());
+    }
+
+    #[test]
+    fn sales_pause_allows_only_replays_of_persisted_operations() {
+        assert!(ensure_cloud_sales_for_operation(false, true).is_ok());
+        assert!(matches!(
+            ensure_cloud_sales_for_operation(false, false),
+            Err(Error::NotConfigured(_))
+        ));
+        assert!(ensure_cloud_sales_for_operation(true, false).is_ok());
+    }
 
     /// The vault app moved behind `/app` when the site root became the marketing page; a payer
     /// must land back in the app, never on the landing page. This pins that contract.

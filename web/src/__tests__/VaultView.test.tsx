@@ -106,18 +106,28 @@ describe("VaultView selection loading", () => {
     await screen.findByRole("button", { name: "Alpha" });
 
     const search = screen.getByRole("searchbox", { name: "Search secret names" });
+    const resultStatus = screen.getByRole("status", { name: "Secret search results" });
+    expect(resultStatus).toHaveTextContent("2 secret names available.");
+    search.focus();
     fireEvent.change(search, { target: { value: "ALP" } });
     expect(screen.getByRole("button", { name: "Alpha" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Beta" })).toBeNull();
+    expect(resultStatus).toHaveTextContent("1 secret name matches this search.");
+    expect(search).toHaveFocus();
     expect(api.fetchSecrets).toHaveBeenCalledTimes(1);
+    expect(vault.decryptSecretValue).not.toHaveBeenCalled();
 
     fireEvent.change(search, { target: { value: "missing" } });
-    expect(screen.getByText("No secret names match this search.")).toBeTruthy();
+    expect(resultStatus).toHaveTextContent("No secret names match this search.");
+    expect(search).toHaveFocus();
 
     fireEvent.change(search, { target: { value: "" } });
     expect(screen.getByRole("button", { name: "Alpha" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Beta" })).toBeInTheDocument();
+    expect(resultStatus).toHaveTextContent("2 secret names available.");
+    expect(search).toHaveFocus();
     expect(api.fetchSecrets).toHaveBeenCalledTimes(1);
+    expect(vault.decryptSecretValue).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole("button", { name: "env-b" }));
     await screen.findByRole("button", { name: "Gamma" });
@@ -134,6 +144,7 @@ describe("VaultView selection loading", () => {
 
     expect(await screen.findByText("No secrets in this environment.")).toBeInTheDocument();
     expect(screen.queryByRole("searchbox", { name: "Search secret names" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("status", { name: "Secret search results" })).not.toBeInTheDocument();
   });
 
   it("keeps environments from the latest project when requests resolve out of order", async () => {
@@ -899,8 +910,12 @@ describe("VaultView navigation ordering", () => {
 });
 
 describe("VaultView secret copying", () => {
-  it("copies the exact revealed value only after explicit activation", async () => {
+  const value = "  first line\nsecond line  ";
+  let clipboardDescriptor: PropertyDescriptor | undefined;
+
+  beforeEach(() => {
     vi.resetAllMocks();
+    clipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
     vi.mocked(api.fetchOrgs).mockResolvedValue([]);
     vi.mocked(api.fetchProjects).mockResolvedValue([project("project-a")]);
     vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a")]);
@@ -910,17 +925,107 @@ describe("VaultView secret copying", () => {
     vi.mocked(vault.decryptEnvName).mockImplementation((_key, id) => id);
     vi.mocked(vault.decryptSecretName).mockImplementation((_key, _env, entry) => entry.id);
     vi.mocked(vault.openEnvGrant).mockReturnValue(new Uint8Array([8]));
-    vi.mocked(vault.decryptSecretValue).mockReturnValue("  first line\nsecond line  ");
-    const writeText = vi.fn().mockResolvedValue(undefined);
-    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    vi.mocked(vault.decryptSecretValue).mockReturnValue(value);
+  });
 
+  afterEach(() => {
+    if (clipboardDescriptor) {
+      Object.defineProperty(navigator, "clipboard", clipboardDescriptor);
+    } else {
+      Reflect.deleteProperty(navigator, "clipboard");
+    }
+  });
+
+  async function revealSecret() {
     renderVault();
     fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
     fireEvent.click(await screen.findByRole("button", { name: "env-a" }));
     fireEvent.click(await screen.findByRole("button", { name: "secret-a" }));
+    return screen.getByRole("textbox", { name: "secret-a" });
+  }
+
+  it("copies the exact revealed value only after explicit activation", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+
+    expect(await revealSecret()).toHaveValue(value);
     expect(writeText).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "Copy secret" }));
     expect(await screen.findByText("Secret copied.", { selector: '[role="status"]' })).toHaveTextContent("Secret copied.");
-    expect(writeText).toHaveBeenCalledWith("  first line\nsecond line  ");
+    expect(writeText).toHaveBeenCalledWith(value);
+  });
+
+  it("keeps the value available when the clipboard API is missing", async () => {
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: undefined });
+
+    const textarea = await revealSecret();
+    fireEvent.click(screen.getByRole("button", { name: "Copy secret" }));
+
+    expect(await screen.findByText("Copy failed. Select the value above and copy it manually.", {
+      selector: '[role="status"]',
+    })).toBeInTheDocument();
+    expect(screen.queryByText("Secret copied.")).not.toBeInTheDocument();
+    expect(textarea).toHaveValue(value);
+    expect(textarea).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Copy secret" })).toBeEnabled();
+  });
+
+  it("keeps the value available when the clipboard write method is missing", async () => {
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: {} });
+
+    const textarea = await revealSecret();
+    fireEvent.click(screen.getByRole("button", { name: "Copy secret" }));
+
+    expect(await screen.findByText("Copy failed. Select the value above and copy it manually.", {
+      selector: '[role="status"]',
+    })).toBeInTheDocument();
+    expect(screen.queryByText("Secret copied.")).not.toBeInTheDocument();
+    expect(textarea).toHaveValue(value);
+    expect(textarea).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Copy secret" })).toBeEnabled();
+  });
+
+  it("keeps the value available after a clipboard write rejects", async () => {
+    const writeText = vi.fn().mockRejectedValue(new Error("permission denied"));
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+
+    const textarea = await revealSecret();
+    fireEvent.click(screen.getByRole("button", { name: "Copy secret" }));
+
+    expect(await screen.findByText("Copy failed. Select the value above and copy it manually.", {
+      selector: '[role="status"]',
+    })).toBeInTheDocument();
+    expect(screen.queryByText("Secret copied.")).not.toBeInTheDocument();
+    expect(textarea).toHaveValue(value);
+    expect(textarea).toBeEnabled();
+    expect(writeText).toHaveBeenCalledExactlyOnceWith(value);
+    expect(screen.getByRole("button", { name: "Copy secret" })).toBeEnabled();
+  });
+
+  it("clears failure guidance and copies the same value on retry", async () => {
+    const retry = deferred<void>();
+    const writeText = vi.fn()
+      .mockRejectedValueOnce(new Error("permission denied"))
+      .mockImplementationOnce(() => retry.promise);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+
+    const textarea = await revealSecret();
+    fireEvent.click(screen.getByRole("button", { name: "Copy secret" }));
+    expect(await screen.findByText("Copy failed. Select the value above and copy it manually.", {
+      selector: '[role="status"]',
+    })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy secret" }));
+    expect(screen.queryByText("Copy failed. Select the value above and copy it manually.")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copying…" })).toBeDisabled();
+    expect(writeText).toHaveBeenCalledTimes(2);
+    expect(writeText).toHaveBeenNthCalledWith(1, value);
+    expect(writeText).toHaveBeenNthCalledWith(2, value);
+    expect(textarea).toHaveValue(value);
+
+    await act(async () => retry.resolve());
+    expect(await screen.findByText("Secret copied.", { selector: '[role="status"]' })).toBeInTheDocument();
+    expect(screen.queryByText("Copy failed. Select the value above and copy it manually.")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy secret" })).toBeEnabled();
   });
 });

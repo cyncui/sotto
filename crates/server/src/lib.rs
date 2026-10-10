@@ -75,11 +75,17 @@ pub mod db;
 pub mod encoding;
 pub mod entitlements;
 pub mod error;
+#[doc(hidden)]
+pub mod export;
 pub mod health;
 pub mod machine;
+#[doc(hidden)]
+pub mod notifications;
 pub mod org;
 pub mod person_eligibility;
 pub mod personal_billing;
+#[doc(hidden)]
+pub mod retention;
 // The lifecycle seam, HTTP adapter, and worker remain doc-hidden: deletion is enabled per
 // deployment rather than presented as a stable public API surface, and the internal seam is not
 // something an embedder should call directly.
@@ -129,10 +135,12 @@ pub fn app(state: AppState) -> Router {
         .merge(audit::router())
         .merge(entitlements::router())
         .merge(account::router())
+        .merge(export::router())
         .merge(person_eligibility::router())
         .merge(org::router())
         .merge(billing::router())
         .merge(machine::router())
+        .merge(notifications::router())
         .merge(sync::router())
         .merge(share::router())
         .merge(server_info::router())
