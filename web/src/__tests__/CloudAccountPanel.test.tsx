@@ -10,6 +10,7 @@ vi.mock("../api", () => ({
   createPersonalCheckout: vi.fn(),
   createPersonalPortal: vi.fn(),
   fetchCloudExportChunk: vi.fn(),
+  fetchCloudNotices: vi.fn(),
   fetchEligibility: vi.fn(),
   fetchPersonalQuote: vi.fn(),
   fetchPersonalOperation: vi.fn(),
@@ -36,6 +37,8 @@ const base = {
 describe("CloudAccountPanel", () => {
   beforeEach(() => vi.resetAllMocks());
 
+  beforeEach(() => vi.mocked(api.fetchCloudNotices).mockResolvedValue([]));
+
   it("does not offer checkout while eligibility evidence is unavailable", async () => {
     vi.mocked(api.fetchEligibility).mockResolvedValue({ ...base, state: "unavailable" });
 
@@ -49,14 +52,14 @@ describe("CloudAccountPanel", () => {
   it("shows the server quote before offering a personal checkout", async () => {
     vi.mocked(api.fetchEligibility).mockResolvedValue({ ...base, state: "free", actions: { ...base.actions, billing: true } });
     vi.mocked(api.fetchPersonalQuote).mockResolvedValue({
-      offer: "monthly", amountPence: 299, currency: "gbp", interval: "month", taxTreatment: "shown_at_checkout",
+      offer: "founding_monthly", amountPence: 199, currency: "gbp", interval: "month", taxTreatment: "shown_at_checkout",
       quoteVersion: 1, quoteExpiresAtEpoch: 2_000_000_000, founding: true,
-      foundingRemainingPlaces: 12, foundingTerm: "through the founding monthly term", nextRenewalAmountPence: 499,
+      foundingRemainingPlaces: 12, foundingTerm: "through the founding monthly term", nextRenewalAmountPence: 299,
     });
 
     render(<CloudAccountPanel />);
 
-    expect(await screen.findByText(/£2\.99 per month/)).toBeInTheDocument();
+    expect(await screen.findByText(/£1\.99 per month/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /secure checkout/i })).toBeInTheDocument();
     expect(screen.getByText(/12 places remain/)).toBeInTheDocument();
   });
@@ -64,7 +67,7 @@ describe("CloudAccountPanel", () => {
   it("keeps a pending checkout recoverable", async () => {
     vi.mocked(api.fetchEligibility).mockResolvedValue({ ...base, state: "pending_initial_payment" });
     vi.mocked(api.fetchPersonalOperation).mockResolvedValue({
-      operationId: "operation-1", offer: "monthly", state: "pending", checkoutUrl: null,
+      operationId: "operation-1", offer: "standard_monthly", state: "pending", checkoutUrl: null,
     });
     sessionStorage.setItem("sotto_personal_operation_id", "operation-1");
 
@@ -72,5 +75,19 @@ describe("CloudAccountPanel", () => {
 
     expect(await screen.findByRole("heading", { name: "Payment confirmation pending" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Refresh payment status" })).toBeInTheDocument();
+  });
+
+  it("shows durable account notices without unlocking the vault", async () => {
+    vi.mocked(api.fetchEligibility).mockResolvedValue({ ...base, state: "export_only", actions: { ...base.actions, export: true } });
+    vi.mocked(api.fetchCloudNotices).mockResolvedValue([{
+      noticeId: "notice-1", kind: "export_deadline", channel: "in_app",
+      content: { title: "Export window", detail: "Download your encrypted export.", effectiveAtEpoch: null, deadlineEpoch: 2_000_000_000, amountPence: null },
+      dueAtEpoch: 1_900_000_000, status: "pending", lastErrorCode: null, deliveredAtEpoch: null, createdAtEpoch: 1_900_000_000,
+    }]);
+
+    render(<CloudAccountPanel />);
+
+    expect(await screen.findByRole("heading", { name: "Account notices" })).toBeInTheDocument();
+    expect(screen.getByText("Download your encrypted export.")).toBeInTheDocument();
   });
 });

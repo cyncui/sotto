@@ -13,6 +13,7 @@ import {
   grantOrgKey,
   inviteMember,
   type AuditEvent,
+  type BillingOffer,
   type Entitlements,
   type Member,
   type Org,
@@ -185,9 +186,10 @@ export function TeamPanel({
     setError(null);
     try {
       const beneficiaryId = sponsoredBeneficiary.trim();
+      const offer: BillingOffer = "standard_monthly";
       const quote = await fetchSponsoredQuote(openOrg.org.id, {
         action: sponsoredAction,
-        offer: "monthly",
+        offer,
         beneficiaryIds: [beneficiaryId],
       });
       const effectiveFrom = Math.min(
@@ -196,7 +198,7 @@ export function TeamPanel({
       );
       const result = await createSponsoredCheckout(openOrg.org.id, {
         action: sponsoredAction,
-        offer: "monthly",
+        offer,
         beneficiaryId,
         replacementBeneficiaryId: sponsoredAction === "replace" ? sponsoredReplacement.trim() : undefined,
         quoteVersion: quote.quoteVersion,
@@ -334,7 +336,10 @@ export function TeamPanel({
                 : ""}
             </p>
           )}
-          {plan !== null && canManage && plan.billingEnabled && (
+          {plan !== null &&
+            canManage &&
+            plan.billingEnabled &&
+            (plan.tier === "team" || plan.purchasesEnabled) && (
             <p>
               {plan.tier !== "team" ? (
                 <button

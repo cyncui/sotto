@@ -162,8 +162,73 @@ export async function fetchEligibility(): Promise<EligibilityView> {
   };
 }
 
+export interface CloudNotice {
+  noticeId: string;
+  kind: string;
+  channel: string;
+  content: {
+    title: string;
+    detail: string;
+    effectiveAtEpoch: number | null;
+    deadlineEpoch: number | null;
+    amountPence: number | null;
+  };
+  dueAtEpoch: number;
+  status: string;
+  lastErrorCode: string | null;
+  deliveredAtEpoch: number | null;
+  createdAtEpoch: number;
+}
+
+export async function fetchCloudNotices(): Promise<CloudNotice[]> {
+  const body = await authedJson<Array<{
+    notice_id: string;
+    kind: string;
+    channel: string;
+    content: {
+      title: string;
+      detail: string;
+      effective_at_epoch: number | null;
+      deadline_epoch: number | null;
+      amount_pence: number | null;
+    };
+    due_at_epoch: number;
+    status: string;
+    last_error_code: string | null;
+    delivered_at_epoch: number | null;
+    created_at_epoch: number;
+  }>>(
+    "/account/notices",
+  );
+  return body.map((notice) => ({
+    noticeId: notice.notice_id,
+    kind: notice.kind,
+    channel: notice.channel,
+    content: {
+      title: notice.content.title,
+      detail: notice.content.detail,
+      effectiveAtEpoch: notice.content.effective_at_epoch,
+      deadlineEpoch: notice.content.deadline_epoch,
+      amountPence: notice.content.amount_pence,
+    },
+    dueAtEpoch: notice.due_at_epoch,
+    status: notice.status,
+    lastErrorCode: notice.last_error_code,
+    deliveredAtEpoch: notice.delivered_at_epoch,
+    createdAtEpoch: notice.created_at_epoch,
+  }));
+}
+
+export type PersonalBillingTerm = "monthly" | "annual";
+export type BillingOffer =
+  | "standard_monthly"
+  | "standard_annual"
+  | "founding_monthly"
+  | "founding_annual";
+export type PersonalBillingOffer = BillingOffer;
+
 export interface PersonalQuote {
-  offer: "monthly" | "annual";
+  offer: BillingOffer;
   amountPence: number;
   currency: string;
   interval: string;
@@ -176,9 +241,10 @@ export interface PersonalQuote {
   nextRenewalAmountPence: number;
 }
 
-export async function fetchPersonalQuote(offer: PersonalQuote["offer"]): Promise<PersonalQuote> {
+export async function fetchPersonalQuote(term: PersonalBillingTerm): Promise<PersonalQuote> {
+  const offer = term === "monthly" ? "standard_monthly" : "standard_annual";
   const body = await authedJson<{
-    offer: PersonalQuote["offer"];
+    offer: BillingOffer;
     amount_pence: number;
     currency: string;
     interval: string;
@@ -212,7 +278,7 @@ export interface PersonalCheckoutResult {
 }
 
 export async function createPersonalCheckout(input: {
-  offer: PersonalQuote["offer"];
+  offer: BillingOffer;
   idempotencyKey: string;
   quoteVersion: number;
   quoteExpiresAtEpoch: number;
@@ -366,7 +432,7 @@ export interface SponsoredQuote {
   quoteExpiresAtEpoch: number;
 }
 
-export async function fetchSponsoredQuote(orgId: string, input: { action: string; offer: string; beneficiaryIds: string[] }): Promise<SponsoredQuote> {
+export async function fetchSponsoredQuote(orgId: string, input: { action: string; offer: BillingOffer; beneficiaryIds: string[] }): Promise<SponsoredQuote> {
   const body = await postJson<{
     action: string; seat_count: number; amount_pence: number; currency: string; interval: string;
     quote_version: number; quote_expires_at_epoch: number;
@@ -379,7 +445,7 @@ export async function fetchSponsoredQuote(orgId: string, input: { action: string
 }
 
 export async function createSponsoredCheckout(orgId: string, input: {
-  action: string; offer: string; beneficiaryId: string; replacementBeneficiaryId?: string;
+  action: string; offer: BillingOffer; beneficiaryId: string; replacementBeneficiaryId?: string;
   quoteVersion: number; quoteExpiresAtEpoch: number; effectiveFrom: number; effectiveUntil?: number;
   idempotencyKey: string; returnUrl: string;
 }): Promise<{ operationId: string; state: string; checkoutUrl: string | null }> {
@@ -640,8 +706,10 @@ export interface Entitlements {
   effectiveTier: string;
   trialEndsAt: string | null;
   limits: { maxMembers: number; maxOrgProjects: number } | null;
-  /// Whether this instance can take payment; upgrade controls are hidden when `false`.
+  /// Whether configured billing can still manage an existing subscription.
   billingEnabled: boolean;
+  /// Whether new hosted purchases are enabled; falls back for servers that predate this field.
+  purchasesEnabled: boolean;
 }
 
 /// The org's plan (tier, trial, limits), visible to any member.
@@ -652,6 +720,7 @@ export async function fetchEntitlements(orgId: string): Promise<Entitlements> {
     trial_ends_at: string | null;
     limits: { max_members: number; max_org_projects: number } | null;
     billing_enabled: boolean;
+    purchases_enabled?: boolean;
   }>(`/orgs/${encodeURIComponent(orgId)}/entitlements`);
   return {
     tier: r.tier,
@@ -661,6 +730,7 @@ export async function fetchEntitlements(orgId: string): Promise<Entitlements> {
       ? { maxMembers: r.limits.max_members, maxOrgProjects: r.limits.max_org_projects }
       : null,
     billingEnabled: r.billing_enabled,
+    purchasesEnabled: r.purchases_enabled ?? r.billing_enabled,
   };
 }
 
