@@ -382,6 +382,20 @@ describe("TeamPanel billing request ownership", () => {
     id, encName: new Uint8Array(), role: "admin", encOrgKey: null,
   });
   const billablePlan: Entitlements = { ...freePlan, billingEnabled: true, purchasesEnabled: true };
+  const standardQuote: api.SponsoredQuote = {
+    action: "add",
+    offer: "standard_monthly",
+    seatCount: 1,
+    amountPence: 299,
+    currency: "gbp",
+    interval: "month",
+    quoteVersion: 2,
+    quoteExpiresAtEpoch: 2_000_000_000,
+    founding: false,
+    foundingRemainingPlaces: null,
+    foundingTerm: null,
+    nextRenewalAmountPence: 299,
+  };
 
   beforeEach(() => {
     resetMocks();
@@ -389,6 +403,126 @@ describe("TeamPanel billing request ownership", () => {
     vi.mocked(api.fetchMembers).mockResolvedValue([]);
     vi.mocked(api.fetchAudit).mockResolvedValue([]);
     vi.mocked(api.fetchEntitlements).mockResolvedValue(billablePlan);
+  });
+
+  it("keeps the selected organisation's quote when an older quote fails", async () => {
+    const firstQuote = deferred<api.SponsoredQuote>();
+    vi.mocked(api.fetchSponsoredQuote).mockImplementation((orgId) =>
+      orgId === "org-a" ? firstQuote.promise : Promise.resolve(standardQuote),
+    );
+    render(<TeamPanel master={new Uint8Array(32)} encPrivateKeys={new Uint8Array([1])} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /org-a/ }));
+    await screen.findByRole("heading", { name: "Sponsored Cloud seats" });
+    fireEvent.change(screen.getByLabelText("Beneficiary user id"), {
+      target: { value: "beneficiary-a" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Review seat price" }));
+    expect(api.fetchSponsoredQuote).toHaveBeenCalledWith("org-a", {
+      action: "add",
+      offer: "standard_monthly",
+      beneficiaryIds: ["beneficiary-a"],
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /org-b/ }));
+    await screen.findByRole("heading", { name: "Sponsored Cloud seats" });
+    fireEvent.change(screen.getByLabelText("Beneficiary user id"), {
+      target: { value: "beneficiary-b" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Review seat price" }));
+    expect(await screen.findByRole("button", { name: "Continue to checkout" })).toBeEnabled();
+
+    await act(async () => {
+      firstQuote.reject(new Error("org-a quote failed (409)"));
+    });
+
+    expect(screen.getByRole("heading", { name: "Members of org-b" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Continue to checkout" })).toBeEnabled();
+    expect(screen.getByText(/£2\.99 per month/)).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("keeps a newer checkout pending and preserves its retry after an older conflict", async () => {
+    const firstCheckout = deferred<Awaited<ReturnType<typeof api.createSponsoredCheckout>>>();
+    const secondCheckout = deferred<Awaited<ReturnType<typeof api.createSponsoredCheckout>>>();
+    let orgBCheckouts = 0;
+    vi.mocked(api.fetchSponsoredQuote).mockResolvedValue(standardQuote);
+    vi.mocked(api.createSponsoredCheckout).mockImplementation((orgId) => {
+      if (orgId === "org-a") return firstCheckout.promise;
+      orgBCheckouts += 1;
+      return orgBCheckouts === 1
+        ? secondCheckout.promise
+        : Promise.resolve({ operationId: "org-b-operation", state: "pending", checkoutUrl: null });
+    });
+    render(<TeamPanel master={new Uint8Array(32)} encPrivateKeys={new Uint8Array([1])} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /org-a/ }));
+    await screen.findByRole("heading", { name: "Sponsored Cloud seats" });
+    fireEvent.change(screen.getByLabelText("Beneficiary user id"), {
+      target: { value: "beneficiary-a" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Review seat price" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Continue to checkout" }));
+    expect(screen.getByRole("button", { name: "Preparing…" })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: /org-b/ }));
+    await screen.findByRole("heading", { name: "Sponsored Cloud seats" });
+    fireEvent.change(screen.getByLabelText("Beneficiary user id"), {
+      target: { value: "beneficiary-b" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Review seat price" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Continue to checkout" }));
+    expect(screen.getByRole("button", { name: "Preparing…" })).toBeDisabled();
+    expect(api.createSponsoredCheckout).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      firstCheckout.reject(new Error("org-a checkout failed (409)"));
+    });
+
+    expect(screen.getByRole("heading", { name: "Members of org-b" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Preparing…" })).toBeDisabled();
+    expect(screen.getByText(/£2\.99 per month/)).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    await act(async () => {
+      secondCheckout.reject(new Error("org-b checkout failed (502)"));
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent("org-b checkout failed (502)");
+    fireEvent.click(screen.getByRole("button", { name: "Continue to checkout" }));
+    expect(await screen.findByText(/pending provider confirmation/)).toBeInTheDocument();
+    expect(api.createSponsoredCheckout).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(api.createSponsoredCheckout).mock.calls[2]).toEqual(
+      vi.mocked(api.createSponsoredCheckout).mock.calls[1],
+    );
+  });
+
+  it("does not restore an old request after switching away and back", async () => {
+    const oldQuote = deferred<api.SponsoredQuote>();
+    vi.mocked(api.fetchSponsoredQuote)
+      .mockReturnValueOnce(oldQuote.promise)
+      .mockResolvedValue(standardQuote);
+    render(<TeamPanel master={new Uint8Array(32)} encPrivateKeys={new Uint8Array([1])} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /org-a/ }));
+    await screen.findByRole("heading", { name: "Sponsored Cloud seats" });
+    fireEvent.change(screen.getByLabelText("Beneficiary user id"), {
+      target: { value: "beneficiary-a" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Review seat price" }));
+    fireEvent.click(screen.getByRole("button", { name: /org-b/ }));
+    await screen.findByRole("heading", { name: "Members of org-b" });
+    fireEvent.click(screen.getByRole("button", { name: /org-a/ }));
+    await screen.findByRole("heading", { name: "Sponsored Cloud seats" });
+    fireEvent.click(screen.getByRole("button", { name: "Review seat price" }));
+    expect(await screen.findByRole("button", { name: "Continue to checkout" })).toBeEnabled();
+
+    await act(async () => {
+      oldQuote.reject(new Error("old org-a quote failed (409)"));
+    });
+
+    expect(screen.getByRole("button", { name: "Continue to checkout" })).toBeEnabled();
+    expect(screen.getByText(/£2\.99 per month/)).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   it("uses the server selected offer for sponsored checkout", async () => {
