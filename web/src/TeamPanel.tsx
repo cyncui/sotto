@@ -254,6 +254,7 @@ export function TeamPanel({
       if (result.checkoutUrl !== null) window.location.assign(result.checkoutUrl);
       else setNotice("Seat checkout is pending provider confirmation. Reload shortly.");
     } catch (e) {
+      if (!isCurrent()) return;
       // A conflict means this price or quote can no longer be honoured. Force a fresh server
       // quote before another checkout attempt instead of resubmitting the stale one.
       if (e instanceof Error && e.message.includes("(409)")) {
@@ -262,7 +263,7 @@ export function TeamPanel({
       }
       setError(message(e));
     } finally {
-      setSponsoredBusy(false);
+      if (isCurrent()) setSponsoredBusy(false);
     }
   }
 
