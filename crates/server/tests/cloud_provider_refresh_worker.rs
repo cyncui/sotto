@@ -160,6 +160,16 @@ async fn insert_job(pool: &PgPool, suffix: &str, fixture: &Fixture) -> String {
     .await
     .expect("insert worker receipt");
     sqlx::query(
+        "INSERT INTO cloud_provider_event_scopes \
+         (provider_namespace, provider_account_id, provider_environment, event_id, beneficiary_id) \
+         VALUES ('stripe', 'acct_refresh_worker', 'test', $1, $2)",
+    )
+    .bind(&event_id)
+    .bind(&fixture.beneficiary_id)
+    .execute(pool)
+    .await
+    .expect("insert worker event scope");
+    sqlx::query(
         "INSERT INTO cloud_provider_refresh_jobs \
          (job_id, provider_namespace, provider_account_id, provider_environment, event_id, \
           beneficiary_id, allocation_id, coverage_source_id) \

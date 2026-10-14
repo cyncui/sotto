@@ -24,6 +24,15 @@ fn config() -> StripeCoverageConfig {
     .unwrap()
 }
 
+fn four_price_config() -> StripeCoverageConfig {
+    config()
+        .with_founding_prices(
+            "price_contract_founding_month",
+            "price_contract_founding_year",
+        )
+        .unwrap()
+}
+
 fn binding() -> StripeAllocationBinding {
     StripeAllocationBinding::new(
         "allocation_contract_person",
@@ -152,6 +161,62 @@ fn annual_standard_price_maps_to_a_year_interval() {
     let evidence = decode(&annual).unwrap();
     assert_eq!(evidence.interval, StripeInterval::Year);
     assert_eq!(evidence.price_id, "price_contract_year");
+}
+
+#[test]
+fn founding_prices_are_recognised_and_line_metadata_is_authoritative() {
+    let mut payload = fixture();
+    payload["data"]["object"]["lines"]["data"][0]["pricing"]["price_details"]["price"] =
+        json!("price_contract_founding_month");
+    payload["data"]["object"]["lines"]["data"][0]["metadata"] = json!({
+        "sotto_allocation_reference": "allocation_contract_person"
+    });
+    payload["data"]["object"]["metadata"] = json!({});
+    let (raw, signature) = signed_payload(&payload, NOW);
+    let evidence = decode_paid_invoice(
+        &raw,
+        &signature,
+        SECRET,
+        NOW,
+        &four_price_config(),
+        &binding(),
+        &settlement(),
+    )
+    .unwrap();
+    assert_eq!(evidence.interval, StripeInterval::Month);
+    assert_eq!(evidence.price_id, "price_contract_founding_month");
+    assert_eq!(evidence.allocation_reference, "allocation_contract_person");
+}
+
+#[test]
+fn conflicting_root_and_line_allocation_metadata_is_rejected() {
+    let mut payload = fixture();
+    payload["data"]["object"]["lines"]["data"][0]["metadata"] = json!({
+        "sotto_allocation_reference": "allocation_other"
+    });
+    assert!(matches!(
+        decode(&payload),
+        Err(StripeContractError::OwnershipMismatch)
+    ));
+}
+
+#[test]
+fn four_price_configuration_rejects_partial_or_duplicate_founding_prices() {
+    assert!(matches!(
+        config().with_founding_prices("price_found_month", " "),
+        Err(StripeContractError::InvalidConfig("founding Stripe prices"))
+    ));
+    assert!(matches!(
+        config().with_founding_prices("price_contract_month", "price_found_year"),
+        Err(StripeContractError::InvalidConfig(
+            "configured Stripe prices must be distinct"
+        ))
+    ));
+    let config = four_price_config();
+    assert_eq!(
+        config.interval_for_price("price_contract_founding_year"),
+        Some(StripeInterval::Year)
+    );
 }
 
 #[test]
@@ -360,7 +425,7 @@ fn unpaid_quantity_price_and_missing_allocation_are_not_coverage() {
     assert!(matches!(
         decode(&missing_allocation),
         Err(StripeContractError::MissingField(
-            "metadata.sotto_allocation_reference"
+            "invoice subscription metadata.sotto_allocation_reference"
         ))
     ));
 

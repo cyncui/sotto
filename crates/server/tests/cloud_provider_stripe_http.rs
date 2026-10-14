@@ -226,7 +226,10 @@ fn paid_invoice() -> Value {
         "customer":"cus_1",
         "parent":{
             "type":"subscription_details",
-            "subscription_details":{"subscription":"sub_1"}
+            "subscription_details":{
+                "subscription":"sub_1",
+                "metadata":{"sotto_allocation_reference":"alloc_1"}
+            }
         },
         "status":"paid",
         "currency":"gbp",
@@ -236,7 +239,6 @@ fn paid_invoice() -> Value {
         "amount_overpaid":0,
         "amount_paid_off_stripe":0,
         "livemode":false,
-        "metadata":{"sotto_allocation_reference":"alloc_1"}
     })
 }
 
@@ -269,6 +271,7 @@ fn personal_line(id: &str) -> Value {
             "type":"price_details",
             "price_details":{"price":"price_month"}
         },
+        "metadata":{"sotto_allocation_reference":"alloc_1"},
         "period":{"start":1700000000,"end":1702592000}
     })
 }

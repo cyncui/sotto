@@ -10,6 +10,18 @@ use std::sync::Arc;
 use sotto_server::auth::GithubOAuth;
 use sotto_server::auth::OAuthProvider;
 use sotto_server::billing::BillingState;
+#[cfg(not(feature = "e2e-mock-billing"))]
+use sotto_server::billing_catalogue::{BillingOffer, BillingPriceCatalogue};
+#[cfg(not(feature = "e2e-mock-billing"))]
+use sotto_server::cloud_provider::ProviderEnvironment;
+#[cfg(not(feature = "e2e-mock-billing"))]
+use sotto_server::cloud_provider_stripe::StripeCoverageConfig;
+#[cfg(not(feature = "e2e-mock-billing"))]
+use sotto_server::cloud_provider_stripe_http::StripeReadClient;
+#[cfg(not(feature = "e2e-mock-billing"))]
+use sotto_server::cloud_provider_stripe_http::StripeReadLimits;
+#[cfg(not(feature = "e2e-mock-billing"))]
+use sotto_server::cloud_provider_stripe_sponsored::SponsoredStripeCoverageConfig;
 use sotto_server::config::Config;
 use sotto_server::db;
 use sotto_server::error::{Error, Result};
@@ -51,28 +63,104 @@ async fn run() -> Result<()> {
         eprintln!("warning: GITHUB_CLIENT_ID/SECRET unset - OAuth endpoints will return 503");
     }
 
-    let billing = config.billing.clone().map(|billing| {
-        #[cfg(feature = "e2e-mock-billing")]
-        {
-            eprintln!(
+    #[allow(unused_mut)]
+    let mut personal_coverage_runtime = None;
+    let billing = if let Some(billing) = config.billing.clone() {
+        Some({
+            #[cfg(feature = "e2e-mock-billing")]
+            {
+                eprintln!(
                 "warning: built with `e2e-mock-billing` - checkout pages are local test fixtures. \
                  Never deploy this build."
             );
-            // The browser leaves the Vite preview for this provider page, so use the API origin
-            // already used by the E2E OAuth adapter. The fallback only covers a feature-only local
-            // server run where no public OAuth origin has been configured.
-            let provider_origin = config
-                .oauth
-                .as_ref()
-                .map(|oauth| oauth.public_base_url.clone())
-                .unwrap_or_else(|| "http://127.0.0.1:8080".into());
-            BillingState::with_e2e_provider(billing, provider_origin)
-        }
-        #[cfg(not(feature = "e2e-mock-billing"))]
+                // The browser leaves the Vite preview for this provider page, so use the API origin
+                // already used by the E2E OAuth adapter. The fallback only covers a feature-only local
+                // server run where no public OAuth origin has been configured.
+                let provider_origin = config
+                    .oauth
+                    .as_ref()
+                    .map(|oauth| oauth.public_base_url.clone())
+                    .unwrap_or_else(|| "http://127.0.0.1:8080".into());
+                BillingState::with_e2e_provider(billing, provider_origin)
+            }
+            #[cfg(not(feature = "e2e-mock-billing"))]
+            {
+                let mut state = BillingState::from_config(billing.clone());
+                if config.provider_refresh_ingest_enabled || config.provider_refresh_worker_enabled
+                {
+                    let account_id = config.stripe_account_id.as_deref().ok_or_else(|| {
+                        Error::Config("provider refresh requires STRIPE_ACCOUNT_ID".into())
+                    })?;
+                    let environment = stripe_environment(&billing.api_key).ok_or_else(|| {
+                        Error::Config("provider refresh requires a Stripe test or live key".into())
+                    })?;
+                    let ids = billing.price_catalogue.as_ref().ok_or_else(|| {
+                        Error::Config(
+                            "provider refresh requires all four hosted Stripe prices".into(),
+                        )
+                    })?;
+                    let coverage = StripeCoverageConfig::new(
+                        account_id,
+                        environment,
+                        ids.standard_monthly.clone(),
+                        ids.standard_annual.clone(),
+                    )
+                    .and_then(|coverage| {
+                        coverage.with_founding_prices(
+                            ids.founding_monthly.clone(),
+                            ids.founding_annual.clone(),
+                        )
+                    })
+                    .map_err(|_| {
+                        Error::Config(
+                            "configured Stripe prices do not form a valid coverage identity".into(),
+                        )
+                    })?;
+                    let client = StripeReadClient::new(
+                        billing.api_key.clone(),
+                        &coverage,
+                        StripeReadLimits::default(),
+                    )
+                    .map_err(|_| {
+                        Error::Config("configured provider refresh limits are invalid".into())
+                    })?;
+                    let sponsored_coverage = SponsoredStripeCoverageConfig::new(
+                        account_id,
+                        environment,
+                        ids.standard_monthly.clone(),
+                        ids.standard_annual.clone(),
+                        ids.founding_monthly.clone(),
+                        ids.founding_annual.clone(),
+                    )
+                    .map_err(|_| {
+                        Error::Config(
+                            "configured sponsored Stripe prices do not form a valid coverage identity".into(),
+                        )
+                    })?;
+                    personal_coverage_runtime =
+                        Some((coverage.clone(), sponsored_coverage, client.clone()));
+                    state = state.with_personal_coverage(
+                        coverage,
+                        client,
+                        config.provider_refresh_ingest_enabled,
+                    );
+                }
+                state
+            }
+        })
+    } else {
+        None
+    };
+    #[cfg(not(feature = "e2e-mock-billing"))]
+    if let Some((coverage, _, stripe)) = &personal_coverage_runtime {
+        if let Some(ids) = config
+            .billing
+            .as_ref()
+            .and_then(|billing| billing.price_catalogue.as_ref())
         {
-            BillingState::from_config(billing)
+            verify_provider_refresh_configuration(stripe, coverage, ids).await?;
         }
-    });
+    }
     // AppState owns billing; keep only the provider handle for the optional worker.
     let worker_provider = billing.as_ref().map(BillingState::provider);
 
@@ -96,7 +184,7 @@ async fn run() -> Result<()> {
     println!("deployment mode: {}", config.deployment_mode.as_str());
     println!("cloud sales: {}", config.cloud_sales_enabled);
     println!(
-        "provider refresh configuration (runtime wiring pending): ingest={}, worker={}, reconciliation={}",
+        "provider refresh: ingest={}, worker={}, reconciliation={}",
         config.provider_refresh_ingest_enabled,
         config.provider_refresh_worker_enabled,
         config.provider_refresh_reconciliation_enabled
@@ -132,6 +220,19 @@ async fn run() -> Result<()> {
     if config.organisation_deletion_worker_enabled {
         sotto_server::org_deletion_worker::spawn(pool.clone(), worker_provider);
     }
+    if config.provider_refresh_worker_enabled {
+        let Some((coverage, sponsored_coverage, stripe)) = personal_coverage_runtime else {
+            return Err(Error::Config(
+                "provider refresh worker requires configured personal Stripe coverage".into(),
+            ));
+        };
+        sotto_server::cloud_provider_stripe_refresh_executor::spawn(
+            pool.clone(),
+            stripe,
+            coverage,
+            sponsored_coverage,
+        );
+    }
     sotto_server::telemetry::spawn(pool, config.telemetry.clone());
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr)
@@ -141,4 +242,50 @@ async fn run() -> Result<()> {
     axum::serve(listener, sotto_server::app(state))
         .await
         .map_err(|e| Error::Io(e.to_string()))
+}
+
+#[cfg(not(feature = "e2e-mock-billing"))]
+fn stripe_environment(api_key: &str) -> Option<ProviderEnvironment> {
+    if api_key.starts_with("sk_test_") || api_key.starts_with("rk_test_") {
+        Some(ProviderEnvironment::Test)
+    } else if api_key.starts_with("sk_live_") || api_key.starts_with("rk_live_") {
+        Some(ProviderEnvironment::Live)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(feature = "e2e-mock-billing"))]
+async fn verify_provider_refresh_configuration(
+    stripe: &StripeReadClient,
+    coverage: &StripeCoverageConfig,
+    ids: &sotto_server::config::BillingPriceIds,
+) -> Result<()> {
+    let mut session = stripe.session();
+    stripe.account(&mut session).await.map_err(|_| {
+        Error::Config("Stripe account identity or mode could not be verified".into())
+    })?;
+    let mut observations = Vec::new();
+    for (offer, price_id) in [
+        (BillingOffer::StandardMonthly, &ids.standard_monthly),
+        (BillingOffer::StandardAnnual, &ids.standard_annual),
+        (BillingOffer::FoundingMonthly, &ids.founding_monthly),
+        (BillingOffer::FoundingAnnual, &ids.founding_annual),
+    ] {
+        let observation = stripe
+            .price_observation(&mut session, price_id)
+            .await
+            .map_err(|_| Error::Config("a configured Stripe price could not be verified".into()))?;
+        observations.push((offer, observation));
+    }
+    BillingPriceCatalogue::from_provider_prices(
+        coverage.account_id.clone(),
+        coverage.environment,
+        ids,
+        observations,
+    )
+    .map_err(|_| {
+        Error::Config("configured Stripe prices do not match the Cloud catalogue".into())
+    })?;
+    Ok(())
 }

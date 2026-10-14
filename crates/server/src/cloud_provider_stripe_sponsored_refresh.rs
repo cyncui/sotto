@@ -1,11 +1,10 @@
-//! Sponsored Stripe refresh execution for durable provider jobs.
+//! Bounded sponsored Stripe collection for durable provider refreshes.
 //!
-//! This module is the provider-specific executor behind the generic refresh queue. It deliberately
-//! remains dormant until the runtime wires it into the worker: the implementation is complete and
-//! testable, but enabling it is a separate rollout decision. A sponsored beneficiary can have
-//! sources represented by several invoices, so collection reads a bounded recent subscription
-//! prefix, selects the newest valid invoice candidate for each source, and only then crosses the
-//! reconciliation adapter.
+//! A sponsored beneficiary can have sources represented by several invoices. Collection reads a
+//! bounded recent subscription prefix, selects the newest valid invoice candidate for each source,
+//! and crosses the reconciliation adapter only with one complete observation per requested source.
+//! The production worker dispatches through the mixed payer executor, which combines this reader
+//! with personal Stripe evidence before completing the beneficiary's ticket.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -284,7 +283,6 @@ pub async fn collect_sponsored_collection(
     ticket: &crate::cloud_coverage_reconciliation::CollectionTicket,
     limits: SponsoredRefreshLimits,
 ) -> Result<VerifiedCollection, SponsoredRefreshError> {
-    let limits = limits.validate()?;
     let invoice_id =
         event
             .provider_object_id
@@ -292,6 +290,73 @@ pub async fn collect_sponsored_collection(
             .ok_or(SponsoredRefreshError::InvalidInput(
                 "triggering invoice id is required",
             ))?;
+    if event.event_type != "invoice.paid"
+        || event.subscription_id.as_deref() != Some(allocation.subscription_id.as_str())
+        || allocation.payer_kind != crate::cloud_provider::PayerKind::Sponsor
+        || context.namespace != crate::cloud_provider_stripe::STRIPE_NAMESPACE
+        || context.account_id != coverage.account_id()
+        || context.environment != coverage.environment()
+        || ticket.beneficiary_id != allocation.beneficiary_id
+    {
+        return Err(SponsoredRefreshError::InvalidInput(
+            "triggering event does not match sponsored subscription scope",
+        ));
+    }
+    collect_sponsored_subscription_history(
+        pool,
+        stripe,
+        coverage,
+        context,
+        allocation,
+        ticket,
+        limits,
+        Some(invoice_id),
+    )
+    .await
+}
+
+/// Collect one sponsored subscription's bounded history for its subset of a beneficiary ticket.
+///
+/// This path has no triggering invoice requirement and is used for other sponsored subscriptions
+/// already present in a mixed payer/source set. Their newest usable paid invoices are sufficient;
+/// the event that invalidated the beneficiary remains the same immutable provider event.
+pub async fn collect_sponsored_subscription_collection(
+    pool: &PgPool,
+    stripe: &StripeReadClient,
+    coverage: &SponsoredStripeCoverageConfig,
+    context: &ProviderContext,
+    allocation: &VerifiedAllocation,
+    ticket: &crate::cloud_coverage_reconciliation::CollectionTicket,
+    limits: SponsoredRefreshLimits,
+) -> Result<VerifiedCollection, SponsoredRefreshError> {
+    if allocation.payer_kind != crate::cloud_provider::PayerKind::Sponsor
+        || context.namespace != crate::cloud_provider_stripe::STRIPE_NAMESPACE
+        || context.account_id != coverage.account_id()
+        || context.environment != coverage.environment()
+        || ticket.beneficiary_id != allocation.beneficiary_id
+    {
+        return Err(SponsoredRefreshError::InvalidInput(
+            "sponsored subscription scope does not match ticket",
+        ));
+    }
+    collect_sponsored_subscription_history(
+        pool, stripe, coverage, context, allocation, ticket, limits, None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn collect_sponsored_subscription_history(
+    pool: &PgPool,
+    stripe: &StripeReadClient,
+    coverage: &SponsoredStripeCoverageConfig,
+    context: &ProviderContext,
+    allocation: &VerifiedAllocation,
+    ticket: &crate::cloud_coverage_reconciliation::CollectionTicket,
+    limits: SponsoredRefreshLimits,
+    triggering_invoice_id: Option<&str>,
+) -> Result<VerifiedCollection, SponsoredRefreshError> {
+    let limits = limits.validate()?;
     let mut session = stripe.session();
     let mut invoices = stripe
         .subscription_invoices_bounded(
@@ -302,21 +367,23 @@ pub async fn collect_sponsored_collection(
         )
         .await
         .map_err(SponsoredRefreshError::Stripe)?;
-    if !invoices.iter().any(|invoice| invoice.id == invoice_id) {
-        invoices.push(
-            stripe
-                .invoice(&mut session, invoice_id)
-                .await
-                .map_err(SponsoredRefreshError::Stripe)?,
-        );
-    }
-    let Some(trigger) = invoices.iter().find(|invoice| invoice.id == invoice_id) else {
-        return Err(SponsoredRefreshError::TriggerInvoiceMissing);
-    };
-    if trigger.status.as_deref() != Some("paid") {
-        return Err(SponsoredRefreshError::InvalidInput(
-            "triggering invoice is not paid",
-        ));
+    if let Some(invoice_id) = triggering_invoice_id {
+        if !invoices.iter().any(|invoice| invoice.id == invoice_id) {
+            invoices.push(
+                stripe
+                    .invoice(&mut session, invoice_id)
+                    .await
+                    .map_err(SponsoredRefreshError::Stripe)?,
+            );
+        }
+        let Some(trigger) = invoices.iter().find(|invoice| invoice.id == invoice_id) else {
+            return Err(SponsoredRefreshError::TriggerInvoiceMissing);
+        };
+        if trigger.status.as_deref() != Some("paid") {
+            return Err(SponsoredRefreshError::InvalidInput(
+                "triggering invoice is not paid",
+            ));
+        }
     }
 
     let expected_sources = ticket

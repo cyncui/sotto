@@ -2,6 +2,14 @@
 
 *Traducción al español de [README.md](README.md). El texto original en inglés es la versión oficial y prevalece en caso de discrepancias.*
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="web/public/mark-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="web/public/mark-light.svg">
+    <img src="web/public/mark-dark.svg" alt="Sotto" width="64" height="64">
+  </picture>
+</p>
+
 # Sotto
 
 Sincronización de secretos con cifrado de extremo a extremo para equipos de desarrollo. Deja de enviar tu `.env` por Slack.
@@ -110,12 +118,23 @@ sotto export --format dotenv --reveal   # print a .env; refuses a terminal witho
 sotto run -- npm start       # inject the environment's secrets into any command
 sotto login && sotto push    # optional: sync ciphertext via the hosted instance (getsotto.co.uk)
 sotto get DATABASE_URL -c    # copy a secret without printing it; clipboard clears after 45s when unchanged
-sotto share DATABASE_URL     # one-time link; copied automatically in an interactive terminal
-sotto share DATABASE_URL --views 3
-sotto share DATABASE_URL --expire 3600   # lifetime in seconds
+sotto share DATABASE_URL     # choose view and lifetime limits in an interactive terminal
+sotto share DATABASE_URL --views 3 --expire 3600   # skip both limit prompts
 ```
 
-De forma predeterminada, un enlace compartido permite una vista y no caduca; el enlace deja de funcionar después de la última vista.
+En un terminal interactivo, cada límite omitido abre su propio menú. El menú de visualizaciones
+ofrece 1, 2, 3, 5 o 10 visualizaciones y un valor personalizado; el menú de duración ofrece sin
+caducidad, 1 hora, 1 día, 7 días, 30 días o un número de segundos personalizado. Los valores
+personalizados deben ser de 1 a 100 visualizaciones o de 1 a 2592000 segundos. Proporcionar
+`DATABASE_URL` omite solo la selección del secreto: `--views` omite el menú de visualizaciones y
+`--expire` omite el menú de duración de forma independiente. Pulsa Esc o Ctrl-C en cualquier menú
+de selección para cancelar sin crear un enlace.
+
+El uso no interactivo requiere un nombre de secreto explícito. Cuando se omite cualquiera de los
+límites, se aplica su valor predeterminado: una visualización y sin caducidad. Para omitir los tres
+menús de selección en un terminal interactivo, proporciona el nombre y ambos límites, por ejemplo
+`sotto share DATABASE_URL --views 3 --expire 3600`. Es posible que todavía se soliciten el
+desbloqueo y la frase de contraseña.
 
 Para explorar los secretos de forma interactiva, consulta la [guía del panel](#panel-interactivo).
 
@@ -130,6 +149,7 @@ sotto ls --env staging
 
 Exportar escribe texto plano, por lo que necesita `--reveal` en un terminal, igual que `sotto get`.
 Usa `sotto share --no-copy` para desactivar la copia interactiva, o `--copy` para solicitarla explícitamente.
+Estas opciones solo controlan el portapapeles; `--no-copy` no omite los menús de límites del enlace.
 El borrado del portapapeles es una medida de mejor esfuerzo: si reemplazas el contenido se protege el nuevo valor,
 mientras que los gestores del portapapeles, la suspensión o la terminación del proceso auxiliar pueden conservar una copia.
 
@@ -148,10 +168,81 @@ sotto grant <user-id>                      # share the active environment (they 
 sotto token create --name ci               # SOTTO_TOKEN: run/export in CI, no password needed
 ```
 
-Los tokens de máquina caducan. Un token nuevo dura 90 días salvo que pases `--expires-in-days` con
-un valor de 1 a 365, y `sotto token ls` muestra cuándo termina cada uno. Dos semanas antes,
-`sotto run` y `sotto export` muestran un aviso en el registro de la CI. Para sustituir un token,
-crea uno nuevo, actualiza el secreto de la CI y después revoca el antiguo con `sotto token revoke`.
+Los tokens de máquina caducan. Uno nuevo dura 90 días, salvo que indiques `--expires-in-days` con
+un valor de 1 a 365; `sotto token ls` muestra cuándo termina cada uno. Dos semanas antes,
+`sotto run` y `sotto export` muestran un aviso en el registro de la CI.
+
+Los comandos de tokens usan el acceso del usuario con sesión iniciada y el entorno seleccionado.
+En un entorno de una organización, solo un administrador o propietario puede gestionar tokens
+de máquina. Los listados incluyen solo metadatos de tokens activos: se omiten los revocados y
+caducados, y el listado no permite recuperar la credencial que se muestra una sola vez al crear
+un token con `sotto token create`. El JSON incluye `token_id`, `name`, `created_by`,
+`beneficiary_id`, `beneficiary_status`, `expires_at` y `expires_in_days`; los campos de
+caducidad pueden ser null. El `token_id` es el ID que se revoca, no el nombre del token ni el
+secreto `SOTTO_TOKEN`.
+
+Usa estos comandos para consultar, sustituir y revocar un token. La selección del entorno solo
+se aplica a este comando:
+
+```sh
+sotto token ls
+sotto token ls --json
+sotto --env staging token ls --json
+sotto token create --name ci
+sotto token revoke <token-id>
+```
+
+Para sustituir un token de CI, identifica el ID antiguo en el listado, crea uno nuevo, actualiza
+el secreto de la CI y verifica que la CI lo use; después revoca el ID antiguo con
+`sotto token revoke <token-id>`. La revocación impide de inmediato que ese token se autentique
+en la API, pero no rota la clave del entorno. Para un entorno de una organización, consulta las
+instrucciones existentes de `sotto rotate` cuando sea necesario rotar la clave. Ni la revocación
+ni la rotación pueden borrar el texto plano que ya se haya copiado.
+
+### Estado de Cloud
+
+Para consultar el servidor configurado y la elegibilidad de tu cuenta para Cloud, inicia sesión primero:
+
+```sh
+sotto login
+sotto cloud status
+sotto cloud status --json
+```
+
+El comando necesita una sesión activa, pero no desbloquea el almacén local ni abre un navegador. Muestra el `server` configurado, el `server_info` del servidor, la `eligibility` de la cuenta y un `billing_url` solo cuando el estado devuelto indica que la facturación está disponible. La salida legible también muestra `actions`, `next_actions` y los valores opcionales `paid_through_epoch`, `recovery_until_epoch` o `export_until_epoch`. Si falta `server_info` o `eligibility`, significa que un servidor antiguo no expone ese endpoint; no demuestra que el acceso esté permitido o denegado.
+
+El formato JSON es útil para scripts. Su estructura de nivel superior es:
+
+```json
+{
+  "server": "https://getsotto.co.uk",
+  "billing_url": "https://getsotto.co.uk/cloud",
+  "server_info": {
+    "deployment_mode": "cloud",
+    "entitlement_model": "person"
+  },
+  "eligibility": {
+    "model": "person_eligibility_v1",
+    "state": "paid",
+    "deployment_mode": "cloud",
+    "account_initialized": true,
+    "billing_available": true,
+    "paid_through_epoch": 1798761600,
+    "recovery_until_epoch": null,
+    "export_until_epoch": null,
+    "actions": {
+      "setup": false,
+      "billing": false,
+      "export": false,
+      "revoke": true
+    },
+    "next_actions": ["revoke"],
+    "payer": "personal"
+  }
+}
+```
+
+El ejemplo es sintético; `actions` y las fechas opcionales proceden del estado devuelto de la cuenta, y los servidores antiguos pueden devolver null para cualquiera de los dos endpoints. `sotto cloud status` solo informa del estado y puede mostrar una URL de facturación. No inicia una compra ni cambia la elegibilidad. Para diagnosticar el almacén local y los entornos, usa `sotto status`; esa vista es independiente de la información del servidor y de la cuenta anterior.
 
 ### Panel interactivo
 
@@ -178,6 +269,36 @@ Pulsa `t` para recorrer los temas con vista previa en directo. Usa las flechas p
 y pulsa `Enter` para guardar tu elección o `Esc` para cancelar. Las
 [reglas de precedencia de los temas](#temas-de-salida) explican cómo los ajustes del comando y del
 entorno afectan a la preferencia guardada.
+
+### Consultar el estado local
+
+Ejecuta `sotto status` para ver si existe una identidad local, si la sesión está desbloqueada y
+qué proyecto y entorno selecciona el directorio actual. Lee el estado local. No comprueba la
+conexión con el servidor ni garantiza que todos los secretos guardados se puedan descifrar.
+
+```sh
+sotto status
+sotto status --json
+```
+
+Usa `sotto status --json` en scripts. `initialized` indica si existe una identidad local y
+`unlocked` indica si hay una clave maestra en caché. `project` contiene `name` y `environment`
+del `sotto.toml` más cercano, o es `null` fuera de un proyecto configurado. Un comando correcto
+puede mostrar `unlocked: false`; los scripts que necesitan una sesión desbloqueada deben consultar ese campo.
+
+Estos ejemplos JSON son ilustrativos. Con un `sotto.toml` pero sin identidad local:
+
+```json
+{"initialized":false,"project":{"environment":"dev","name":"demo"},"unlocked":false}
+```
+
+Sin un `sotto.toml` ni identidad local:
+
+```json
+{"initialized":false,"project":null,"unlocked":false}
+```
+
+Si falta `sotto.toml`, no hay ningún proyecto seleccionado. Un archivo mal formado o ilegible produce un error.
 
 ### Temas de salida
 

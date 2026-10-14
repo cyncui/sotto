@@ -77,6 +77,8 @@ pub struct Config {
     pub oauth: Option<OAuthConfig>,
     /// Stripe billing configuration, present only for Cloud deployments when the `STRIPE_*` variables are set.
     pub billing: Option<BillingConfig>,
+    /// Operator-selected Stripe account identity for provider evidence, when configured.
+    pub stripe_account_id: Option<String>,
     /// Anonymous version-ping telemetry (see [`crate::telemetry`] and the README).
     pub telemetry: TelemetryConfig,
     /// Recovery window applied to new organisation-deletion requests.
@@ -240,6 +242,7 @@ impl Config {
         } else {
             None
         };
+        let stripe_account_id = env_nonempty("STRIPE_ACCOUNT_ID");
         if hosted_catalogue_configured && billing.is_none() {
             // The hosted catalogue is dormant until the hosted billing route lands. Keep one
             // complete Stripe configuration boundary for now so legacy billing cannot silently
@@ -282,6 +285,13 @@ impl Config {
                 .ok()
                 .as_deref(),
         );
+        validate_provider_refresh_configuration(
+            provider_refresh_ingest_enabled,
+            provider_refresh_worker_enabled,
+            provider_refresh_reconciliation_enabled,
+            billing.as_ref(),
+            stripe_account_id.as_deref(),
+        )?;
         let cloud_action_enforcement_enabled =
             feature_flag_is_enabled(std::env::var(CLOUD_ACTION_ENFORCEMENT_ENV).ok().as_deref());
         let machine_eligibility_enforcement_enabled = feature_flag_is_enabled(
@@ -296,6 +306,7 @@ impl Config {
             deployment_mode,
             oauth,
             billing,
+            stripe_account_id,
             telemetry,
             organisation_deletion_retention_days,
             organisation_deletion_worker_enabled,
@@ -309,6 +320,44 @@ impl Config {
             cloud_sales_enabled,
         })
     }
+}
+
+fn validate_provider_refresh_configuration(
+    ingest_enabled: bool,
+    worker_enabled: bool,
+    reconciliation_enabled: bool,
+    billing: Option<&BillingConfig>,
+    stripe_account_id: Option<&str>,
+) -> Result<()> {
+    if reconciliation_enabled {
+        return Err(Error::Config(
+            "SOTTO_PROVIDER_REFRESH_RECONCILIATION_ENABLED is not supported yet".into(),
+        ));
+    }
+    if !ingest_enabled && !worker_enabled {
+        return Ok(());
+    }
+    let billing =
+        billing.ok_or_else(|| Error::Config("provider refresh requires Stripe billing".into()))?;
+    if billing.price_catalogue.is_none() {
+        return Err(Error::Config(
+            "provider refresh requires all four hosted Stripe prices".into(),
+        ));
+    }
+    if stripe_account_id.is_none_or(str::is_empty) {
+        return Err(Error::Config(
+            "provider refresh requires STRIPE_ACCOUNT_ID".into(),
+        ));
+    }
+    if !["sk_test_", "rk_test_", "sk_live_", "rk_live_"]
+        .iter()
+        .any(|prefix| billing.api_key.starts_with(prefix))
+    {
+        return Err(Error::Config(
+            "provider refresh requires a Stripe test or live API key".into(),
+        ));
+    }
+    Ok(())
 }
 
 const BILLING_CATALOGUE_ENV: [&str; 4] = [
@@ -370,6 +419,21 @@ fn billing_price_catalogue_from_values(
         ));
     }
     let [standard_monthly, standard_annual, founding_monthly, founding_annual] = values;
+    let ids = [
+        standard_monthly.as_deref().expect("checked above"),
+        standard_annual.as_deref().expect("checked above"),
+        founding_monthly.as_deref().expect("checked above"),
+        founding_annual.as_deref().expect("checked above"),
+    ];
+    if ids
+        .iter()
+        .enumerate()
+        .any(|(index, id)| ids[..index].contains(id))
+    {
+        return Err(Error::Config(
+            "hosted Stripe price ids must be distinct".into(),
+        ));
+    }
     Ok(Some(BillingPriceIds {
         standard_monthly: standard_monthly.expect("checked above"),
         standard_annual: standard_annual.expect("checked above"),
@@ -471,7 +535,8 @@ mod tests {
         billing_price_catalogue_from_values, billing_return_url, feature_flag_is_enabled,
         organisation_deletion_retention_from_env_result, organisation_deletion_worker_is_enabled,
         parse_organisation_deletion_retention_days, telemetry_ping_enabled,
-        validate_cloud_sales_configuration, validate_deployment_billing_boundary, DeploymentMode,
+        validate_cloud_sales_configuration, validate_deployment_billing_boundary,
+        validate_provider_refresh_configuration, BillingConfig, BillingPriceIds, DeploymentMode,
         DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS, MAX_ORGANISATION_DELETION_RETENTION_DAYS,
     };
 
@@ -511,6 +576,52 @@ mod tests {
         assert!(validate_deployment_billing_boundary(DeploymentMode::SelfHosted, true).is_err());
         assert!(validate_deployment_billing_boundary(DeploymentMode::SelfHosted, false).is_ok());
         assert!(validate_deployment_billing_boundary(DeploymentMode::Cloud, true).is_ok());
+    }
+
+    #[test]
+    fn provider_refresh_controls_are_dark_or_require_complete_stripe_identity() {
+        assert!(validate_provider_refresh_configuration(false, false, false, None, None).is_ok());
+        assert!(validate_provider_refresh_configuration(false, false, true, None, None).is_err());
+        assert!(validate_provider_refresh_configuration(true, false, false, None, None).is_err());
+
+        let incomplete = BillingConfig {
+            api_key: "rk_test_secret".into(),
+            webhook_secret: "whsec_test".into(),
+            price_id: "price_legacy".into(),
+            price_catalogue: None,
+            cloud_sales_enabled: false,
+            return_url: "https://app.example.test".into(),
+        };
+        assert!(validate_provider_refresh_configuration(
+            false,
+            true,
+            false,
+            Some(&incomplete),
+            Some("acct_test"),
+        )
+        .is_err());
+
+        let complete = BillingConfig {
+            price_catalogue: Some(BillingPriceIds {
+                standard_monthly: "price_standard_month".into(),
+                standard_annual: "price_standard_year".into(),
+                founding_monthly: "price_founding_month".into(),
+                founding_annual: "price_founding_year".into(),
+            }),
+            ..incomplete
+        };
+        assert!(validate_provider_refresh_configuration(
+            true,
+            true,
+            false,
+            Some(&complete),
+            Some("acct_test"),
+        )
+        .is_ok());
+        assert!(
+            validate_provider_refresh_configuration(true, true, false, Some(&complete), None,)
+                .is_err()
+        );
     }
 
     #[test]

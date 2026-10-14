@@ -1,5 +1,13 @@
 [English](README.md) | [Español](README.es.md) | [Français](README.fr.md) | [Deutsch](README.de.md) | [Português (BR)](README.pt-BR.md)
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="web/public/mark-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="web/public/mark-light.svg">
+    <img src="web/public/mark-dark.svg" alt="Sotto" width="64" height="64">
+  </picture>
+</p>
+
 # Sotto
 
 End-to-end encrypted secret sync for developer teams. Stop Slacking your `.env`.
@@ -107,12 +115,21 @@ sotto export --format dotenv --reveal   # print a .env; refuses a terminal witho
 sotto run -- npm start       # inject the environment's secrets into any command
 sotto login && sotto push    # optional: sync ciphertext via the hosted instance (getsotto.co.uk)
 sotto get DATABASE_URL -c    # copy a secret without printing it; clipboard clears after 45s when unchanged
-sotto share DATABASE_URL     # one-time link; copied automatically in an interactive terminal
-sotto share DATABASE_URL --views 3
-sotto share DATABASE_URL --expire 3600   # lifetime in seconds
+sotto share DATABASE_URL     # choose view and lifetime limits in an interactive terminal
+sotto share DATABASE_URL --views 3 --expire 3600   # skip both limit prompts
 ```
 
-By default, a share allows one view and has no expiry; the link burns after the last view.
+In an interactive terminal, each omitted share limit opens its own menu. The view menu offers
+1, 2, 3, 5 or 10 views and a custom value; the lifetime menu offers no expiry, 1 hour, 1 day,
+7 days, 30 days or a custom number of seconds. Custom values must be 1-100 views or
+1-2592000 seconds. Supplying `DATABASE_URL` skips secret selection only: `--views` skips the view
+menu and `--expire` skips the lifetime menu independently. Press Esc or Ctrl-C in any selection
+menu to cancel without creating a share.
+
+Non-interactive use requires an explicit secret name. When either limit flag is omitted there,
+its existing default applies: one view and no expiry. To bypass all three selection menus in an
+interactive terminal, supply the name and both limits, for example
+`sotto share DATABASE_URL --views 3 --expire 3600`. Unlock and passphrase prompts may still apply.
 
 To browse secrets interactively, see the [dashboard guide](#interactive-dashboard).
 
@@ -127,6 +144,7 @@ sotto ls --env staging
 
 Export writes plaintext, so it needs `--reveal` on a terminal, just like `sotto get`.
 Use `sotto share --no-copy` to disable interactive copying, or `--copy` to request it explicitly.
+These flags control the clipboard only; `--no-copy` does not skip the share limit menus.
 Clipboard clearing is best-effort: replacing the clipboard protects the newer content, while
 clipboard managers, suspension, or a terminated helper may retain a history copy.
 
@@ -147,8 +165,78 @@ sotto token create --name ci               # SOTTO_TOKEN: run/export in CI, no p
 
 Machine tokens expire. A new token lasts 90 days unless you pass `--expires-in-days` with anything
 from 1 to 365, and `sotto token ls` shows when each one ends. Two weeks before that, `sotto run` and
-`sotto export` print a warning in the CI log. To replace a token, create a new one, update the CI
-secret, then revoke the old one with `sotto token revoke`.
+`sotto export` print a warning in the CI log.
+
+Token commands use the logged-in user's access and the selected environment. In an organisation
+environment, only an admin or owner can manage machine tokens. Listings contain active-token
+metadata only: revoked and expired tokens are omitted, and the credential printed once by
+`sotto token create` cannot be retrieved by listing. JSON includes `token_id`, `name`,
+`created_by`, `beneficiary_id`, `beneficiary_status`, `expires_at` and `expires_in_days`;
+expiry fields may be null. The `token_id` is the ID to revoke, not the token's name or the
+`SOTTO_TOKEN` secret.
+
+Use these commands to inspect, replace and revoke a token. The environment override applies to
+this command only:
+
+```sh
+sotto token ls
+sotto token ls --json
+sotto --env staging token ls --json
+sotto token create --name ci
+sotto token revoke <token-id>
+```
+
+To replace a CI token, identify the old ID in the listing, create a replacement, update the CI
+secret and verify CI uses it, then revoke the old ID with `sotto token revoke <token-id>`.
+Revocation immediately stops that token from authenticating to the API; it does not rotate the
+environment key. For an organisation environment, see the existing `sotto rotate` guidance
+when key rotation is needed. Neither revocation nor rotation can erase plaintext that was already
+copied.
+
+### Cloud status
+
+To inspect the configured server and your account's Cloud eligibility, first log in:
+
+```sh
+sotto login
+sotto cloud status
+sotto cloud status --json
+```
+
+The command needs an active login but does not unlock the local vault or open a browser. It reports the configured `server`, the server's `server_info`, the account `eligibility`, and a `billing_url` only when the returned state says billing is available. The human-readable output also shows `actions`, `next_actions`, and any optional `paid_through_epoch`, `recovery_until_epoch`, or `export_until_epoch` values. A missing `server_info` or `eligibility` means that an older server does not expose that endpoint; it is not proof that access is allowed or denied.
+
+The JSON form is useful for scripts. Its top-level shape is:
+
+```json
+{
+  "server": "https://getsotto.co.uk",
+  "billing_url": "https://getsotto.co.uk/cloud",
+  "server_info": {
+    "deployment_mode": "cloud",
+    "entitlement_model": "person"
+  },
+  "eligibility": {
+    "model": "person_eligibility_v1",
+    "state": "paid",
+    "deployment_mode": "cloud",
+    "account_initialized": true,
+    "billing_available": true,
+    "paid_through_epoch": 1798761600,
+    "recovery_until_epoch": null,
+    "export_until_epoch": null,
+    "actions": {
+      "setup": false,
+      "billing": false,
+      "export": false,
+      "revoke": true
+    },
+    "next_actions": ["revoke"],
+    "payer": "personal"
+  }
+}
+```
+
+The example is synthetic; `actions` and the optional dates come from the returned account state, and older servers can return null for either endpoint. `sotto cloud status` only reports status and may print a billing URL. It does not start a purchase or change eligibility. For local vault and environment diagnostics, use `sotto status`; that view is separate from the server and account information above.
 
 ### Interactive dashboard
 
@@ -173,6 +261,36 @@ clears an active search or quits.
 Press `t` to browse themes with a live preview. Use the arrow keys to preview each theme, then
 press `Enter` to save your choice or `Esc` to cancel. The [theme precedence rules](#output-themes)
 explain how command and environment overrides affect the saved preference.
+
+### Inspect local status
+
+Run `sotto status` to see whether a local identity exists, whether the session is unlocked, and
+which project and environment the current directory selects. It reads local state. It does not
+check server connectivity or prove that every stored secret can be decrypted.
+
+```sh
+sotto status
+sotto status --json
+```
+
+Use `sotto status --json` in scripts. `initialized` reports whether a local identity exists, and
+`unlocked` reports whether a master key is cached. `project` contains `name` and `environment`
+from the nearest `sotto.toml`, or is `null` outside a configured project. A successful command can
+report `unlocked: false`, so scripts must inspect that field if they need an unlocked session.
+
+These JSON examples are illustrative. With a `sotto.toml` but no local identity:
+
+```json
+{"initialized":false,"project":{"environment":"dev","name":"demo"},"unlocked":false}
+```
+
+Without a `sotto.toml` or local identity:
+
+```json
+{"initialized":false,"project":null,"unlocked":false}
+```
+
+An absent `sotto.toml` means no project is selected. A malformed or unreadable file is an error.
 
 ### Output themes
 

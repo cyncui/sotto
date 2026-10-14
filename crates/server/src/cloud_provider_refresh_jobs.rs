@@ -84,7 +84,7 @@ pub async fn enqueue_event(
          (job_id, provider_namespace, provider_account_id, provider_environment, event_id, \
           beneficiary_id, allocation_id, coverage_source_id) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
-         ON CONFLICT (provider_namespace, provider_account_id, provider_environment, event_id) \
+         ON CONFLICT (provider_namespace, provider_account_id, provider_environment, event_id, beneficiary_id) \
          DO NOTHING",
     )
     .bind(job_id)

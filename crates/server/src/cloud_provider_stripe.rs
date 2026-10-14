@@ -44,13 +44,15 @@ impl fmt::Display for StripeInterval {
     }
 }
 
-/// Operator-selected Stripe identity and the two supported standard prices.
+/// Operator-selected Stripe identity and the four supported personal prices.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StripeCoverageConfig {
     pub account_id: String,
     pub environment: ProviderEnvironment,
     pub monthly_price_id: String,
     pub annual_price_id: String,
+    pub founding_monthly_price_id: Option<String>,
+    pub founding_annual_price_id: Option<String>,
 }
 
 impl StripeCoverageConfig {
@@ -65,9 +67,36 @@ impl StripeCoverageConfig {
             environment,
             monthly_price_id: monthly_price_id.into(),
             annual_price_id: annual_price_id.into(),
+            founding_monthly_price_id: None,
+            founding_annual_price_id: None,
         };
         config.validate()?;
         Ok(config)
+    }
+
+    pub fn with_founding_prices(
+        mut self,
+        monthly_price_id: impl Into<String>,
+        annual_price_id: impl Into<String>,
+    ) -> Result<Self, StripeContractError> {
+        self.founding_monthly_price_id = Some(monthly_price_id.into());
+        self.founding_annual_price_id = Some(annual_price_id.into());
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn interval_for_price(&self, price_id: &str) -> Option<StripeInterval> {
+        if price_id == self.monthly_price_id
+            || self.founding_monthly_price_id.as_deref() == Some(price_id)
+        {
+            Some(StripeInterval::Month)
+        } else if price_id == self.annual_price_id
+            || self.founding_annual_price_id.as_deref() == Some(price_id)
+        {
+            Some(StripeInterval::Year)
+        } else {
+            None
+        }
     }
 
     pub fn provider_context(&self) -> Result<ProviderContext, StripeContractError> {
@@ -88,6 +117,31 @@ impl StripeCoverageConfig {
         if self.monthly_price_id == self.annual_price_id {
             return Err(StripeContractError::InvalidConfig(
                 "monthly and annual Stripe prices must differ",
+            ));
+        }
+        let mut ids = vec![
+            self.monthly_price_id.as_str(),
+            self.annual_price_id.as_str(),
+        ];
+        match (
+            self.founding_monthly_price_id.as_deref(),
+            self.founding_annual_price_id.as_deref(),
+        ) {
+            (None, None) => {}
+            (Some(monthly), Some(annual))
+                if !monthly.trim().is_empty() && !annual.trim().is_empty() =>
+            {
+                ids.extend([monthly, annual]);
+            }
+            _ => return Err(StripeContractError::InvalidConfig("founding Stripe prices")),
+        }
+        if ids
+            .iter()
+            .enumerate()
+            .any(|(index, id)| ids[..index].contains(id))
+        {
+            return Err(StripeContractError::InvalidConfig(
+                "configured Stripe prices must be distinct",
             ));
         }
         Ok(())
@@ -285,13 +339,9 @@ pub(crate) fn validate_personal_invoice_observation(
     if facts.amount_paid_off_stripe < 0 {
         return Err(StripeContractError::InvalidField("amount_paid_off_stripe"));
     }
-    let interval = if facts.price_id == config.monthly_price_id {
-        StripeInterval::Month
-    } else if facts.price_id == config.annual_price_id {
-        StripeInterval::Year
-    } else {
-        return Err(StripeContractError::UnsupportedPrice);
-    };
+    let interval = config
+        .interval_for_price(&facts.price_id)
+        .ok_or(StripeContractError::UnsupportedPrice)?;
     if facts.period_start < 0 || facts.period_end <= facts.period_start {
         return Err(StripeContractError::InvalidField("period"));
     }
@@ -452,7 +502,7 @@ pub enum StripeContractError {
     UnsupportedQuantity,
     #[error("Stripe invoice line is unsupported: {0}")]
     UnsupportedLine(&'static str),
-    #[error("Stripe price is not one of the configured standard prices")]
+    #[error("Stripe price is not one of the configured personal prices")]
     UnsupportedPrice,
     #[error("provider context is invalid: {0}")]
     ProviderContext(ProviderAdapterError),
@@ -602,15 +652,31 @@ pub fn decode_paid_invoice(
         .ok_or(StripeContractError::MissingField("lines.data[0].period"))?;
     let period_start = required_i64(&Value::Object(period.clone()), "start")?;
     let period_end = required_i64(&Value::Object(period.clone()), "end")?;
-    let allocation_reference = invoice
-        .get("metadata")
-        .and_then(Value::as_object)
-        .and_then(|metadata| metadata.get(STRIPE_ALLOCATION_METADATA_KEY))
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_owned)
+    let root_allocation_reference = metadata_allocation_reference(invoice.get("metadata"))?;
+    let line_allocation_reference = metadata_allocation_reference(line.get("metadata"))?;
+    let parent_allocation_reference = invoice
+        .get("parent")
+        .and_then(|parent| parent.get("subscription_details"))
+        .and_then(|details| details.get("metadata"))
+        .map(|metadata| metadata_allocation_reference(Some(metadata)))
+        .transpose()?
+        .flatten();
+    let claims = [
+        root_allocation_reference.as_deref(),
+        line_allocation_reference.as_deref(),
+        parent_allocation_reference.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    if claims.windows(2).any(|pair| pair[0] != pair[1]) {
+        return Err(StripeContractError::OwnershipMismatch);
+    }
+    let allocation_reference = line_allocation_reference
+        .or(root_allocation_reference)
+        .or(parent_allocation_reference)
         .ok_or(StripeContractError::MissingField(
-            "metadata.sotto_allocation_reference",
+            "invoice subscription metadata.sotto_allocation_reference",
         ))?;
     let invoice_subscription_id = optional_ref(invoice, "subscription")?;
     let observation = validate_personal_invoice_observation(
@@ -675,6 +741,24 @@ pub fn decode_paid_invoice(
         period_end: observation.period_end,
         evidence_reference: format!("stripe:invoice:{invoice_id}:line:{invoice_line_id}"),
     })
+}
+
+fn metadata_allocation_reference(
+    metadata: Option<&Value>,
+) -> Result<Option<String>, StripeContractError> {
+    let Some(metadata) = metadata else {
+        return Ok(None);
+    };
+    let Some(metadata) = metadata.as_object() else {
+        return Err(StripeContractError::MalformedPayload);
+    };
+    match metadata.get(STRIPE_ALLOCATION_METADATA_KEY) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if !value.trim().is_empty() => Ok(Some(value.clone())),
+        Some(_) => Err(StripeContractError::InvalidField(
+            "metadata.sotto_allocation_reference",
+        )),
+    }
 }
 
 /// Decode the current Stripe Invoice Payment response fetched through an authenticated API call.

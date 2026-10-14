@@ -64,6 +64,20 @@ Hosted catalogue variables are `STRIPE_STANDARD_MONTHLY_PRICE_ID`,
 `STRIPE_FOUNDING_ANNUAL_PRICE_ID`. Compose passes them separately from the legacy
 `STRIPE_PRICE_ID`. The catalogue must be complete; partial configuration fails at boot.
 
+Hosted paid-invoice coverage intake and its refresh worker are staged separately and default off:
+`SOTTO_PROVIDER_REFRESH_INGEST_ENABLED=0` and `SOTTO_PROVIDER_REFRESH_WORKER_ENABLED=0`. These
+controls apply only to the hosted billing deployment; self-hosted installations can leave them
+disabled. For the current Stripe integration, enabling either control requires `STRIPE_ACCOUNT_ID`,
+a test or live restricted API key, and the complete hosted price catalogue. Startup verifies the
+provider account and configured prices before enabling either path. Intake accepts only verified,
+fully paid personal subscription invoices with a matching durable allocation reference; its source
+registration, invoice receipt, invalidation, and queued refresh are committed together. The worker
+reads bounded provider history outside database transactions and publishes coverage only after the
+prepared collection still matches its registered source set. An invoice received before its
+Checkout subscription is linked is retried without recording a receipt. Neither switch enables
+sales, reconciliation, or Cloud action enforcement; leave these values disabled until the hosted
+provider lifecycle has been exercised and reviewed.
+
 Human hosted action checks are shadow-only by default. They record would-deny decisions while
 existing ACL, grant, lifecycle, and export responses remain unchanged. Do not set
 `SOTTO_CLOUD_ACTION_ENFORCEMENT=1` until the Cloud transition and export gates have been

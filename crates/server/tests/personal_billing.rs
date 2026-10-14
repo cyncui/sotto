@@ -83,7 +83,7 @@ async fn personal_settlement_is_idempotent_and_keeps_paid_term() {
         BeginOperation::Created(operation) => operation,
         BeginOperation::AlreadyExists(_) => panic!("operation fixture unexpectedly existed"),
     };
-    begin_account(
+    let allocation_reference = begin_account(
         &mut tx,
         USER_ID,
         &operation.operation_id,
@@ -93,6 +93,17 @@ async fn personal_settlement_is_idempotent_and_keeps_paid_term() {
     )
     .await
     .expect("begin account");
+    let replayed_allocation_reference = begin_account(
+        &mut tx,
+        USER_ID,
+        &operation.operation_id,
+        BillingOffer::FoundingMonthly,
+        1_900_000_000,
+        1_800_000_000,
+    )
+    .await
+    .expect("replay account");
+    assert_eq!(allocation_reference, replayed_allocation_reference);
     tx.commit().await.expect("commit pending account");
 
     let mut settlement_tx = pool.begin().await.expect("begin settlement");
@@ -160,6 +171,7 @@ async fn personal_settlement_is_idempotent_and_keeps_paid_term() {
         .expect("load account")
         .expect("account exists");
     assert_eq!(account.state, PersonalBillingState::Active);
+    assert_eq!(account.allocation_reference, allocation_reference);
     assert_eq!(account.paid_through_date.as_deref(), Some("2030-03-17"));
     assert_eq!(
         account.payment_reference.as_deref(),
@@ -203,7 +215,7 @@ async fn abandoned_and_canceled_accounts_can_start_a_new_operation() {
         BeginOperation::Created(operation) => operation,
         BeginOperation::AlreadyExists(_) => panic!("first operation unexpectedly existed"),
     };
-    begin_account(
+    let first_allocation_reference = begin_account(
         &mut first_tx,
         USER_ID,
         &first.operation_id,
@@ -232,7 +244,7 @@ async fn abandoned_and_canceled_accounts_can_start_a_new_operation() {
         BeginOperation::Created(operation) => operation,
         BeginOperation::AlreadyExists(_) => panic!("second operation unexpectedly existed"),
     };
-    begin_account(
+    let second_allocation_reference = begin_account(
         &mut second_tx,
         USER_ID,
         &second.operation_id,
@@ -242,6 +254,7 @@ async fn abandoned_and_canceled_accounts_can_start_a_new_operation() {
     )
     .await
     .expect("reuse expired pending account");
+    assert_ne!(first_allocation_reference, second_allocation_reference);
     second_tx.commit().await.expect("commit second operation");
 
     let mut cancel_tx = pool.begin().await.expect("begin canceled transition");
@@ -269,7 +282,7 @@ async fn abandoned_and_canceled_accounts_can_start_a_new_operation() {
         BeginOperation::Created(operation) => operation,
         BeginOperation::AlreadyExists(_) => panic!("third operation unexpectedly existed"),
     };
-    begin_account(
+    let third_allocation_reference = begin_account(
         &mut cancel_tx,
         USER_ID,
         &third.operation_id,
@@ -279,6 +292,7 @@ async fn abandoned_and_canceled_accounts_can_start_a_new_operation() {
     )
     .await
     .expect("reuse canceled account");
+    assert_ne!(second_allocation_reference, third_allocation_reference);
     cancel_tx.commit().await.expect("commit canceled reuse");
 
     let mut load_tx = pool.begin().await.expect("load reused account");
