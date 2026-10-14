@@ -2,6 +2,14 @@
 
 *Tradução para o português (Brasil) do [README.md](README.md). O texto original em inglês é a versão oficial e prevalece em caso de divergência.*
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="web/public/mark-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="web/public/mark-light.svg">
+    <img src="web/public/mark-dark.svg" alt="Sotto" width="64" height="64">
+  </picture>
+</p>
+
 # Sotto
 
 Sincronização de segredos com criptografia de ponta a ponta para equipes de desenvolvimento. Pare de enviar seu `.env` pelo Slack.
@@ -110,12 +118,25 @@ sotto export --format dotenv --reveal   # print a .env; refuses a terminal witho
 sotto run -- npm start       # inject the environment's secrets into any command
 sotto login && sotto push    # optional: sync ciphertext via the hosted instance (getsotto.co.uk)
 sotto get DATABASE_URL -c    # copy a secret without printing it; clipboard clears after 45s when unchanged
-sotto share DATABASE_URL     # one-time link; copied automatically in an interactive terminal
-sotto share DATABASE_URL --views 3
-sotto share DATABASE_URL --expire 3600   # lifetime in seconds
+sotto share DATABASE_URL     # choose view and lifetime limits in an interactive terminal
+sotto share DATABASE_URL --views 3 --expire 3600   # skip both limit prompts
 ```
 
-Por padrão, um compartilhamento permite uma visualização e não expira; o link deixa de funcionar após a última visualização.
+Em um terminal interativo, cada limite omitido abre seu próprio menu. O menu de visualizações
+oferece 1, 2, 3, 5 ou 10 visualizações e um valor personalizado; o menu de duração oferece sem
+expiração, 1 hora, 1 dia, 7 dias, 30 dias ou um número de segundos personalizado. Os valores
+personalizados devem ser de 1 a 100 visualizações ou de 1 a 2592000 segundos. Fornecer
+`DATABASE_URL` ignora apenas a seleção do segredo: `--views` ignora o menu de visualizações e
+`--expire` ignora o menu de duração de forma independente. Pressione Esc ou Ctrl-C em qualquer
+menu de seleção para cancelar sem criar um compartilhamento.
+
+O uso não interativo exige um nome de segredo explícito. Quando qualquer limite é omitido, seu
+valor padrão é aplicado: uma visualização e sem expiração. Para ignorar os três menus de seleção
+em um terminal interativo, forneça o nome e ambos os limites, por exemplo
+`sotto share DATABASE_URL --views 3 --expire 3600`. As solicitações de desbloqueio e frase secreta
+ainda podem ser exibidas.
+
+Para explorar os segredos interativamente, consulte o [guia do painel](#painel-interativo).
 
 Use `--env` para selecionar um ambiente para um único comando sem alterar o padrão do projeto:
 
@@ -128,6 +149,7 @@ sotto ls --env staging
 
 A exportação escreve texto puro, portanto precisa de `--reveal` em um terminal, assim como `sotto get`.
 Use `sotto share --no-copy` para desativar a cópia interativa, ou `--copy` para solicitá-la explicitamente.
+Essas opções controlam apenas a área de transferência; `--no-copy` não ignora os menus de limites do compartilhamento.
 A limpeza da área de transferência é uma medida de melhor esforço: substituir o conteúdo protege o novo valor,
 enquanto gerenciadores da área de transferência, suspensão ou encerramento do processo auxiliar podem manter uma cópia.
 
@@ -146,10 +168,105 @@ sotto grant <user-id>                      # share the active environment (they 
 sotto token create --name ci               # SOTTO_TOKEN: run/export in CI, no password needed
 ```
 
-Tokens de máquina expiram. Um token novo dura 90 dias, a menos que você passe `--expires-in-days`
-com um valor de 1 a 365, e `sotto token ls` mostra quando cada um termina. Duas semanas antes,
-`sotto run` e `sotto export` exibem um aviso no log da CI. Para substituir um token, crie um novo,
-atualize o segredo da CI e depois revogue o antigo com `sotto token revoke`.
+Tokens de máquina expiram. Um token novo dura 90 dias, a menos que você passe
+`--expires-in-days` com um valor de 1 a 365; `sotto token ls` mostra quando cada um termina.
+Duas semanas antes, `sotto run` e `sotto export` exibem um aviso no log da CI.
+
+Os comandos de token usam o acesso do usuário conectado e o ambiente selecionado. Em um ambiente
+de organização, somente um administrador ou proprietário pode gerenciar tokens de máquina. A
+lista contém apenas metadados de tokens ativos: tokens revogados ou expirados são omitidos, e
+não é possível recuperar pela lista a credencial exibida uma única vez ao criar um token com
+`sotto token create`. O JSON inclui `token_id`, `name`, `created_by`, `beneficiary_id`,
+`beneficiary_status`, `expires_at` e `expires_in_days`; os campos de expiração podem ser null.
+O `token_id` é o ID usado para revogar, não o nome do token nem o segredo `SOTTO_TOKEN`.
+
+Use estes comandos para consultar, substituir e revogar um token. A seleção do ambiente vale
+somente para este comando:
+
+```sh
+sotto token ls
+sotto token ls --json
+sotto --env staging token ls --json
+sotto token create --name ci
+sotto token revoke <token-id>
+```
+
+Para substituir um token de CI, identifique o ID antigo na lista, crie um substituto, atualize
+o segredo da CI e confirme que ela já usa o novo token; depois revogue o ID antigo com
+`sotto token revoke <token-id>`. A revogação impede imediatamente a autenticação desse token
+na API, mas não rotaciona a chave do ambiente. Em um ambiente de organização, consulte as
+orientações existentes de `sotto rotate` quando for necessário rotacionar a chave. Nem a
+revogação nem a rotação apagam texto puro que já tenha sido copiado.
+
+### Status do Cloud
+
+Para consultar o servidor configurado e a elegibilidade do Cloud da sua conta, faça login primeiro:
+
+```sh
+sotto login
+sotto cloud status
+sotto cloud status --json
+```
+
+O comando exige uma sessão ativa, mas não desbloqueia o cofre local nem abre um navegador. Ele mostra o `server` configurado, o `server_info` do servidor, a `eligibility` da conta e um `billing_url` somente quando o estado retornado indica que a cobrança está disponível. A saída legível também mostra `actions`, `next_actions` e os valores opcionais `paid_through_epoch`, `recovery_until_epoch` ou `export_until_epoch`. A ausência de `server_info` ou `eligibility` significa que um servidor antigo não oferece esse endpoint; isso não prova que o acesso esteja permitido ou negado.
+
+O formato JSON é útil para scripts. Sua estrutura de nível superior é:
+
+```json
+{
+  "server": "https://getsotto.co.uk",
+  "billing_url": "https://getsotto.co.uk/cloud",
+  "server_info": {
+    "deployment_mode": "cloud",
+    "entitlement_model": "person"
+  },
+  "eligibility": {
+    "model": "person_eligibility_v1",
+    "state": "paid",
+    "deployment_mode": "cloud",
+    "account_initialized": true,
+    "billing_available": true,
+    "paid_through_epoch": 1798761600,
+    "recovery_until_epoch": null,
+    "export_until_epoch": null,
+    "actions": {
+      "setup": false,
+      "billing": false,
+      "export": false,
+      "revoke": true
+    },
+    "next_actions": ["revoke"],
+    "payer": "personal"
+  }
+}
+```
+
+O exemplo é sintético; `actions` e as datas opcionais vêm do estado retornado da conta, e servidores antigos podem retornar null para qualquer um dos dois endpoints. `sotto cloud status` apenas informa o status e pode mostrar uma URL de cobrança. Ele não inicia uma compra nem altera a elegibilidade. Para diagnósticos do cofre local e dos ambientes, use `sotto status`; essa visão é separada das informações do servidor e da conta acima.
+
+### Painel interativo
+
+Em um projeto inicializado, execute `sotto` sem subcomando para explorar os segredos locais:
+
+```sh
+sotto
+```
+
+Você precisa ter uma identidade local desbloqueada antes de abrir o painel. Se necessário, Sotto
+pede a senha mestra. A entrada, a saída e a saída de erro padrão precisam estar conectadas a
+terminais. Se faltar algum, a CI estiver ativa ou `TERM=dumb`, a execução sem subcomando escreve
+a ajuda na saída de erro padrão e termina com código 2. Use `sotto --help` para pedir a ajuda
+explicitamente.
+
+Use as setas ou `j` e `k` para navegar. Pressione `/` para buscar, `?` para ver a ajuda e Tab para
+trocar de ambiente. A troca vale apenas durante a sessão do painel; `sotto env use` altera o
+ambiente padrão do projeto. Pressione `r` para mostrar ou ocultar o valor selecionado, `c` para
+copiá-lo para a área de transferência e `q` para sair. `Esc` fecha a busca ou a caixa de diálogo
+atual; na tela principal, limpa uma busca ativa ou sai.
+
+Pressione `t` para percorrer os temas com visualização ao vivo. Use as setas para ver cada tema
+e pressione `Enter` para salvar sua escolha ou `Esc` para cancelar. As
+[regras de precedência dos temas](#temas-de-saída) explicam como as opções do comando e as
+variáveis de ambiente afetam a preferência salva.
 
 ### Consultar o estado local
 

@@ -3,27 +3,43 @@
 //! in-memory adapter and no test calls the real Stripe API.
 
 use async_trait::async_trait;
-use axum::body::Body;
+use axum::body::{to_bytes, Body};
+use axum::extract::State;
 use axum::http::{Request, StatusCode};
+use axum::response::Response;
+use axum::routing::any;
 use axum::Router;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
+use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::Mutex;
 use tower::ServiceExt;
+use uuid::Uuid;
 
 use sotto_server::auth::session;
 use sotto_server::billing::{
     BillingState, ProviderResult, SubscriptionObservation, SubscriptionProvider,
     SubscriptionSnapshot, SubscriptionStatus, STRIPE_API_VERSION,
 };
-use sotto_server::billing_catalogue::BillingOffer;
+use sotto_server::billing_catalogue::{BillingOffer, BillingPriceIds};
 use sotto_server::billing_operations::{self, BeginOperation};
+use sotto_server::cloud_provider::ProviderEnvironment;
+use sotto_server::cloud_provider_stripe::StripeCoverageConfig;
+use sotto_server::cloud_provider_stripe_http::{StripeReadClient, StripeReadLimits};
 use sotto_server::config::{BillingConfig, DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS};
 use sotto_server::db;
-use sotto_server::founding_allocator::FoundingDate;
+use sotto_server::founding_allocator::{
+    reserve_with_payer_kind_until, FoundingDate, FoundingOffer, FoundingPayerKind,
+    ReservationOutcome,
+};
 use sotto_server::personal_billing;
 use sotto_server::state::AppState;
+use tokio::net::TcpListener;
+use url::Url;
 
 const WEBHOOK_SECRET: &str = "whsec_test_secret";
 
@@ -34,24 +50,66 @@ async fn pool_or_skip() -> Option<PgPool> {
     Some(pool)
 }
 
+async fn one_connection_pool_or_skip() -> Option<PgPool> {
+    if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
+        return None;
+    }
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL is required");
+    let options = PgConnectOptions::from_str(&url).expect("parse DATABASE_URL");
+    assert!(
+        matches!(options.get_host(), "localhost" | "127.0.0.1" | "::1"),
+        "refusing one-connection coverage test against non-local host: {}",
+        options.get_host()
+    );
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("connect one-connection test pool");
+    db::migrate(&pool)
+        .await
+        .expect("migrate one-connection pool");
+    Some(pool)
+}
+
 fn app(pool: PgPool, configured: bool) -> Router {
+    app_with_billing(
+        pool,
+        configured.then(|| {
+            BillingState::from_config(BillingConfig {
+                api_key: "rk_test_never_called".into(),
+                webhook_secret: WEBHOOK_SECRET.into(),
+                price_id: "price_test".into(),
+                price_catalogue: None,
+                cloud_sales_enabled: true,
+                return_url: "https://app.sotto.test".into(),
+            })
+        }),
+    )
+}
+
+fn app_with_billing(pool: PgPool, billing: Option<BillingState>) -> Router {
+    app_with_billing_mode(
+        pool,
+        billing,
+        sotto_server::config::DeploymentMode::SelfHosted,
+    )
+}
+
+fn app_with_billing_mode(
+    pool: PgPool,
+    billing: Option<BillingState>,
+    deployment_mode: sotto_server::config::DeploymentMode,
+) -> Router {
     let state = AppState {
-        deployment_mode: sotto_server::config::DeploymentMode::SelfHosted,
+        deployment_mode,
         telemetry_ingest: false,
         cloud_action_enforcement_enabled: false,
         machine_eligibility_enforcement_enabled: false,
         pool,
         oauth: None,
         oauth_config: None,
-        billing: configured.then(|| {
-            BillingState::from_config(BillingConfig {
-                api_key: "rk_test_never_called".into(),
-                webhook_secret: WEBHOOK_SECRET.into(),
-                price_id: "price_test".into(),
-                price_catalogue: None,
-                return_url: "https://app.sotto.test".into(),
-            })
-        }),
+        billing,
         organisation_deletion_enabled: false,
         organisation_deletion_retention_days: DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
         organisation_deletion_metrics_token: None,
@@ -59,7 +117,75 @@ fn app(pool: PgPool, configured: bool) -> Router {
     };
     Router::new()
         .merge(sotto_server::billing::router())
+        .merge(sotto_server::person_eligibility::router())
         .with_state(state)
+}
+
+async fn get_eligibility(app: &Router, token: &str) -> (StatusCode, serde_json::Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/account/eligibility")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("eligibility request");
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+#[derive(Clone)]
+struct StripeMockResponses(Arc<Mutex<HashMap<String, serde_json::Value>>>);
+
+async fn stripe_mock_handler(
+    State(responses): State<StripeMockResponses>,
+    request: Request<Body>,
+) -> Response<Body> {
+    let mut value = responses
+        .0
+        .lock()
+        .unwrap()
+        .get(request.uri().path())
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({"error":"not found"}));
+    let status = value
+        .get("_http_status")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|status| u16::try_from(status).ok())
+        .and_then(|status| StatusCode::from_u16(status).ok())
+        .unwrap_or(if value.get("error").is_some() {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::OK
+        });
+    if let Some(object) = value.as_object_mut() {
+        object.remove("_http_status");
+    }
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&value).unwrap()))
+        .unwrap()
+}
+
+async fn stripe_mock_server(
+    responses: HashMap<String, serde_json::Value>,
+) -> (Url, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let state = StripeMockResponses(Arc::new(Mutex::new(responses)));
+    let router = Router::new()
+        .fallback(any(stripe_mock_handler))
+        .with_state(state);
+    let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (Url::parse(&format!("http://{address}/")).unwrap(), task)
 }
 
 struct TestProvider {
@@ -116,10 +242,11 @@ fn app_with_provider(pool: PgPool, provider: Arc<dyn SubscriptionProvider>) -> R
         pool,
         oauth: None,
         oauth_config: None,
-        billing: Some(BillingState::with_provider(
+        billing: Some(BillingState::with_provider_and_cloud_sales(
             provider,
             WEBHOOK_SECRET.into(),
             "https://app.sotto.test".into(),
+            true,
         )),
         organisation_deletion_enabled: false,
         organisation_deletion_retention_days: DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
@@ -687,6 +814,758 @@ async fn personal_paid_checkout_webhook_records_provider_term() {
     .await
     .expect("renewed personal account");
     assert_eq!(renewed_epoch, 2_100_000_000,);
+}
+
+#[tokio::test]
+async fn personal_invoice_first_delivery_waits_for_checkout_binding_then_queues_coverage() {
+    let Some(pool) = one_connection_pool_or_skip().await else {
+        return;
+    };
+    let fixture = Uuid::new_v4().simple().to_string();
+    let user_id = format!("billing-coverage-user-{fixture}");
+    let token = seed_user(&pool, &user_id).await;
+    let operation_id =
+        seed_personal_account(&pool, &user_id, &format!("personal-coverage-{fixture}")).await;
+    let allocation_reference: String = sqlx::query_scalar(
+        "SELECT allocation_reference FROM billing_personal_accounts WHERE operation_id = $1",
+    )
+    .bind(&operation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("personal allocation reference");
+
+    let catalogue = BillingPriceIds {
+        standard_monthly: "price_coverage_month".into(),
+        standard_annual: "price_coverage_year".into(),
+        founding_monthly: "price_coverage_found_month".into(),
+        founding_annual: "price_coverage_found_year".into(),
+    };
+    let coverage = StripeCoverageConfig::new(
+        "acct_coverage_test",
+        ProviderEnvironment::Test,
+        catalogue.standard_monthly.clone(),
+        catalogue.standard_annual.clone(),
+    )
+    .unwrap()
+    .with_founding_prices(
+        catalogue.founding_monthly.clone(),
+        catalogue.founding_annual.clone(),
+    )
+    .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let period_start = now.saturating_sub(3_600);
+    let period_end = now + 2_592_000;
+    let invoice_id = format!("in_coverage_{fixture}");
+    let invoice = serde_json::json!({
+        "id": invoice_id,
+        "customer": "cus_coverage_person",
+        "parent": {"type":"subscription_details", "subscription_details": {
+            "subscription":"sub_coverage_person",
+            "metadata": {
+                "sotto_allocation_reference": allocation_reference,
+                "personal_user_id": user_id,
+                "operation_id": operation_id
+            }
+        }},
+        "status":"paid", "currency":"gbp", "amount_paid":299, "amount_due":299,
+        "amount_remaining":0, "amount_overpaid":0, "amount_paid_off_stripe":0,
+        "livemode":false, "metadata":{"sotto_allocation_reference":allocation_reference},
+        "lines":{"data":[{
+            "id":"il_coverage_person", "quantity":1, "livemode":false,
+            "parent":{"type":"subscription_item_details", "subscription_item_details": {
+                "subscription":"sub_coverage_person", "subscription_item":"si_coverage_person"
+            }},
+            "pricing":{"type":"price_details", "price_details":{"price":"price_coverage_month"}},
+            "metadata":{"sotto_allocation_reference":allocation_reference},
+            "period":{"start":period_start,"end":period_end}
+        }]}
+    });
+    let line = invoice["lines"]["data"][0].clone();
+    let payment = serde_json::json!({
+        "id":"inpay_coverage_person", "object":"invoice_payment", "invoice":invoice_id,
+        "status":"paid", "amount_paid":299, "amount_requested":299, "currency":"gbp",
+        "livemode":false,
+        "payment":{"type":"payment_intent", "payment_intent":"pi_coverage_person"}
+    });
+    let listed_invoice = invoice.clone();
+    let mut malformed_invoice = invoice.clone();
+    malformed_invoice
+        .as_object_mut()
+        .expect("invoice object")
+        .remove("id");
+    let (origin, stripe_task) = stripe_mock_server(HashMap::from([
+        (
+            "/v1/account".into(),
+            serde_json::json!({"id":"acct_coverage_test","livemode":false}),
+        ),
+        (
+            "/v1/subscriptions/sub_coverage_person".into(),
+            serde_json::json!({"id":"sub_coverage_person","customer":"cus_coverage_person","status":"active","livemode":false}),
+        ),
+        (
+            "/v1/invoices".into(),
+            serde_json::json!({"object":"list","data":[listed_invoice],"has_more":false}),
+        ),
+        (format!("/v1/invoices/{invoice_id}"), invoice.clone()),
+        (
+            format!("/v1/invoices/in_coverage_auth_{fixture}"),
+            serde_json::json!({"_http_status":401,"error":{"message":"invalid api key"}}),
+        ),
+        (
+            format!("/v1/invoices/in_coverage_malformed_{fixture}"),
+            malformed_invoice,
+        ),
+        (
+            format!("/v1/invoices/{invoice_id}/lines"),
+            serde_json::json!({"object":"list","data":[line],"has_more":false}),
+        ),
+        (
+            "/v1/invoice_payments".into(),
+            serde_json::json!({"object":"list","data":[payment],"has_more":false}),
+        ),
+        (
+            "/v1/credit_notes".into(),
+            serde_json::json!({"object":"list","data":[],"has_more":false}),
+        ),
+        (
+            "/v1/refunds".into(),
+            serde_json::json!({"object":"list","data":[],"has_more":false}),
+        ),
+        (
+            "/v1/disputes".into(),
+            serde_json::json!({"object":"list","data":[],"has_more":false}),
+        ),
+    ]))
+    .await;
+    let stripe = StripeReadClient::for_test(
+        "sk_test_coverage",
+        &coverage,
+        origin,
+        StripeReadLimits::default(),
+    )
+    .unwrap();
+    let provider = Arc::new(TestProvider {
+        observation: SubscriptionObservation::Missing,
+        personal_period_end: Some(period_end),
+    });
+    let billing = BillingState::with_provider_and_cloud_sales(
+        provider,
+        WEBHOOK_SECRET.into(),
+        "https://app.sotto.test".into(),
+        false,
+    )
+    .with_price_catalogue(catalogue)
+    .with_personal_coverage(coverage.clone(), stripe.clone(), true);
+    let app = app_with_billing_mode(
+        pool.clone(),
+        Some(billing),
+        sotto_server::config::DeploymentMode::Cloud,
+    );
+
+    let invoice_event = serde_json::json!({
+        "id":format!("evt_coverage_invoice_{fixture}"), "created":now + 5,
+        "api_version":STRIPE_API_VERSION, "type":"invoice.paid", "livemode":false,
+        "data":{"object":invoice}
+    })
+    .to_string();
+
+    // Stripe can deliver invoice.paid before the Checkout completion has linked the local row.
+    // The failure occurs before any webhook/provider receipt or financial write is committed.
+    assert_eq!(
+        post_webhook(
+            &app,
+            &invoice_event,
+            Some(&stripe_signature(&invoice_event))
+        )
+        .await,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let receipt_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM stripe_webhook_events WHERE event_id = $1")
+            .bind(format!("evt_coverage_invoice_{fixture}"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(receipt_count, 0);
+
+    let checkout_event = serde_json::json!({
+        "id":format!("evt_coverage_checkout_{fixture}"), "created":now,
+        "api_version":STRIPE_API_VERSION, "type":"checkout.session.completed", "livemode":false,
+        "data":{"object":{
+            "client_reference_id":format!("personal:{operation_id}"), "payment_status":"paid",
+            "customer":"cus_coverage_person", "subscription":"sub_coverage_person",
+            "payment_intent":"pi_coverage_person"
+        }}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(
+            &app,
+            &checkout_event,
+            Some(&stripe_signature(&checkout_event))
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    // A Stripe credential failure is operational, not permanent invoice evidence. Keep the
+    // webhook unprocessed so Stripe retries after the key or permissions are repaired.
+    let auth_invoice_id = format!("in_coverage_auth_{fixture}");
+    let mut auth_invoice = invoice.clone();
+    auth_invoice["id"] = serde_json::json!(auth_invoice_id);
+    let auth_event_id = format!("evt_coverage_auth_failure_{fixture}");
+    let auth_event = serde_json::json!({
+        "id":auth_event_id, "created":now + 1,
+        "api_version":STRIPE_API_VERSION, "type":"invoice.paid", "livemode":false,
+        "data":{"object":auth_invoice}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(&app, &auth_event, Some(&stripe_signature(&auth_event))).await,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let auth_receipt_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM stripe_webhook_events WHERE event_id = $1")
+            .bind(&auth_event_id)
+            .fetch_one(&pool)
+            .await
+            .expect("authentication failure must not be receipted");
+    assert_eq!(auth_receipt_count, 0);
+
+    // A Stripe invoice that cannot be decoded is a permanent evidence gap, unlike a
+    // credential failure. Acknowledge the billing event but leave Cloud coverage untouched.
+    let malformed_invoice_id = format!("in_coverage_malformed_{fixture}");
+    let mut malformed_event_invoice = invoice.clone();
+    malformed_event_invoice["id"] = serde_json::json!(malformed_invoice_id);
+    let malformed_event_id = format!("evt_coverage_malformed_invoice_{fixture}");
+    let malformed_event = serde_json::json!({
+        "id":malformed_event_id, "created":now + 2,
+        "api_version":STRIPE_API_VERSION, "type":"invoice.paid", "livemode":false,
+        "data":{"object":malformed_event_invoice}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(
+            &app,
+            &malformed_event,
+            Some(&stripe_signature(&malformed_event))
+        )
+        .await,
+        StatusCode::OK
+    );
+    let malformed_receipt: (i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(processed_at) FROM stripe_webhook_events WHERE event_id = $1",
+    )
+    .bind(&malformed_event_id)
+    .fetch_one(&pool)
+    .await
+    .expect("malformed invoice receipt");
+    assert_eq!(malformed_receipt, (1, 1));
+    let malformed_coverage_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_provider_event_receipts WHERE event_id = $1",
+    )
+    .bind(&malformed_event_id)
+    .fetch_one(&pool)
+    .await
+    .expect("no coverage receipt for malformed Stripe evidence");
+    assert_eq!(malformed_coverage_rows, 0);
+
+    let (eligibility_status, eligibility) = get_eligibility(&app, &token).await;
+    assert_eq!(eligibility_status, StatusCode::OK);
+    assert_eq!(eligibility["state"], "unavailable");
+    let missing_binding_event_id = format!("evt_coverage_missing_binding_{fixture}");
+    let mut invoice_without_binding = invoice.clone();
+    invoice_without_binding
+        .as_object_mut()
+        .expect("invoice object")
+        .remove("metadata");
+    invoice_without_binding["parent"]["subscription_details"]
+        .as_object_mut()
+        .expect("subscription details")
+        .remove("metadata");
+    invoice_without_binding["lines"]["data"][0]
+        .as_object_mut()
+        .expect("invoice line")
+        .remove("metadata");
+    let missing_binding_event = serde_json::json!({
+        "id":missing_binding_event_id, "created":now + 3,
+        "api_version":STRIPE_API_VERSION, "type":"invoice.paid", "livemode":false,
+        "data":{"object":invoice_without_binding}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(
+            &app,
+            &missing_binding_event,
+            Some(&stripe_signature(&missing_binding_event))
+        )
+        .await,
+        StatusCode::OK
+    );
+    let missing_binding_receipt: (i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(processed_at) FROM stripe_webhook_events WHERE event_id = $1",
+    )
+    .bind(missing_binding_event_id)
+    .fetch_one(&pool)
+    .await
+    .expect("missing-binding webhook receipt count");
+    assert_eq!(missing_binding_receipt.0, 1);
+    assert_eq!(missing_binding_receipt.1, 1);
+    let paid_through_after_missing_binding: i64 = sqlx::query_scalar(
+        "SELECT paid_through_epoch FROM billing_personal_accounts WHERE user_id = $1",
+    )
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("billing update despite missing coverage binding");
+    assert_eq!(paid_through_after_missing_binding, period_end);
+
+    // A fully credited invoice cannot prove Cloud coverage, but its signed paid event still
+    // advances billing and is acknowledged so Stripe does not retry a permanent evidence gap.
+    let credited_event_id = format!("evt_coverage_credited_invoice_{fixture}");
+    let mut credited_invoice = invoice.clone();
+    credited_invoice["amount_paid"] = serde_json::json!(0);
+    credited_invoice["amount_due"] = serde_json::json!(0);
+    let credited_event = serde_json::json!({
+        "id":credited_event_id, "created":now + 4,
+        "api_version":STRIPE_API_VERSION, "type":"invoice.paid", "livemode":false,
+        "data":{"object":credited_invoice}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(
+            &app,
+            &credited_event,
+            Some(&stripe_signature(&credited_event))
+        )
+        .await,
+        StatusCode::OK
+    );
+    let credited_receipt: (i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(processed_at) FROM stripe_webhook_events WHERE event_id = $1",
+    )
+    .bind(&credited_event_id)
+    .fetch_one(&pool)
+    .await
+    .expect("credited invoice receipt");
+    assert_eq!(credited_receipt.0, 1);
+    assert_eq!(credited_receipt.1, 1);
+    let credited_coverage_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_provider_event_receipts WHERE event_id = $1",
+    )
+    .bind(&credited_event_id)
+    .fetch_one(&pool)
+    .await
+    .expect("no coverage receipt for unsupported settlement");
+    assert_eq!(credited_coverage_rows, 0);
+    let paid_through_after_credit: i64 = sqlx::query_scalar(
+        "SELECT paid_through_epoch FROM billing_personal_accounts WHERE user_id = $1",
+    )
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("billing update despite unsupported coverage settlement");
+    assert_eq!(paid_through_after_credit, period_end);
+
+    assert_eq!(
+        post_webhook(
+            &app,
+            &invoice_event,
+            Some(&stripe_signature(&invoice_event))
+        )
+        .await,
+        StatusCode::OK
+    );
+    let (queued_status, queued_view) = get_eligibility(&app, &token).await;
+    assert_eq!(queued_status, StatusCode::OK);
+    assert_eq!(queued_view["state"], "unavailable");
+
+    let provider_rows: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM cloud_provider_event_receipts WHERE event_id = $1), \
+                (SELECT count(*) FROM cloud_provider_allocations WHERE external_allocation_reference = $2), \
+                (SELECT count(*) FROM cloud_provider_refresh_jobs WHERE event_id = $1)",
+    )
+    .bind(format!("evt_coverage_invoice_{fixture}"))
+    .bind(&allocation_reference)
+    .fetch_one(&pool)
+    .await
+    .expect("provider coverage intake rows");
+    assert_eq!(provider_rows, (1, 1, 1));
+    let stored_payment: String = sqlx::query_scalar(
+        "SELECT payment_reference FROM billing_personal_accounts WHERE user_id = $1",
+    )
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("paid invoice settlement");
+    assert_eq!(stored_payment, "pi_coverage_person");
+
+    let mut executor =
+        sotto_server::cloud_provider_stripe_personal_refresh::PersonalStripeRefreshExecutor::new(
+            pool.clone(),
+            stripe,
+            coverage,
+        );
+    let worker_outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        sotto_server::cloud_provider_refresh_worker::run_once(
+            &pool,
+            &format!("coverage-worker-{fixture}"),
+            &mut executor,
+        ),
+    )
+    .await
+    .expect("personal Stripe reads must not hold the only database connection")
+    .expect("personal coverage worker run");
+    assert_eq!(
+        worker_outcome,
+        sotto_server::cloud_provider_refresh_worker::RefreshWorkerOutcome::Completed
+    );
+    let (projected_status, projected_view) = get_eligibility(&app, &token).await;
+    assert_eq!(projected_status, StatusCode::OK);
+    assert_eq!(projected_view["state"], "paid");
+    assert_eq!(
+        sotto_server::cloud_action_policy::decide(
+            sotto_server::cloud_action_policy::ActionClass::SecretRead,
+            sotto_server::person_eligibility::EligibilityState::Paid,
+        ),
+        sotto_server::cloud_action_policy::ShadowDecision::Allowed
+    );
+
+    // A processed redelivery must be acknowledged from its durable receipt without depending
+    // on the current Stripe binding or making another provider read.
+    let replaced_reference = format!("alloc_replaced_{fixture}");
+    sqlx::query(
+        "UPDATE billing_personal_accounts SET allocation_reference = $2 WHERE user_id = $1",
+    )
+    .bind(&user_id)
+    .bind(replaced_reference)
+    .execute(&pool)
+    .await
+    .expect("replace personal binding after accepted invoice");
+    assert_eq!(
+        post_webhook(
+            &app,
+            &invoice_event,
+            Some(&stripe_signature(&invoice_event))
+        )
+        .await,
+        StatusCode::OK
+    );
+    sqlx::query(
+        "UPDATE billing_personal_accounts SET allocation_reference = $2, \
+         stripe_coverage_binding_required = FALSE WHERE user_id = $1",
+    )
+    .bind(&user_id)
+    .bind(&allocation_reference)
+    .execute(&pool)
+    .await
+    .expect("mark migrated personal account as legacy-bound");
+
+    // Accounts created before coverage binding was introduced cannot have the new reference in
+    // Stripe metadata. They still receive their billing update, without creating coverage work.
+    let mut legacy_invoice = invoice.clone();
+    legacy_invoice
+        .as_object_mut()
+        .expect("invoice object")
+        .remove("metadata");
+    legacy_invoice["parent"]["subscription_details"]["metadata"] = serde_json::json!({
+        "personal_user_id": user_id,
+        "operation_id": operation_id
+    });
+    legacy_invoice["lines"]["data"][0]
+        .as_object_mut()
+        .expect("invoice line")
+        .remove("metadata");
+    let legacy_event_id = format!("evt_coverage_legacy_invoice_{fixture}");
+    let legacy_invoice_event = serde_json::json!({
+        "id":legacy_event_id, "created":now + 6,
+        "api_version":STRIPE_API_VERSION, "type":"invoice.paid", "livemode":false,
+        "data":{"object":legacy_invoice}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(
+            &app,
+            &legacy_invoice_event,
+            Some(&stripe_signature(&legacy_invoice_event))
+        )
+        .await,
+        StatusCode::OK
+    );
+    let legacy_provider_work: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM cloud_provider_event_receipts WHERE event_id = $1), \
+                (SELECT count(*) FROM cloud_provider_refresh_jobs WHERE event_id = $1)",
+    )
+    .bind(&legacy_event_id)
+    .fetch_one(&pool)
+    .await
+    .expect("legacy invoice must not enqueue provider work");
+    assert_eq!(legacy_provider_work, (0, 0));
+    let legacy_receipt_processed: bool = sqlx::query_scalar(
+        "SELECT processed_at IS NOT NULL FROM stripe_webhook_events WHERE event_id = $1",
+    )
+    .bind(&legacy_event_id)
+    .fetch_one(&pool)
+    .await
+    .expect("legacy invoice webhook receipt");
+    assert!(legacy_receipt_processed);
+
+    // Remove the queue-owned and provider rows first; the beneficiary/source FKs deliberately
+    // prevent ordinary user deletion while evidence exists.
+    sqlx::query("DELETE FROM cloud_provider_invalidation_associations WHERE event_id = $1")
+        .bind(format!("evt_coverage_invoice_{fixture}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_provider_event_receipts WHERE event_id = $1")
+        .bind(format!("evt_coverage_invoice_{fixture}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_provider_allocations WHERE external_allocation_reference = $1")
+        .bind(&allocation_reference)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_coverage_sources WHERE beneficiary_id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE cloud_coverage_coordinators SET current_attempt_id = NULL WHERE beneficiary_id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    for table in [
+        "cloud_coverage_collection_attempts",
+        "cloud_coverage_coordinators",
+    ] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE beneficiary_id = $1"))
+            .bind(&user_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query("DELETE FROM cloud_provider_payers WHERE payer_kind = 'personal' AND provider_customer_id = 'cus_coverage_person'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM stripe_subscription_watermarks WHERE event_id = ANY($1)")
+        .bind(vec![
+            format!("evt_coverage_invoice_{fixture}"),
+            format!("evt_coverage_checkout_{fixture}"),
+            format!("evt_coverage_legacy_invoice_{fixture}"),
+        ])
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM stripe_webhook_events WHERE event_id = ANY($1)")
+        .bind(vec![
+            format!("evt_coverage_invoice_{fixture}"),
+            format!("evt_coverage_checkout_{fixture}"),
+            format!("evt_coverage_legacy_invoice_{fixture}"),
+        ])
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "DELETE FROM billing_personal_events WHERE operation_id IN \
+         (SELECT operation_id FROM billing_operations WHERE actor_user_id = $1)",
+    )
+    .bind(&user_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM billing_personal_accounts WHERE user_id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM billing_operations WHERE actor_user_id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_coverage_heads WHERE beneficiary_id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_coverage_revision_facts WHERE beneficiary_id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_coverage_revisions WHERE beneficiary_id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    stripe_task.abort();
+}
+
+#[tokio::test]
+async fn delayed_personal_checkout_payment_honours_timely_founding_reservation() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let fixture = Uuid::new_v4().simple().to_string();
+    let user_id = format!("billing-user-delayed-founding-{fixture}");
+    seed_user(&pool, &user_id).await;
+    let operation_id =
+        seed_personal_account(&pool, &user_id, &format!("delayed-founding-{fixture}")).await;
+    let checkout_created_at = 1_800_000_000;
+    let quote_expires_at = checkout_created_at + 1_800;
+    let checkout_deadline = quote_expires_at + 1_800;
+    sqlx::query(
+        "UPDATE billing_personal_accounts SET offer = 'founding_monthly', pending_expires_at_epoch = $2 \
+         WHERE operation_id = $1",
+    )
+    .bind(&operation_id)
+    .bind(checkout_deadline)
+    .execute(&pool)
+    .await
+    .expect("set founding offer");
+    sqlx::query(
+        "UPDATE billing_operations SET offer = 'founding_monthly', quote_expires_at_epoch = $2 \
+         WHERE operation_id = $1",
+    )
+    .bind(&operation_id)
+    .bind(quote_expires_at)
+    .execute(&pool)
+    .await
+    .expect("set founding quote");
+    let mut reservation_tx = pool.begin().await.expect("begin founding reservation");
+    assert!(matches!(
+        reserve_with_payer_kind_until(
+            &mut reservation_tx,
+            &format!("founding:{operation_id}"),
+            &operation_id,
+            &user_id,
+            FoundingPayerKind::Personal,
+            &user_id,
+            FoundingOffer::Monthly,
+            1,
+            quote_expires_at,
+            checkout_deadline,
+            checkout_created_at,
+        )
+        .await
+        .expect("reserve founding place"),
+        ReservationOutcome::Created(_)
+    ));
+    reservation_tx.commit().await.expect("commit reservation");
+
+    let app = app_with_provider(
+        pool.clone(),
+        Arc::new(TestProvider {
+            observation: SubscriptionObservation::Missing,
+            personal_period_end: Some(1_900_000_000),
+        }),
+    );
+    let checkout_completed_at = checkout_created_at + 1_700;
+    let completed = serde_json::json!({
+        "id": format!("evt_delayed_founding_checkout_completed_{fixture}"),
+        "created": checkout_completed_at,
+        "api_version": STRIPE_API_VERSION,
+        "type": "checkout.session.completed",
+        "data": { "object": {
+            "id": "cs_delayed_founding",
+            "client_reference_id": format!("personal:{operation_id}"),
+            "payment_status": "unpaid",
+            "customer": "cus_delayed_founding",
+            "subscription": "sub_delayed_founding",
+            "payment_intent": "pi_delayed_founding"
+        }}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(&app, &completed, Some(&stripe_signature(&completed))).await,
+        StatusCode::OK
+    );
+    let recorded_completion: Option<i64> = sqlx::query_scalar(
+        "SELECT checkout_completed_by_epoch FROM billing_founding_reservations WHERE operation_id = $1",
+    )
+    .bind(&operation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("record Checkout completion timestamp");
+    assert_eq!(recorded_completion, Some(checkout_completed_at));
+
+    let paid_at = checkout_completed_at + 5 * 24 * 60 * 60;
+    let succeeded = serde_json::json!({
+        "id": format!("evt_delayed_founding_payment_succeeded_{fixture}"),
+        "created": paid_at,
+        "api_version": STRIPE_API_VERSION,
+        "type": "checkout.session.async_payment_succeeded",
+        "data": { "object": {
+            "id": "cs_delayed_founding",
+            "client_reference_id": format!("personal:{operation_id}"),
+            "payment_status": "paid",
+            "status": "complete",
+            "expires_at": checkout_deadline,
+            "customer": "cus_delayed_founding",
+            "subscription": "sub_delayed_founding",
+            "payment_intent": "pi_delayed_founding"
+        }}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(&app, &succeeded, Some(&stripe_signature(&succeeded))).await,
+        StatusCode::OK
+    );
+    let (account_state, reservation_state): (String, String) = sqlx::query_as(
+        "SELECT a.state, r.status FROM billing_personal_accounts a \
+         JOIN billing_founding_reservations r ON r.operation_id = a.operation_id \
+         WHERE a.operation_id = $1",
+    )
+    .bind(&operation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read delayed Checkout settlement");
+    assert_eq!(account_state, "active");
+    assert_eq!(reservation_state, "confirmed");
+
+    sqlx::query("DELETE FROM billing_founding_awards WHERE beneficiary_id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("clean founding award");
+    sqlx::query("DELETE FROM billing_founding_reservations WHERE operation_id = $1")
+        .bind(&operation_id)
+        .execute(&pool)
+        .await
+        .expect("clean founding reservation");
+    sqlx::query("DELETE FROM billing_personal_accounts WHERE operation_id = $1")
+        .bind(&operation_id)
+        .execute(&pool)
+        .await
+        .expect("clean personal account");
+    sqlx::query("DELETE FROM billing_personal_events WHERE operation_id = $1")
+        .bind(&operation_id)
+        .execute(&pool)
+        .await
+        .expect("clean personal billing events");
+    sqlx::query("DELETE FROM billing_operations WHERE operation_id = $1")
+        .bind(&operation_id)
+        .execute(&pool)
+        .await
+        .expect("clean billing operation");
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("clean delayed founding user");
 }
 
 #[tokio::test]

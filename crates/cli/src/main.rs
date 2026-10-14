@@ -115,7 +115,7 @@ enum Command {
     },
     /// Create a one-time / expiring share link for a secret and print it.
     #[command(
-        after_help = "Examples:\n  sotto share DATABASE_URL\n  sotto share DATABASE_URL --views 3\n  sotto share DATABASE_URL --expire 3600"
+        after_help = "Interactive selection:\n  Omitting NAME opens a secret picker. After a secret is selected, each omitted limit opens its own menu: view presets are 1, 2, 3, 5 and 10 plus custom (1-100); lifetime presets are no expiry, 1 hour, 1 day, 7 days and 30 days plus custom (1-2592000 seconds). Supplying NAME skips only the secret picker. --views and --expire each skip their corresponding limit menu. Press Esc or Ctrl-C to cancel a selection.\n\nNon-interactive use:\n  Scripts must supply NAME. Omitted limits retain the defaults of one view and no expiry. --no-copy controls clipboard behaviour only; it does not skip selection menus. Unlock and --passphrase prompts may still apply.\n\nExamples:\n  sotto share DATABASE_URL\n  sotto share DATABASE_URL --views 3 --expire 3600"
     )]
     Share {
         /// The secret name to share.
@@ -207,13 +207,16 @@ enum Command {
     },
     /// Show a secret's version history (from the server; run after `login`).
     #[command(
-        after_help = "Examples:\n  sotto history DATABASE_URL\n  sotto history DATABASE_URL --reveal\n\nHistory and rollback use the server and require login and an unlocked local store. History normally shows version numbers and sizes; --reveal prints plaintext values."
+        after_help = "Examples:\n  sotto history DATABASE_URL\n  sotto history DATABASE_URL --json\n  sotto history DATABASE_URL --reveal\n\nHistory and rollback use the server and require login and an unlocked local store. History normally shows version numbers and sizes; --json prints metadata as a JSON array with version, readable, and size_bytes fields. --reveal prints plaintext values."
     )]
     History {
         name: String,
         /// Show each version's value, not just its number and size.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "json")]
         reveal: bool,
+        /// Output metadata as a JSON array without secret values.
+        #[arg(long, conflicts_with = "reveal")]
+        json: bool,
     },
     /// Restore an old version of a secret as a new version (local until you `push`).
     #[command(
@@ -774,10 +777,10 @@ fn run() -> Result<()> {
             eprintln!("removed {name}");
             Ok(())
         }
-        Command::History { name, reveal } => {
+        Command::History { name, reveal, json } => {
             let config = effective_config(&cwd, cli.env.as_deref())?;
             ensure_unlocked(&store, &keychain)?;
-            history(&store, &keychain, &config, &name, reveal)
+            history(&store, &keychain, &config, &name, reveal, json)
         }
         Command::Rollback { name, version } => {
             let config = effective_config(&cwd, cli.env.as_deref())?;
@@ -1704,21 +1707,26 @@ fn history(
     config: &Config,
     name: &str,
     reveal: bool,
+    json: bool,
 ) -> Result<()> {
     let master = session::current_master_key(keychain)?.ok_or(Error::Locked)?;
     let keypair = session::account_keypair(store, &master)?;
     let client = sync_client(keychain)?;
-    let versions = remote::sync::history(&client, store, &keypair, config, name)?;
+    let mut versions = remote::sync::history(&client, store, &keypair, config, name)?;
     if reveal {
         eprintln!("warning: --reveal prints secret values in plaintext");
     }
     let count = versions.len();
-    for mut v in versions {
-        println!("{}", history_line(v.version, v.value.as_deref(), reveal));
-        // Zeroize each decrypted plaintext as soon as it's printed, so the whole history isn't left
-        // resident in memory for the rest of the command.
-        if let Some(value) = v.value.as_mut() {
-            value.zeroize();
+    if json {
+        println!("{}", history_json(&mut versions)?);
+    } else {
+        for mut v in versions {
+            println!("{}", history_line(v.version, v.value.as_deref(), reveal));
+            // Zeroize each decrypted plaintext as soon as it's printed, so the whole history isn't left
+            // resident in memory for the rest of the command.
+            if let Some(value) = v.value.as_mut() {
+                value.zeroize();
+            }
         }
     }
     eprintln!(
@@ -1887,7 +1895,24 @@ fn env_list_json(environments: &[String], active: &str) -> Result<String> {
     to_json(&value)
 }
 
-/// Stable machine-readable shape for token list JSON output.
+/// Stable machine-readable shape for `sotto token ls --json`.
+///
+/// Returns a JSON array of one object per token, in the order the server listed them. Stdout
+/// contains JSON only; diagnostics stay on stderr. No token is emitted for an empty listing.
+///
+/// ```text
+/// [{"token_id":"token-1","name":"ci","created_by":"user-1","beneficiary_id":"user-1",
+///   "beneficiary_status":"verified","expires_at":"2026-01-01T00:00:00Z","expires_in_days":14}]
+/// ```
+///
+/// `created_by`, `beneficiary_id` and `beneficiary_status` are `null` when the server does not
+/// know them.
+///
+/// `expires_at` is an RFC 3339 UTC timestamp or `null`, and `expires_in_days` is the whole days
+/// until then, rounded down, or `null`. Both are `null` together against a server that predates
+/// token expiry, whose tokens never expire. Both are passed through exactly as the server sent
+/// them: days come from the server's clock and are never recomputed locally, and `0` means the
+/// token expires today rather than an unknown expiry.
 fn machine_token_list_json(tokens: &[remote::api::MachineTokenInfo]) -> Result<String> {
     let value: Vec<_> = tokens
         .iter()
@@ -1898,6 +1923,8 @@ fn machine_token_list_json(tokens: &[remote::api::MachineTokenInfo]) -> Result<S
                 "created_by": token.created_by,
                 "beneficiary_id": token.beneficiary_id,
                 "beneficiary_status": token.beneficiary_status,
+                "expires_at": token.expires_at,
+                "expires_in_days": token.expires_in_days,
             })
         })
         .collect();
@@ -2013,6 +2040,32 @@ fn history_line(version: i64, value: Option<&[u8]>, reveal: bool) -> String {
         (Some(value), false) => format!("v{version}  ({} bytes)", value.len()),
         (None, _) => format!("v{version}  (unreadable - run `sotto pull` first)"),
     }
+}
+
+/// Stable machine-readable shape for `sotto history --json`.
+///
+/// Returns metadata only, in newest-first order. Values are zeroized before this function
+/// returns; unreadable rows remain present with a null `size_bytes`.
+fn history_json(versions: &mut [remote::sync::HistoryVersion]) -> Result<String> {
+    let rows: Vec<_> = versions
+        .iter_mut()
+        .map(|version| {
+            let (readable, size_bytes) = match version.value.as_mut() {
+                Some(value) => {
+                    let size_bytes = value.len();
+                    value.zeroize();
+                    (true, Some(size_bytes))
+                }
+                None => (false, None),
+            };
+            serde_json::json!({
+                "version": version.version,
+                "readable": readable,
+                "size_bytes": size_bytes,
+            })
+        })
+        .collect();
+    to_json(&rows)
 }
 
 /// Decrypt all secrets as UTF-8 text pairs (for injection/export). Errors on non-UTF-8 values.
@@ -2169,13 +2222,14 @@ mod tests {
     use sotto_cli::config::Config;
     use sotto_cli::keychain::MemoryKeychain;
     use sotto_cli::remote::api::MachineTokenInfo;
+    use sotto_cli::remote::sync::HistoryVersion;
     use sotto_cli::session;
     use sotto_cli::store::Store;
     use sotto_cli::vault::Vault;
     use std::time::Duration;
 
     use super::{
-        display_secret, env_list_json, history_line, import_dotenv, login_config,
+        display_secret, env_list_json, history_json, history_line, import_dotenv, login_config,
         machine_token_list_json, set_confirmation, Cli, CloudCommand, Command, EnvCommand,
         SharesCommand, ThemeCommand, TokenCommand,
     };
@@ -2258,6 +2312,8 @@ mod tests {
             .render_long_help()
             .to_string();
         assert!(history.contains("sotto history DATABASE_URL --reveal"));
+        assert!(history.contains("sotto history DATABASE_URL --json"));
+        assert!(history.contains("size_bytes"));
         assert!(history.contains("--reveal prints plaintext values"));
 
         let rollback = command
@@ -2268,6 +2324,69 @@ mod tests {
         assert!(rollback.contains("sotto rollback DATABASE_URL 2"));
         assert!(rollback.contains("without erasing history"));
         assert!(rollback.contains("1 or greater"), "{rollback}");
+    }
+
+    #[test]
+    fn history_parser_accepts_json_and_rejects_reveal_conflict() {
+        let cli = Cli::try_parse_from(["sotto", "history", "DATABASE_URL", "--json"])
+            .expect("history JSON should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::History {
+                json: true,
+                reveal: false,
+                ..
+            })
+        ));
+
+        let error =
+            match Cli::try_parse_from(["sotto", "history", "DATABASE_URL", "--json", "--reveal"]) {
+                Ok(_) => panic!("history JSON and reveal should conflict"),
+                Err(error) => error,
+            };
+        assert!(error.to_string().contains("cannot be used with"));
+    }
+
+    #[test]
+    fn history_json_contains_metadata_only_for_all_rows() {
+        let mut versions = vec![
+            HistoryVersion {
+                version: 3,
+                value: Some(b"readable".to_vec()),
+            },
+            HistoryVersion {
+                version: 2,
+                value: Some(vec![0xff, 0x00]),
+            },
+            HistoryVersion {
+                version: 1,
+                value: Some(Vec::new()),
+            },
+            HistoryVersion {
+                version: 0,
+                value: None,
+            },
+        ];
+
+        let output = history_json(&mut versions).expect("history JSON should serialize");
+        let rows: serde_json::Value =
+            serde_json::from_str(&output).expect("history JSON should parse");
+        assert_eq!(
+            rows,
+            serde_json::json!([
+                {"version": 3, "readable": true, "size_bytes": 8},
+                {"version": 2, "readable": true, "size_bytes": 2},
+                {"version": 1, "readable": true, "size_bytes": 0},
+                {"version": 0, "readable": false, "size_bytes": null},
+            ])
+        );
+        assert!(rows
+            .as_array()
+            .expect("history rows should be an array")
+            .iter()
+            .all(|row| row.get("value").is_none()));
+        assert_eq!(versions[0].value, Some(Vec::new()));
+        assert_eq!(versions[1].value, Some(Vec::new()));
     }
 
     #[test]
@@ -2593,7 +2712,7 @@ mod tests {
     }
 
     #[test]
-    fn share_help_explains_supported_limits() {
+    fn share_help_explains_interactive_selection_and_supported_limits() {
         let mut command = Cli::command();
         let help = command
             .find_subcommand_mut("share")
@@ -2601,8 +2720,25 @@ mod tests {
             .render_long_help()
             .to_string();
 
-        assert!(help.contains("1-100"), "{help}");
-        assert!(help.contains("1-2592000"), "{help}");
+        for expected in [
+            "Omitting NAME opens a secret picker",
+            "each omitted limit opens its own menu",
+            "1-100",
+            "1-2592000",
+            "Supplying NAME skips only the secret picker",
+            "--views and --expire each skip their corresponding limit menu",
+            "Press Esc or Ctrl-C",
+            "Scripts must supply NAME",
+            "one view and no expiry",
+            "--no-copy controls clipboard behaviour only",
+            "Unlock and --passphrase prompts may still apply",
+            "sotto share DATABASE_URL --views 3 --expire 3600",
+        ] {
+            assert!(
+                help.contains(expected),
+                "missing share help text: {expected}"
+            );
+        }
     }
 
     #[test]
@@ -2785,8 +2921,8 @@ mod tests {
                 created_by: Some("user-1".into()),
                 beneficiary_id: Some("user-1".into()),
                 beneficiary_status: Some("verified".into()),
-                expires_at: None,
-                expires_in_days: None,
+                expires_at: Some("2026-01-01T00:00:00Z".into()),
+                expires_in_days: Some(14),
             },
             MachineTokenInfo {
                 token_id: "token-2".into(),
@@ -2797,6 +2933,16 @@ mod tests {
                 beneficiary_status: Some("ambiguous".into()),
                 expires_at: None,
                 expires_in_days: None,
+            },
+            MachineTokenInfo {
+                token_id: "token-3".into(),
+                name: "expiring today".into(),
+                public_key: "unused".into(),
+                created_by: Some("user-2".into()),
+                beneficiary_id: Some("user-2".into()),
+                beneficiary_status: Some("verified".into()),
+                expires_at: Some("2026-01-01T00:00:00Z".into()),
+                expires_in_days: Some(0),
             },
         ];
         let value: serde_json::Value =
@@ -2809,6 +2955,28 @@ mod tests {
         assert!(value[1]["beneficiary_id"].is_null());
         assert_eq!(value[1]["beneficiary_status"], "ambiguous");
         assert_eq!(machine_token_list_json(&[]).unwrap(), "[]");
+        let first = value[0].as_object().unwrap();
+        assert_eq!(
+            first.get("expires_at"),
+            Some(&serde_json::Value::String("2026-01-01T00:00:00Z".into()))
+        );
+        assert_eq!(
+            first.get("expires_in_days"),
+            Some(&serde_json::Value::from(14))
+        );
+
+        let second = value[1].as_object().unwrap();
+        assert_eq!(second.get("expires_at"), Some(&serde_json::Value::Null));
+        assert_eq!(
+            second.get("expires_in_days"),
+            Some(&serde_json::Value::Null)
+        );
+
+        let third = value[2].as_object().unwrap();
+        assert_eq!(
+            third.get("expires_in_days"),
+            Some(&serde_json::Value::from(0))
+        );
     }
 
     #[test]

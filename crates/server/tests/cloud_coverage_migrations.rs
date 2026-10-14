@@ -688,6 +688,106 @@ async fn populated_0024_upgrade_preserves_coverage_and_scopes_attempt_identity()
 }
 
 #[tokio::test]
+async fn migration_0053_backfills_beneficiary_scopes_and_allows_event_fanout() {
+    let Some(database) = DisposableDatabase::create().await else {
+        return;
+    };
+    migrator_before(53)
+        .run(&database.pool)
+        .await
+        .expect("apply migrations through 0052");
+    let event_id = format!("migration-fanout-event-{}", uuid::Uuid::new_v4());
+    let first_beneficiary = format!("migration-fanout-person-a-{}", uuid::Uuid::new_v4());
+    let second_beneficiary = format!("migration-fanout-person-b-{}", uuid::Uuid::new_v4());
+    sqlx::query(
+        "INSERT INTO cloud_provider_event_receipts \
+         (provider_namespace, provider_account_id, provider_environment, event_id, event_type, \
+          provider_created_at, normalized_payload_hash, status) \
+         VALUES ('stripe', 'acct_migration_fanout', 'test', $1, 'invoice.paid', 1700000000, $2, 'pending')",
+    )
+    .bind(&event_id)
+    .bind("a".repeat(64))
+    .execute(&database.pool)
+    .await
+    .expect("seed legacy event receipt");
+    sqlx::query(
+        "INSERT INTO cloud_provider_refresh_jobs \
+         (job_id, provider_namespace, provider_account_id, provider_environment, event_id, \
+          beneficiary_id, allocation_id, coverage_source_id) \
+         VALUES ($1, 'stripe', 'acct_migration_fanout', 'test', $2, $3, 'allocation-a', 'source-a')",
+    )
+    .bind(format!("migration-fanout-job-{}", uuid::Uuid::new_v4()))
+    .bind(&event_id)
+    .bind(&first_beneficiary)
+    .execute(&database.pool)
+    .await
+    .expect("seed legacy refresh job");
+
+    db::migrate(&database.pool)
+        .await
+        .expect("apply migration 0053");
+    let backfilled: (String, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT status, collection_attempt_id, collection_run_id \
+         FROM cloud_provider_event_scopes WHERE event_id = $1 AND beneficiary_id = $2",
+    )
+    .bind(&event_id)
+    .bind(&first_beneficiary)
+    .fetch_one(&database.pool)
+    .await
+    .expect("backfilled beneficiary scope");
+    assert_eq!(backfilled, ("pending".into(), None, None));
+
+    sqlx::query(
+        "INSERT INTO cloud_provider_event_scopes \
+         (provider_namespace, provider_account_id, provider_environment, event_id, beneficiary_id) \
+         VALUES ('stripe', 'acct_migration_fanout', 'test', $1, $2)",
+    )
+    .bind(&event_id)
+    .bind(&second_beneficiary)
+    .execute(&database.pool)
+    .await
+    .expect("insert sibling beneficiary scope");
+    sqlx::query(
+        "INSERT INTO cloud_provider_refresh_jobs \
+         (job_id, provider_namespace, provider_account_id, provider_environment, event_id, \
+          beneficiary_id, allocation_id, coverage_source_id) \
+         VALUES ($1, 'stripe', 'acct_migration_fanout', 'test', $2, $3, 'allocation-b', 'source-b')",
+    )
+    .bind(format!("migration-fanout-job-{}", uuid::Uuid::new_v4()))
+    .bind(&event_id)
+    .bind(&second_beneficiary)
+    .execute(&database.pool)
+    .await
+    .expect("insert sibling beneficiary job for the same provider event");
+    let sibling_jobs: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM cloud_provider_refresh_jobs WHERE event_id = $1")
+            .bind(&event_id)
+            .fetch_one(&database.pool)
+            .await
+            .expect("count event jobs");
+    assert_eq!(sibling_jobs, 2);
+
+    for table in [
+        "cloud_provider_invalidation_associations",
+        "cloud_provider_stripe_renewal_failures",
+    ] {
+        let primary_key: String = sqlx::query_scalar(
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+             WHERE conrelid = $1::regclass AND contype = 'p'",
+        )
+        .bind(table)
+        .fetch_one(&database.pool)
+        .await
+        .expect("read composite primary key");
+        assert!(
+            primary_key.contains("beneficiary_id"),
+            "{table}: {primary_key}"
+        );
+    }
+    database.cleanup().await;
+}
+
+#[tokio::test]
 async fn migration_0028_preserves_legacy_provider_replay() {
     let Some(database) = DisposableDatabase::create().await else {
         return;

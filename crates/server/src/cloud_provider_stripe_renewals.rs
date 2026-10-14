@@ -576,14 +576,9 @@ pub fn decode_personal_renewal_failure(
             "lines.data[0].pricing.price_details",
         ))?;
     let price_id = required_ref(&Value::Object(price_details.clone()), "price")?;
-    if price_id != config.monthly_price_id && price_id != config.annual_price_id {
-        return Err(StripeContractError::UnsupportedPrice);
-    }
-    let expected_interval = if price_id == config.monthly_price_id {
-        StripeInterval::Month
-    } else {
-        StripeInterval::Year
-    };
+    let expected_interval = config
+        .interval_for_price(&price_id)
+        .ok_or(StripeContractError::UnsupportedPrice)?;
     let period = line
         .get("period")
         .and_then(Value::as_object)

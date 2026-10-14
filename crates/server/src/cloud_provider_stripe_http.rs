@@ -18,7 +18,7 @@ use crate::billing_catalogue::{BillingInterval, StripePriceObservation};
 use crate::cloud_provider::ProviderEnvironment;
 use crate::cloud_provider_stripe::{
     decode_invoice_payment, validate_personal_invoice_observation, StripeAllocationBinding,
-    StripeContractError, StripeCoverageConfig, StripeInterval, StripePersonalInvoiceFacts,
+    StripeContractError, StripeCoverageConfig, StripePersonalInvoiceFacts,
     StripePersonalInvoiceObservation, STRIPE_ALLOCATION_METADATA_KEY,
 };
 use crate::cloud_provider_stripe_corrections::{
@@ -141,10 +141,17 @@ pub enum StripeReadError {
 }
 
 impl StripeReadError {
-    fn retryable(&self) -> bool {
+    pub(crate) fn is_retryable(&self) -> bool {
         matches!(
             self,
             Self::Transport | Self::Timeout | Self::RateLimited { .. } | Self::Retryable { .. }
+        )
+    }
+
+    pub(crate) fn is_evidence_rejection(&self) -> bool {
+        matches!(
+            self,
+            Self::MalformedResponse(_) | Self::Settlement(_) | Self::Observation(_)
         )
     }
 
@@ -813,6 +820,14 @@ impl StripeReadClient {
                 StripeContractError::UnsupportedPrice,
             ));
         }
+        if line
+            .allocation_reference
+            .as_deref()
+            .zip(invoice.allocation_reference.as_deref())
+            .is_some_and(|(line_reference, invoice_reference)| line_reference != invoice_reference)
+        {
+            return Err(StripeReadError::ContextMismatch);
+        }
         let payments = self.invoice_payments(session, &invoice.id).await?;
         if payments.len() != 1 {
             return Err(StripeReadError::Observation(
@@ -838,11 +853,13 @@ impl StripeReadClient {
                     .clone()
                     .ok_or(StripeReadError::MalformedResponse("line.subscription_item"))?,
                 invoice_line_id: line.id.clone(),
-                allocation_reference: invoice.allocation_reference.ok_or(
-                    StripeReadError::MalformedResponse(
+                allocation_reference: line
+                    .allocation_reference
+                    .clone()
+                    .or(invoice.allocation_reference)
+                    .ok_or(StripeReadError::MalformedResponse(
                         "invoice.metadata.sotto_allocation_reference",
-                    ),
-                )?,
+                    ))?,
                 price_id: line
                     .price_id
                     .clone()
@@ -1396,7 +1413,7 @@ impl StripeReadClient {
                 Ok(value) => return Ok(value),
                 Err(error)
                     if method == Method::GET
-                        && error.retryable()
+                        && error.is_retryable()
                         && retries < self.limits.max_retries =>
                 {
                     let backoff = error
@@ -1958,11 +1975,12 @@ fn validate_current_line(
             StripeContractError::ContextMismatch,
         ));
     }
-    let expected_price = match failure.interval() {
-        StripeInterval::Month => &config.monthly_price_id,
-        StripeInterval::Year => &config.annual_price_id,
-    };
-    if line.price_id.as_deref() != Some(expected_price.as_str()) {
+    if line
+        .price_id
+        .as_deref()
+        .and_then(|price_id| config.interval_for_price(price_id))
+        != Some(failure.interval())
+    {
         return Err(StripeReadError::MalformedResponse("line.price"));
     }
     Ok(())
@@ -2087,6 +2105,7 @@ pub struct StripeInvoiceLineResource {
     pub legacy_subscription_id: Option<String>,
     pub legacy_subscription_item_id: Option<String>,
     pub price_id: Option<String>,
+    pub allocation_reference: Option<String>,
     pub parent_type: Option<String>,
     pub pricing_type: Option<String>,
     pub livemode: Option<bool>,
@@ -2480,6 +2499,20 @@ fn parse_invoice(value: &Value) -> Result<StripeInvoiceResource, StripeReadError
             ));
         }
     };
+    let parent_allocation_reference = parent
+        .and_then(|parent| parent.get("subscription_details"))
+        .and_then(Value::as_object)
+        .map(|details| optional_allocation_reference(details.get("metadata")))
+        .transpose()?
+        .flatten();
+    let invoice_allocation_reference = optional_allocation_reference(value.get("metadata"))?;
+    if parent_allocation_reference
+        .as_deref()
+        .zip(invoice_allocation_reference.as_deref())
+        .is_some_and(|(parent, invoice)| parent != invoice)
+    {
+        return Err(StripeReadError::ContextMismatch);
+    }
     let legacy_subscription_id =
         optional_validated_ref(value.get("subscription"), "invoice.subscription")?;
     if parent_subscription_id
@@ -2510,7 +2543,7 @@ fn parse_invoice(value: &Value) -> Result<StripeInvoiceResource, StripeReadError
             value.get("amount_paid_off_stripe"),
             "invoice.amount_paid_off_stripe",
         )?,
-        allocation_reference: optional_allocation_reference(value.get("metadata"))?,
+        allocation_reference: parent_allocation_reference.or(invoice_allocation_reference),
         livemode: optional_bool(value.get("livemode"), "invoice.livemode")?,
         billing_reason_present: value.get("billing_reason").is_some(),
         collection_method_present: value.get("collection_method").is_some(),
@@ -2622,6 +2655,7 @@ fn parse_invoice_line(value: &Value) -> Result<StripeInvoiceLineResource, Stripe
             .map(|details| optional_validated_ref(details.get("price"), "line.price"))
             .transpose()?
             .flatten(),
+        allocation_reference: optional_allocation_reference(value.get("metadata"))?,
         parent_type: parent
             .map(|parent| optional_string(parent.get("type"), "line.parent.type"))
             .transpose()?
