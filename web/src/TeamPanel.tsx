@@ -441,7 +441,23 @@ export function TeamPanel({
               <p className="muted">Seat changes are quoted before checkout and take effect only after the provider confirms payment.</p>
               {sponsoredSeats.length === 0 ? <p className="muted">No sponsored seats are active.</p> : (
                 <ul className="items">
-                  {sponsoredSeats.map((seat) => <li key={seat.seatId}>{seat.beneficiaryId}<span className="meta">{seat.state} · {seat.offer}{seat.effectiveUntil === null ? " · ongoing" : ` · ends ${new Date(seat.effectiveUntil * 1000).toLocaleDateString("en-GB")}`}</span></li>)}
+                  {sponsoredSeats.map((seat) => {
+                    const transitionStatus = seat.foundingTransitionStatus;
+                    const transitionReason = seat.foundingTransitionReason === "provider_authentication"
+                      ? "Stripe credentials or permissions need attention"
+                      : seat.foundingTransitionReason === "provider_malformed"
+                        ? "the provider schedule could not be verified"
+                        : seat.foundingTransitionReason === "invoice_price_mismatch"
+                          ? "the renewal price did not match"
+                          : seat.foundingTransitionReason === "invoice_boundary_missing"
+                            ? "the renewal period could not be verified"
+                            : seat.foundingTransitionReason === null ? "" : "the transition needs to be checked";
+                    const transitionCopy = transitionStatus === null ? "" :
+                      seat.foundingPriceEndEpoch === null || seat.standardRenewalAmountPence === null
+                        ? ` · founding transition date is not verified${transitionReason === "" ? "" : `; ${transitionReason}`}`
+                        : ` · founding price until ${new Date(seat.foundingPriceEndEpoch * 1000).toLocaleDateString("en-GB")}, then ${new Intl.NumberFormat("en-GB", { style: "currency", currency: "GBP" }).format(seat.standardRenewalAmountPence / 100)} (${transitionStatus === "scheduled" ? "scheduled" : transitionStatus === "not_required" ? "no transition required" : `not yet confirmed${transitionReason === "" ? "" : `: ${transitionReason}`}`})`;
+                    return <li key={seat.seatId}>{seat.beneficiaryId}<span className="meta">{seat.state} · {seat.offer}{seat.effectiveUntil === null ? " · ongoing" : ` · ends ${new Date(seat.effectiveUntil * 1000).toLocaleDateString("en-GB")}`}{transitionCopy}</span></li>;
+                  })}
                 </ul>
               )}
               <form className="row" onSubmit={(e) => { e.preventDefault(); void addSponsoredSeat(); }}>

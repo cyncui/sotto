@@ -7,6 +7,7 @@
 
 use sqlx::{Postgres, Row, Transaction};
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::billing_catalogue::BillingOffer;
 
@@ -49,6 +50,7 @@ impl PersonalBillingState {
 pub struct PersonalBillingAccount {
     pub user_id: String,
     pub operation_id: String,
+    pub allocation_reference: String,
     pub offer: BillingOffer,
     pub stripe_customer_id: Option<String>,
     pub stripe_subscription_id: Option<String>,
@@ -87,9 +89,9 @@ pub async fn begin_account(
     offer: BillingOffer,
     pending_expires_at_epoch: i64,
     now_epoch: i64,
-) -> Result<(), PersonalBillingError> {
+) -> Result<String, PersonalBillingError> {
     let existing = sqlx::query(
-        "SELECT operation_id, offer, state, pending_expires_at_epoch \
+        "SELECT operation_id, allocation_reference, offer, state, pending_expires_at_epoch \
          FROM billing_personal_accounts WHERE user_id = $1 FOR UPDATE",
     )
     .bind(user_id)
@@ -103,16 +105,19 @@ pub async fn begin_account(
             && existing_offer == offer.as_str()
             && state == PersonalBillingState::Pending.as_str();
         if same_pending {
-            return Ok(());
+            return Ok(row.try_get("allocation_reference")?);
         }
         let existing_pending_expires: i64 = row.try_get("pending_expires_at_epoch")?;
         let reusable = state == PersonalBillingState::Canceled.as_str()
             || (state == PersonalBillingState::Pending.as_str()
                 && existing_pending_expires <= now_epoch);
         if reusable {
+            let allocation_reference = new_allocation_reference();
             sqlx::query(
                 "UPDATE billing_personal_accounts SET operation_id = $2, offer = $3, \
                  stripe_customer_id = NULL, stripe_subscription_id = NULL, state = 'pending', \
+                 allocation_reference = $5, \
+                 stripe_coverage_binding_required = TRUE, \
                  pending_expires_at_epoch = $4, paid_through_epoch = NULL, \
                  paid_through_date = NULL, payment_reference = NULL, cancel_at_period_end = FALSE, \
                  cancellation_requested_at = NULL, updated_at = now() WHERE user_id = $1",
@@ -121,23 +126,32 @@ pub async fn begin_account(
             .bind(operation_id)
             .bind(offer.as_str())
             .bind(pending_expires_at_epoch)
+            .bind(&allocation_reference)
             .execute(&mut **tx)
             .await?;
-            return Ok(());
+            return Ok(allocation_reference);
         }
         return Err(PersonalBillingError::AccountExists);
     }
+    let allocation_reference = new_allocation_reference();
     sqlx::query(
         "INSERT INTO billing_personal_accounts \
-         (user_id, operation_id, offer, pending_expires_at_epoch) VALUES ($1, $2, $3, $4)",
+         (user_id, operation_id, allocation_reference, stripe_coverage_binding_required, offer, \
+          pending_expires_at_epoch) \
+         VALUES ($1, $2, $3, TRUE, $4, $5)",
     )
     .bind(user_id)
     .bind(operation_id)
+    .bind(&allocation_reference)
     .bind(offer.as_str())
     .bind(pending_expires_at_epoch)
     .execute(&mut **tx)
     .await?;
-    Ok(())
+    Ok(allocation_reference)
+}
+
+fn new_allocation_reference() -> String {
+    format!("alloc_{}", Uuid::new_v4().simple())
 }
 
 pub async fn load_account(
@@ -145,7 +159,7 @@ pub async fn load_account(
     user_id: &str,
 ) -> Result<Option<PersonalBillingAccount>, PersonalBillingError> {
     let row = sqlx::query(
-        "SELECT user_id, operation_id, offer, stripe_customer_id, stripe_subscription_id, \
+        "SELECT user_id, operation_id, allocation_reference, offer, stripe_customer_id, stripe_subscription_id, \
                 state, pending_expires_at_epoch, paid_through_epoch, paid_through_date, payment_reference, \
                 cancel_at_period_end \
          FROM billing_personal_accounts WHERE user_id = $1",
@@ -359,6 +373,7 @@ fn account_from_row(
     Ok(PersonalBillingAccount {
         user_id: row.try_get("user_id")?,
         operation_id: row.try_get("operation_id")?,
+        allocation_reference: row.try_get("allocation_reference")?,
         offer,
         stripe_customer_id: row.try_get("stripe_customer_id")?,
         stripe_subscription_id: row.try_get("stripe_subscription_id")?,

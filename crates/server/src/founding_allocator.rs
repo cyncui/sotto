@@ -92,6 +92,14 @@ impl FoundingOffer {
             BillingOffer::StandardAnnual | BillingOffer::FoundingAnnual => Self::Annual,
         }
     }
+
+    /// Number of billing periods covered by the founding price for this interval.
+    pub const fn founding_terms(self) -> i32 {
+        match self {
+            Self::Monthly => 12,
+            Self::Annual => 1,
+        }
+    }
 }
 
 impl fmt::Display for FoundingOffer {
@@ -207,6 +215,19 @@ impl FoundingDate {
             ..target
         }
     }
+
+    pub fn anchored_term_end_epoch(
+        start_epoch: i64,
+        offer: FoundingOffer,
+        terms: i32,
+    ) -> Result<i64, CalendarError> {
+        if start_epoch < 0 || terms <= 0 {
+            return Err(CalendarError::InvalidDate);
+        }
+        let start = Self::from_unix_seconds(start_epoch)?;
+        let time_of_day = start_epoch.rem_euclid(86_400);
+        Ok(start.anchored_term_end(offer, terms).to_unix_seconds() + time_of_day)
+    }
 }
 
 impl fmt::Display for FoundingDate {
@@ -250,6 +271,8 @@ pub struct FoundingAward {
     pub cohort_ordinal: i64,
     pub original_start: FoundingDate,
     pub original_end: FoundingDate,
+    pub original_start_epoch: Option<i64>,
+    pub original_end_epoch: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -635,8 +658,32 @@ pub async fn confirm_payment(
     paid_on: FoundingDate,
     now_epoch: i64,
 ) -> Result<ConfirmationOutcome, FoundingAllocatorError> {
+    confirm_payment_with_period_start(
+        tx,
+        reservation_id,
+        payment_reference,
+        paid_on,
+        paid_on.to_unix_seconds(),
+        now_epoch,
+    )
+    .await
+}
+
+pub async fn confirm_payment_with_period_start(
+    tx: &mut Transaction<'_, Postgres>,
+    reservation_id: &str,
+    payment_reference: &str,
+    paid_on: FoundingDate,
+    period_start_epoch: i64,
+    now_epoch: i64,
+) -> Result<ConfirmationOutcome, FoundingAllocatorError> {
     validate_identity(reservation_id, "reservation_id")?;
     validate_identity(payment_reference, "payment_reference")?;
+    if period_start_epoch < 0
+        || FoundingDate::from_unix_seconds(period_start_epoch).ok() != Some(paid_on)
+    {
+        return Err(FoundingAllocatorError::InvalidField("period_start"));
+    }
     lock_capacity(tx).await?;
     let row = sqlx::query(
         "SELECT reservation_id, operation_id, beneficiary_id, payer_kind, payer_id, offer, quote_version, \
@@ -752,11 +799,16 @@ pub async fn confirm_payment(
         return Err(FoundingAllocatorError::CorruptState);
     }
     let award_id = format!("founding:{}", Uuid::new_v4());
-    let end = paid_on.anchored_term_end(offer, 1);
+    let end_epoch =
+        FoundingDate::anchored_term_end_epoch(period_start_epoch, offer, offer.founding_terms())
+            .map_err(|_| FoundingAllocatorError::InvalidField("period_start"))?;
+    let end = FoundingDate::from_unix_seconds(end_epoch)
+        .map_err(|_| FoundingAllocatorError::CorruptState)?;
     sqlx::query(
         "INSERT INTO billing_founding_awards \
-         (award_id, beneficiary_id, payer_kind, payer_id, offer, cohort_ordinal, original_start_date, original_end_date) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+         (award_id, beneficiary_id, payer_kind, payer_id, offer, cohort_ordinal, original_start_date, \
+          original_end_date, original_start_epoch, original_end_epoch) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
     )
     .bind(&award_id)
     .bind(&beneficiary_id)
@@ -766,6 +818,8 @@ pub async fn confirm_payment(
     .bind(ordinal)
     .bind(paid_on.to_string())
     .bind(end.to_string())
+    .bind(period_start_epoch)
+    .bind(end_epoch)
     .execute(&mut **tx)
     .await?;
     sqlx::query(
@@ -786,6 +840,8 @@ pub async fn confirm_payment(
         cohort_ordinal: ordinal,
         original_start: paid_on,
         original_end: end,
+        original_start_epoch: Some(period_start_epoch),
+        original_end_epoch: Some(end_epoch),
     };
     Ok(ConfirmationOutcome::Awarded(award))
 }
@@ -961,7 +1017,7 @@ pub async fn load_award(
 ) -> Result<Option<FoundingAward>, FoundingAllocatorError> {
     let row = sqlx::query(
         "SELECT award_id, beneficiary_id, payer_kind, payer_id, offer, cohort_ordinal, original_start_date, \
-         original_end_date FROM billing_founding_awards WHERE award_id = $1",
+         original_end_date, original_start_epoch, original_end_epoch FROM billing_founding_awards WHERE award_id = $1",
     )
     .bind(award_id)
     .fetch_optional(&mut **tx)
@@ -1021,7 +1077,7 @@ async fn load_award_by_beneficiary(
 ) -> Result<Option<FoundingAward>, FoundingAllocatorError> {
     let row = sqlx::query(
         "SELECT award_id, beneficiary_id, payer_kind, payer_id, offer, cohort_ordinal, original_start_date, \
-         original_end_date FROM billing_founding_awards WHERE beneficiary_id = $1",
+         original_end_date, original_start_epoch, original_end_epoch FROM billing_founding_awards WHERE beneficiary_id = $1",
     )
     .bind(beneficiary_id)
     .fetch_optional(&mut **tx)
@@ -1057,6 +1113,8 @@ fn award_from_row(row: sqlx::postgres::PgRow) -> Result<FoundingAward, FoundingA
             .map_err(|_| FoundingAllocatorError::CorruptState)?,
         original_end: FoundingDate::parse(&row.try_get::<String, _>("original_end_date")?)
             .map_err(|_| FoundingAllocatorError::CorruptState)?,
+        original_start_epoch: row.try_get("original_start_epoch")?,
+        original_end_epoch: row.try_get("original_end_epoch")?,
     })
 }
 
@@ -1142,5 +1200,41 @@ mod tests {
             FoundingOffer::from_billing_offer(BillingOffer::StandardMonthly),
             None
         );
+    }
+
+    #[test]
+    fn founding_price_period_matches_the_advertised_duration() {
+        let monthly_start = FoundingDate::new(2026, 1, 31).unwrap();
+        assert_eq!(
+            monthly_start
+                .anchored_term_end(
+                    FoundingOffer::Monthly,
+                    FoundingOffer::Monthly.founding_terms()
+                )
+                .to_string(),
+            "2027-01-31"
+        );
+
+        let annual_start = FoundingDate::new(2024, 2, 29).unwrap();
+        assert_eq!(
+            annual_start
+                .anchored_term_end(
+                    FoundingOffer::Annual,
+                    FoundingOffer::Annual.founding_terms()
+                )
+                .to_string(),
+            "2025-02-28"
+        );
+    }
+
+    #[test]
+    fn founding_boundary_keeps_the_verified_subscription_time_anchor() {
+        let start = FoundingDate::new(2026, 1, 31).unwrap().to_unix_seconds() + 14 * 3_600 + 27;
+        let end = FoundingDate::anchored_term_end_epoch(start, FoundingOffer::Monthly, 12).unwrap();
+        assert_eq!(
+            end - end.rem_euclid(86_400),
+            FoundingDate::new(2027, 1, 31).unwrap().to_unix_seconds()
+        );
+        assert_eq!(end.rem_euclid(86_400), start.rem_euclid(86_400));
     }
 }

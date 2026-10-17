@@ -1,6 +1,6 @@
 import { StrictMode } from "react";
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import * as api from "../api";
@@ -14,6 +14,7 @@ vi.mock("../api", () => ({
   fetchCloudExportChunk: vi.fn(),
   fetchCloudNotices: vi.fn(),
   fetchEligibility: vi.fn(),
+  fetchPersonalLifecycle: vi.fn(),
   fetchPersonalQuote: vi.fn(),
   fetchPersonalOperation: vi.fn(),
   requestPersonalRefund: vi.fn(),
@@ -36,10 +37,101 @@ const base = {
   deploymentMode: "cloud" as const,
 };
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
+
+function quote(offer: api.PersonalBillingTerm): api.PersonalQuote {
+  return {
+    offer: offer === "monthly" ? "standard_monthly" : "standard_annual", amountPence: offer === "monthly" ? 499 : 4999, currency: "gbp",
+    interval: offer === "monthly" ? "month" : "year", taxTreatment: "shown_at_checkout",
+    quoteVersion: 1, quoteExpiresAtEpoch: 2_000_000_000, founding: false,
+    foundingRemainingPlaces: null, foundingTerm: null, nextRenewalAmountPence: 499,
+  };
+}
+
 describe("CloudAccountPanel", () => {
   beforeEach(() => vi.resetAllMocks());
 
-  beforeEach(() => vi.mocked(api.fetchCloudNotices).mockResolvedValue([]));
+  beforeEach(() => {
+    vi.mocked(api.fetchCloudNotices).mockResolvedValue([]);
+    vi.mocked(api.fetchPersonalLifecycle).mockResolvedValue({
+      state: "active", paidThroughDate: null, cancelAtPeriodEnd: false, portalUrl: null,
+      foundingPriceEndEpoch: null, standardRenewalAmountPence: null, foundingTransitionStatus: null, foundingTransitionReason: null,
+    });
+  });
+
+  it("retries a failed selected-term quote through repeated failure and successful recovery", async () => {
+    vi.mocked(api.fetchEligibility).mockResolvedValue({
+      ...base, state: "free", actions: { ...base.actions, billing: true },
+    });
+    const pending = deferred<api.PersonalQuote>();
+    vi.mocked(api.fetchPersonalQuote)
+      .mockRejectedValueOnce(new Error("synthetic monthly failure"))
+      .mockRejectedValueOnce(new Error("synthetic annual failure"))
+      .mockReturnValueOnce(pending.promise)
+      .mockResolvedValueOnce(quote("annual"));
+    render(<CloudAccountPanel />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("synthetic monthly failure");
+    expect(screen.getByRole("button", { name: "Retry billing quote" })).toBeEnabled();
+    fireEvent.change(screen.getByRole("combobox", { name: "Term" }), { target: { value: "annual" } });
+    expect(await screen.findByRole("alert")).toHaveTextContent("synthetic annual failure");
+    fireEvent.click(screen.getByRole("button", { name: "Retry billing quote" }));
+
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("Loading billing quote");
+    expect(screen.queryByRole("button", { name: "Retry billing quote" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /checkout/i })).not.toBeInTheDocument();
+    expect(api.fetchPersonalQuote).toHaveBeenCalledTimes(3);
+    expect(api.fetchPersonalQuote).toHaveBeenLastCalledWith("annual");
+    expect(api.createPersonalCheckout).not.toHaveBeenCalled();
+    await act(async () => { pending.reject(new Error("synthetic retry failure")); });
+    expect(screen.getByRole("alert")).toHaveTextContent("synthetic retry failure");
+    expect(screen.getByRole("button", { name: "Retry billing quote" })).toBeEnabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry billing quote" }));
+    expect(await screen.findByText(/£49\.99 per year/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Continue to secure checkout" })).toBeEnabled();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(api.fetchPersonalQuote).toHaveBeenCalledTimes(4);
+    expect(api.fetchPersonalQuote).toHaveBeenLastCalledWith("annual");
+    expect(api.createPersonalCheckout).not.toHaveBeenCalled();
+  });
+
+  it.each(["success", "failure"] as const)(
+    "ignores a stale quote %s after changing the selected term",
+    async (outcome) => {
+      vi.mocked(api.fetchEligibility).mockResolvedValue({
+        ...base, state: "free", actions: { ...base.actions, billing: true },
+      });
+      const monthly = deferred<api.PersonalQuote>();
+      const annual = deferred<api.PersonalQuote>();
+      vi.mocked(api.fetchPersonalQuote)
+        .mockReturnValueOnce(monthly.promise)
+        .mockReturnValueOnce(annual.promise);
+      render(<CloudAccountPanel />);
+      const term = await screen.findByRole("combobox", { name: "Term" });
+      fireEvent.change(term, { target: { value: "annual" } });
+      await act(async () => { annual.resolve(quote("annual")); });
+      expect(screen.getByText(/£49\.99 per year/)).toBeInTheDocument();
+      await act(async () => {
+        if (outcome === "success") monthly.resolve(quote("monthly"));
+        else monthly.reject(new Error("stale monthly failure"));
+      });
+      expect(term).toHaveValue("annual");
+      expect(screen.getByText(/£49\.99 per year/)).toBeInTheDocument();
+      expect(screen.queryByText(/£4\.99 per month/)).not.toBeInTheDocument();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Continue to secure checkout" })).toBeEnabled();
+      expect(api.fetchPersonalQuote).toHaveBeenCalledTimes(2);
+      expect(api.createPersonalCheckout).not.toHaveBeenCalled();
+    },
+  );
 
   it("requests initial eligibility only once during StrictMode effect replay", async () => {
     vi.mocked(api.fetchEligibility).mockResolvedValue({ ...base, state: "unavailable" });
@@ -63,6 +155,50 @@ describe("CloudAccountPanel", () => {
     expect(screen.queryByRole("button", { name: /checkout/i })).not.toBeInTheDocument();
     expect(api.fetchPersonalQuote).not.toHaveBeenCalled();
   });
+
+  it.each(["failure", "empty"] as const)(
+    "keeps export recovery available with an optional notices %s",
+    async (outcome) => {
+      vi.mocked(api.fetchEligibility).mockResolvedValue({
+        ...base, state: "export_only", actions: { ...base.actions, export: true },
+      });
+      if (outcome === "failure") {
+        vi.mocked(api.fetchCloudNotices).mockRejectedValueOnce(new Error("synthetic notice failure"));
+      }
+      const view = render(<CloudAccountPanel />);
+      await screen.findByRole("button", { name: "Download encrypted export" });
+      await act(async () => {});
+
+      expect(api.fetchCloudNotices).toHaveBeenCalledOnce();
+      expect(screen.getByRole("heading", { name: "Hosted access" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Download encrypted export" })).toBeEnabled();
+      expect(screen.queryByRole("heading", { name: "Account notices" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      expect(api.startCloudExport).not.toHaveBeenCalled();
+      expect(api.fetchCloudExportChunk).not.toHaveBeenCalled();
+      expect(api.fetchPersonalQuote).not.toHaveBeenCalled();
+      expect(api.createPersonalCheckout).not.toHaveBeenCalled();
+
+      if (outcome === "failure") {
+        view.unmount();
+        vi.mocked(api.fetchCloudNotices).mockResolvedValue([{
+          noticeId: "notice-current", kind: "export_deadline", channel: "in_app",
+          content: { title: "Current export notice", detail: "Keep your encrypted recovery materials.", effectiveAtEpoch: null, deadlineEpoch: null, amountPence: null },
+          dueAtEpoch: 1_900_000_000, status: "pending", lastErrorCode: null,
+          deliveredAtEpoch: null, createdAtEpoch: 1_900_000_000,
+        }]);
+        render(<CloudAccountPanel />);
+        expect(await screen.findByRole("heading", { name: "Account notices" })).toBeInTheDocument();
+        expect(screen.getByText("Current export notice")).toBeInTheDocument();
+        expect(screen.getByText("Keep your encrypted recovery materials.")).toBeInTheDocument();
+        expect(api.fetchCloudNotices).toHaveBeenCalledTimes(2);
+        expect(screen.getByRole("button", { name: "Download encrypted export" })).toBeEnabled();
+        expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+        expect(api.startCloudExport).not.toHaveBeenCalled();
+        expect(api.createPersonalCheckout).not.toHaveBeenCalled();
+      }
+    },
+  );
 
   it("offers a retry when the initial eligibility request fails", async () => {
     vi.mocked(api.fetchEligibility).mockRejectedValueOnce(new Error("synthetic status failure"));
@@ -125,7 +261,7 @@ describe("CloudAccountPanel", () => {
     vi.mocked(api.fetchPersonalQuote).mockResolvedValue({
       offer: "founding_monthly", amountPence: 199, currency: "gbp", interval: "month", taxTreatment: "shown_at_checkout",
       quoteVersion: 1, quoteExpiresAtEpoch: 2_000_000_000, founding: true,
-      foundingRemainingPlaces: 12, foundingTerm: "through the founding monthly term", nextRenewalAmountPence: 299,
+      foundingRemainingPlaces: 12, foundingTerm: "for the first 12 monthly billing periods", nextRenewalAmountPence: 299,
     });
 
     render(<CloudAccountPanel />);
@@ -133,6 +269,26 @@ describe("CloudAccountPanel", () => {
     expect(await screen.findByText(/£1\.99 per month/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /secure checkout/i })).toBeInTheDocument();
     expect(screen.getByText(/12 places remain/)).toBeInTheDocument();
+    expect(screen.getByText(/standard price after the founding term is £2\.99/i)).toBeInTheDocument();
+  });
+
+  it("shows the founding boundary without claiming an unconfirmed schedule is active", async () => {
+    vi.mocked(api.fetchEligibility).mockResolvedValue({
+      ...base, state: "paid", payer: "personal",
+    });
+    vi.mocked(api.fetchPersonalLifecycle).mockResolvedValue({
+      state: "active", paidThroughDate: "2027-01-31", cancelAtPeriodEnd: false, portalUrl: null,
+      foundingPriceEndEpoch: Date.UTC(2027, 0, 31) / 1000,
+      standardRenewalAmountPence: 299,
+      foundingTransitionStatus: "unresolved",
+      foundingTransitionReason: "provider_authentication",
+    });
+
+    render(<CloudAccountPanel />);
+
+    expect(await screen.findByText(/Founding price applies until 31\/01\/2027/i)).toBeInTheDocument();
+    expect(screen.getByText(/not yet confirmed; we are checking it/i)).toBeInTheDocument();
+    expect(screen.getByText(/Stripe credentials or permissions need attention/i)).toBeInTheDocument();
   });
 
   it("keeps a pending checkout recoverable", async () => {

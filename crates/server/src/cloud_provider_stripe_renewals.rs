@@ -45,6 +45,47 @@ pub struct StripeRenewalFailureEvidence {
 }
 
 impl StripeRenewalFailureEvidence {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        allocation_reference: &str,
+        customer_id: &str,
+        subscription_id: &str,
+        provider_item_id: &str,
+        invoice_id: &str,
+        predecessor_invoice_id: &str,
+        renewal_id: &str,
+    ) -> Self {
+        Self {
+            evidence_reference: "stripe-renewal-test-evidence".into(),
+            renewal_id: renewal_id.into(),
+            event_id: "evt_renewal_test".into(),
+            invoice_id: invoice_id.into(),
+            invoice_line_id: "il_renewal_test".into(),
+            predecessor_invoice_id: predecessor_invoice_id.into(),
+            predecessor_evidence_reference: "stripe-paid-test-evidence".into(),
+            provider_account_id: "acct_test".into(),
+            environment: ProviderEnvironment::Test,
+            allocation_reference: allocation_reference.into(),
+            customer_id: customer_id.into(),
+            subscription_id: subscription_id.into(),
+            provider_item_id: provider_item_id.into(),
+            predecessor_period_start: 1_700_000_000,
+            predecessor_period_end: 1_702_592_000,
+            renewal_period_start: 1_702_592_000,
+            renewal_period_end: 1_705_184_000,
+            event_created_at: 1_702_592_000,
+            interval: StripeInterval::Month,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_event(mut self, event_id: &str, event_created_at: i64) -> Self {
+        self.event_id = event_id.into();
+        self.event_created_at = event_created_at;
+        self.evidence_reference = format!("stripe-renewal-test-evidence:{event_id}");
+        self
+    }
+
     /// The versioned semantic reference for this complete historical observation.
     ///
     /// This is separate from the generic provider event fingerprint: it includes the linked
@@ -576,14 +617,9 @@ pub fn decode_personal_renewal_failure(
             "lines.data[0].pricing.price_details",
         ))?;
     let price_id = required_ref(&Value::Object(price_details.clone()), "price")?;
-    if price_id != config.monthly_price_id && price_id != config.annual_price_id {
-        return Err(StripeContractError::UnsupportedPrice);
-    }
-    let expected_interval = if price_id == config.monthly_price_id {
-        StripeInterval::Month
-    } else {
-        StripeInterval::Year
-    };
+    let expected_interval = config
+        .interval_for_price(&price_id)
+        .ok_or(StripeContractError::UnsupportedPrice)?;
     let period = line
         .get("period")
         .and_then(Value::as_object)

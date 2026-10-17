@@ -50,11 +50,20 @@ pub mod cloud_provider_stripe_corrections;
 #[doc(hidden)]
 pub mod cloud_provider_stripe_coverage;
 pub mod founding_allocator;
+pub mod founding_schedule;
+pub mod founding_schedule_worker;
 // Dormant Stripe history transport; it remains unwired until the complete-history contract lands.
 #[doc(hidden)]
 pub mod cloud_provider_stripe_adapter;
 #[doc(hidden)]
+pub mod cloud_provider_stripe_event_repair;
+pub mod cloud_provider_stripe_event_repair_executor;
+#[doc(hidden)]
 pub mod cloud_provider_stripe_http;
+#[doc(hidden)]
+pub mod cloud_provider_stripe_personal_refresh;
+#[doc(hidden)]
+pub mod cloud_provider_stripe_refresh_executor;
 #[doc(hidden)]
 pub mod cloud_provider_stripe_renewal_store;
 #[doc(hidden)]

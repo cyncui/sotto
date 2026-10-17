@@ -207,13 +207,16 @@ enum Command {
     },
     /// Show a secret's version history (from the server; run after `login`).
     #[command(
-        after_help = "Examples:\n  sotto history DATABASE_URL\n  sotto history DATABASE_URL --reveal\n\nHistory and rollback use the server and require login and an unlocked local store. History normally shows version numbers and sizes; --reveal prints plaintext values."
+        after_help = "Examples:\n  sotto history DATABASE_URL\n  sotto history DATABASE_URL --json\n  sotto history DATABASE_URL --reveal\n\nHistory and rollback use the server and require login and an unlocked local store. History normally shows version numbers and sizes; --json prints metadata as a JSON array with version, readable, and size_bytes fields. --reveal prints plaintext values."
     )]
     History {
         name: String,
         /// Show each version's value, not just its number and size.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "json")]
         reveal: bool,
+        /// Output metadata as a JSON array without secret values.
+        #[arg(long, conflicts_with = "reveal")]
+        json: bool,
     },
     /// Restore an old version of a secret as a new version (local until you `push`).
     #[command(
@@ -380,7 +383,17 @@ enum OrgCommand {
     /// Invite an existing Sotto user into an org by email; prints their user id.
     Invite { org_id: String, email: String },
     /// List an org's members and their ids.
-    Members { org_id: String },
+    #[command(after_help = r#"Examples:
+  sotto org members <org-id>
+  sotto org members <org-id> --json
+
+--json prints one {"user_id":...,"role":...,"has_keys":...} object per member, where has_keys reports whether an account public key is on file. The key itself is never printed. Stdout carries the JSON array only; diagnostics stay on stderr."#)]
+    Members {
+        org_id: String,
+        /// Output as a JSON array.
+        #[arg(long)]
+        json: bool,
+    },
     /// Remove a member and rotate every environment they could access.
     Remove { org_id: String, user_id: String },
     /// Show the org's plan: tier, trial, and the limits in effect.
@@ -774,10 +787,10 @@ fn run() -> Result<()> {
             eprintln!("removed {name}");
             Ok(())
         }
-        Command::History { name, reveal } => {
+        Command::History { name, reveal, json } => {
             let config = effective_config(&cwd, cli.env.as_deref())?;
             ensure_unlocked(&store, &keychain)?;
-            history(&store, &keychain, &config, &name, reveal)
+            history(&store, &keychain, &config, &name, reveal, json)
         }
         Command::Rollback { name, version } => {
             let config = effective_config(&cwd, cli.env.as_deref())?;
@@ -944,8 +957,13 @@ fn org_command(store: &Store, keychain: &dyn Keychain, command: OrgCommand) -> R
             println!("{}", invited.user_id);
             Ok(())
         }
-        OrgCommand::Members { org_id } => {
-            for m in remote::team::members(&client, &org_id)? {
+        OrgCommand::Members { org_id, json } => {
+            let members = remote::team::members(&client, &org_id)?;
+            if json {
+                println!("{}", org_members_json(&members)?);
+                return Ok(());
+            }
+            for m in members {
                 let keys = if m.public_key.is_some() {
                     "keys"
                 } else {
@@ -1704,21 +1722,26 @@ fn history(
     config: &Config,
     name: &str,
     reveal: bool,
+    json: bool,
 ) -> Result<()> {
     let master = session::current_master_key(keychain)?.ok_or(Error::Locked)?;
     let keypair = session::account_keypair(store, &master)?;
     let client = sync_client(keychain)?;
-    let versions = remote::sync::history(&client, store, &keypair, config, name)?;
+    let mut versions = remote::sync::history(&client, store, &keypair, config, name)?;
     if reveal {
         eprintln!("warning: --reveal prints secret values in plaintext");
     }
     let count = versions.len();
-    for mut v in versions {
-        println!("{}", history_line(v.version, v.value.as_deref(), reveal));
-        // Zeroize each decrypted plaintext as soon as it's printed, so the whole history isn't left
-        // resident in memory for the rest of the command.
-        if let Some(value) = v.value.as_mut() {
-            value.zeroize();
+    if json {
+        println!("{}", history_json(&mut versions)?);
+    } else {
+        for mut v in versions {
+            println!("{}", history_line(v.version, v.value.as_deref(), reveal));
+            // Zeroize each decrypted plaintext as soon as it's printed, so the whole history isn't left
+            // resident in memory for the rest of the command.
+            if let Some(value) = v.value.as_mut() {
+                value.zeroize();
+            }
         }
     }
     eprintln!(
@@ -1887,6 +1910,32 @@ fn env_list_json(environments: &[String], active: &str) -> Result<String> {
     to_json(&value)
 }
 
+/// Stable machine-readable shape for `sotto org members <org-id> --json`.
+///
+/// Returns a JSON array of one object per member, in the order the server listed them. Stdout
+/// contains JSON only; diagnostics stay on stderr. An organisation with no members yields `[]`.
+///
+/// ```text
+/// [{"user_id":"user-1","role":"admin","has_keys":true},
+///  {"user_id":"user-2","role":"member","has_keys":false}]
+/// ```
+///
+/// `has_keys` reports whether the member has an account public key on file, so a script can tell
+/// a member who cannot be granted a vault key. The key itself is never serialised.
+fn org_members_json(members: &[remote::api::MemberInfo]) -> Result<String> {
+    let value: Vec<_> = members
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "user_id": m.user_id,
+                "role": m.role,
+                "has_keys": m.public_key.is_some(),
+            })
+        })
+        .collect();
+    to_json(&value)
+}
+
 /// Stable machine-readable shape for `sotto token ls --json`.
 ///
 /// Returns a JSON array of one object per token, in the order the server listed them. Stdout
@@ -2032,6 +2081,32 @@ fn history_line(version: i64, value: Option<&[u8]>, reveal: bool) -> String {
         (Some(value), false) => format!("v{version}  ({} bytes)", value.len()),
         (None, _) => format!("v{version}  (unreadable - run `sotto pull` first)"),
     }
+}
+
+/// Stable machine-readable shape for `sotto history --json`.
+///
+/// Returns metadata only, in newest-first order. Values are zeroized before this function
+/// returns; unreadable rows remain present with a null `size_bytes`.
+fn history_json(versions: &mut [remote::sync::HistoryVersion]) -> Result<String> {
+    let rows: Vec<_> = versions
+        .iter_mut()
+        .map(|version| {
+            let (readable, size_bytes) = match version.value.as_mut() {
+                Some(value) => {
+                    let size_bytes = value.len();
+                    value.zeroize();
+                    (true, Some(size_bytes))
+                }
+                None => (false, None),
+            };
+            serde_json::json!({
+                "version": version.version,
+                "readable": readable,
+                "size_bytes": size_bytes,
+            })
+        })
+        .collect();
+    to_json(&rows)
 }
 
 /// Decrypt all secrets as UTF-8 text pairs (for injection/export). Errors on non-UTF-8 values.
@@ -2187,16 +2262,17 @@ mod tests {
     use sotto_cli::commands::App;
     use sotto_cli::config::Config;
     use sotto_cli::keychain::MemoryKeychain;
-    use sotto_cli::remote::api::MachineTokenInfo;
+    use sotto_cli::remote::api::{MachineTokenInfo, MemberInfo};
+    use sotto_cli::remote::sync::HistoryVersion;
     use sotto_cli::session;
     use sotto_cli::store::Store;
     use sotto_cli::vault::Vault;
     use std::time::Duration;
 
     use super::{
-        display_secret, env_list_json, history_line, import_dotenv, login_config,
-        machine_token_list_json, set_confirmation, Cli, CloudCommand, Command, EnvCommand,
-        SharesCommand, ThemeCommand, TokenCommand,
+        display_secret, env_list_json, history_json, history_line, import_dotenv, login_config,
+        machine_token_list_json, org_members_json, set_confirmation, Cli, CloudCommand, Command,
+        EnvCommand, OrgCommand, SharesCommand, ThemeCommand, TokenCommand,
     };
 
     #[test]
@@ -2277,6 +2353,8 @@ mod tests {
             .render_long_help()
             .to_string();
         assert!(history.contains("sotto history DATABASE_URL --reveal"));
+        assert!(history.contains("sotto history DATABASE_URL --json"));
+        assert!(history.contains("size_bytes"));
         assert!(history.contains("--reveal prints plaintext values"));
 
         let rollback = command
@@ -2287,6 +2365,69 @@ mod tests {
         assert!(rollback.contains("sotto rollback DATABASE_URL 2"));
         assert!(rollback.contains("without erasing history"));
         assert!(rollback.contains("1 or greater"), "{rollback}");
+    }
+
+    #[test]
+    fn history_parser_accepts_json_and_rejects_reveal_conflict() {
+        let cli = Cli::try_parse_from(["sotto", "history", "DATABASE_URL", "--json"])
+            .expect("history JSON should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::History {
+                json: true,
+                reveal: false,
+                ..
+            })
+        ));
+
+        let error =
+            match Cli::try_parse_from(["sotto", "history", "DATABASE_URL", "--json", "--reveal"]) {
+                Ok(_) => panic!("history JSON and reveal should conflict"),
+                Err(error) => error,
+            };
+        assert!(error.to_string().contains("cannot be used with"));
+    }
+
+    #[test]
+    fn history_json_contains_metadata_only_for_all_rows() {
+        let mut versions = vec![
+            HistoryVersion {
+                version: 3,
+                value: Some(b"readable".to_vec()),
+            },
+            HistoryVersion {
+                version: 2,
+                value: Some(vec![0xff, 0x00]),
+            },
+            HistoryVersion {
+                version: 1,
+                value: Some(Vec::new()),
+            },
+            HistoryVersion {
+                version: 0,
+                value: None,
+            },
+        ];
+
+        let output = history_json(&mut versions).expect("history JSON should serialize");
+        let rows: serde_json::Value =
+            serde_json::from_str(&output).expect("history JSON should parse");
+        assert_eq!(
+            rows,
+            serde_json::json!([
+                {"version": 3, "readable": true, "size_bytes": 8},
+                {"version": 2, "readable": true, "size_bytes": 2},
+                {"version": 1, "readable": true, "size_bytes": 0},
+                {"version": 0, "readable": false, "size_bytes": null},
+            ])
+        );
+        assert!(rows
+            .as_array()
+            .expect("history rows should be an array")
+            .iter()
+            .all(|row| row.get("value").is_none()));
+        assert_eq!(versions[0].value, Some(Vec::new()));
+        assert_eq!(versions[1].value, Some(Vec::new()));
     }
 
     #[test]
@@ -2742,6 +2883,68 @@ mod tests {
             panic!("expected TokenCommand::Ls");
         };
         assert!(json);
+    }
+
+    #[test]
+    fn org_members_json_parser_parses_flag() {
+        let cli = Cli::try_parse_from(["sotto", "org", "members", "org-1", "--json"])
+            .expect("sotto org members --json should parse");
+        let Some(Command::Org {
+            command: OrgCommand::Members { org_id, json },
+        }) = cli.command
+        else {
+            panic!("expected OrgCommand::Members");
+        };
+        assert_eq!(org_id, "org-1");
+        assert!(json);
+
+        let cli = Cli::try_parse_from(["sotto", "org", "members", "org-1"])
+            .expect("sotto org members should parse");
+        let Some(Command::Org {
+            command: OrgCommand::Members { org_id, json },
+        }) = cli.command
+        else {
+            panic!("expected OrgCommand::Members");
+        };
+        assert_eq!(org_id, "org-1");
+        assert!(!json);
+    }
+
+    #[test]
+    fn org_members_json_reports_key_presence_and_omits_the_key() {
+        let members = vec![
+            MemberInfo {
+                user_id: "user-1".into(),
+                role: "admin".into(),
+                public_key: Some("cHVibGljLWtleQ".into()),
+            },
+            MemberInfo {
+                user_id: "user-2".into(),
+                role: "member".into(),
+                public_key: None,
+            },
+            MemberInfo {
+                user_id: "quote\"and\\slash".into(),
+                role: "member".into(),
+                public_key: Some("cHVibGljLWtleQ".into()),
+            },
+        ];
+        let value: serde_json::Value =
+            serde_json::from_str(&org_members_json(&members).unwrap()).unwrap();
+
+        assert_eq!(value[0]["user_id"], "user-1");
+        assert_eq!(value[0]["role"], "admin");
+        assert_eq!(value[0]["has_keys"], true);
+        assert_eq!(value[1]["has_keys"], false);
+        assert_eq!(value[2]["user_id"], "quote\"and\\slash");
+
+        let first = value[0].as_object().unwrap();
+        assert!(first.contains_key("user_id"));
+        assert!(first.contains_key("role"));
+        assert!(first.contains_key("has_keys"));
+        assert!(!first.contains_key("public_key"));
+
+        assert_eq!(org_members_json(&[]).unwrap(), "[]");
     }
 
     #[test]

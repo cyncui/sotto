@@ -11,6 +11,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::billing_catalogue::BillingOffer;
+use crate::billing_transfers;
 use crate::error::Error;
 use crate::org;
 
@@ -83,6 +84,10 @@ pub struct SponsoredSeat {
     pub effective_from: i64,
     pub effective_until: Option<i64>,
     pub state: SponsoredSeatState,
+    pub founding_offer: Option<BillingOffer>,
+    pub founding_price_end_epoch: Option<i64>,
+    pub founding_transition_status: Option<String>,
+    pub founding_transition_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -284,6 +289,8 @@ pub enum SponsoredBillingError {
     FoundingAllocator(#[from] crate::founding_allocator::FoundingAllocatorError),
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
+    #[error("payer transfer error: {0}")]
+    Transfer(#[from] billing_transfers::TransferError),
 }
 
 impl From<SponsoredBillingError> for Error {
@@ -305,6 +312,12 @@ impl From<SponsoredBillingError> for Error {
             SponsoredBillingError::BeneficiaryAlreadyCovered => {
                 Self::Conflict("beneficiary already has sponsored coverage".into())
             }
+            SponsoredBillingError::Transfer(
+                billing_transfers::TransferError::AlreadyInProgress,
+            ) => Self::Conflict(
+                "a payer transfer is already in progress for this beneficiary".into(),
+            ),
+            SponsoredBillingError::Transfer(error) => Self::from(error),
             SponsoredBillingError::SeatMissing => Self::NotFound("sponsored seat not found".into()),
             SponsoredBillingError::IdempotencyConflict => Self::Conflict(
                 "sponsored idempotency key conflicts with a different request".into(),
@@ -385,8 +398,20 @@ pub async fn list_seats(
         return Err(SponsoredBillingError::Unauthorised);
     }
     let rows = sqlx::query(
-        "SELECT seat_id, organization_id, beneficiary_id, offer, effective_from, effective_until, state \
-         FROM billing_sponsored_seats WHERE organization_id = $1 ORDER BY effective_from, seat_id",
+        "SELECT seat.seat_id, seat.organization_id, seat.beneficiary_id, seat.offer, \
+                seat.effective_from, seat.effective_until, seat.state, award.offer AS founding_offer, \
+                award.original_end_epoch AS founding_price_end_epoch, \
+                CASE WHEN award.award_id IS NULL THEN NULL \
+                     ELSE COALESCE(schedule.state, 'unresolved') END AS founding_transition_status, \
+                CASE WHEN award.award_id IS NULL THEN NULL \
+                     WHEN schedule.state = 'unresolved' THEN schedule.last_error_code \
+                     WHEN schedule.job_id IS NULL THEN 'local_evidence_invalid' \
+                     ELSE NULL END AS founding_transition_reason \
+         FROM billing_sponsored_seats AS seat \
+         LEFT JOIN billing_founding_awards AS award ON award.beneficiary_id = seat.beneficiary_id \
+           AND award.payer_kind = 'sponsor' AND award.payer_id = seat.organization_id \
+         LEFT JOIN billing_founding_schedule_jobs AS schedule ON schedule.award_id = award.award_id \
+         WHERE seat.organization_id = $1 ORDER BY seat.effective_from, seat.seat_id",
     )
     .bind(organization_id)
     .fetch_all(pool)
@@ -402,6 +427,12 @@ pub async fn begin_operation(
     now_epoch: i64,
 ) -> Result<SponsoredOperation, SponsoredBillingError> {
     request.validate_identity()?;
+    let mut transfer_beneficiaries = vec![request.beneficiary_id.as_str()];
+    if let Some(replacement) = request.replacement_beneficiary_id.as_deref() {
+        transfer_beneficiaries.push(replacement);
+    }
+    billing_transfers::lock_and_check_no_live_transfer(tx, &transfer_beneficiaries, now_epoch)
+        .await?;
     let access = org::access_for_update(tx, organization_id, actor_user_id)
         .await
         .map_err(|_| SponsoredBillingError::Unauthorised)?;
@@ -584,6 +615,7 @@ pub async fn record_provider_update(
     current_period_end: Option<i64>,
     provider_item_id: Option<&str>,
 ) -> Result<SponsoredOperation, SponsoredBillingError> {
+    lock_operation_beneficiaries(tx, operation_id).await?;
     let updated = sqlx::query(
         "UPDATE billing_sponsored_operations SET state = 'provider_pending', \
          provider_customer_id = $2, provider_subscription_id = $3, provider_item_id = $4, updated_at = now() \
@@ -665,12 +697,22 @@ pub async fn record_provider_item(
     if provider_item_id.trim().is_empty() || provider_price_id.trim().is_empty() || quantity < 0 {
         return Err(SponsoredBillingError::CorruptState);
     }
+    // A schedule can change the price class carried by one Stripe subscription item. Reconcile
+    // by the provider item and current offer before inserting so the unique item and offer keys
+    // remain valid across a founding-to-standard transition.
+    sqlx::query(
+        "DELETE FROM billing_sponsored_subscription_items \
+         WHERE organization_id = $1 AND (provider_item_id = $2 OR offer = $3)",
+    )
+    .bind(organization_id)
+    .bind(provider_item_id)
+    .bind(offer.as_str())
+    .execute(&mut **tx)
+    .await?;
     sqlx::query(
         "INSERT INTO billing_sponsored_subscription_items \
          (subscription_item_id, organization_id, provider_item_id, provider_price_id, offer, quantity, updated_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, now()) \
-         ON CONFLICT (organization_id, offer) DO UPDATE SET provider_item_id = EXCLUDED.provider_item_id, \
-           provider_price_id = EXCLUDED.provider_price_id, quantity = EXCLUDED.quantity, updated_at = now()",
+         VALUES ($1, $2, $3, $4, $5, $6, now())",
     )
     .bind(format!("sponsored-item:{}", Uuid::new_v4()))
     .bind(organization_id)
@@ -688,6 +730,7 @@ pub async fn complete_paid_checkout(
     operation_id: &str,
     evidence: &SponsoredProviderEvidence,
 ) -> Result<SponsoredOperation, SponsoredBillingError> {
+    lock_operation_beneficiaries(tx, operation_id).await?;
     let organization_id: String = sqlx::query_scalar(
         "SELECT organization_id FROM billing_sponsored_operations WHERE operation_id = $1",
     )
@@ -751,6 +794,27 @@ pub async fn complete_paid_checkout(
     .execute(&mut **tx)
     .await?;
     load_operation(tx, operation_id).await
+}
+
+async fn lock_operation_beneficiaries(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: &str,
+) -> Result<(), SponsoredBillingError> {
+    let beneficiaries: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT beneficiary_id, replacement_beneficiary_id \
+         FROM billing_sponsored_operations WHERE operation_id = $1",
+    )
+    .bind(operation_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((beneficiary_id, replacement_beneficiary_id)) = beneficiaries else {
+        return Ok(());
+    };
+    let mut ids = vec![beneficiary_id];
+    ids.extend(replacement_beneficiary_id);
+    let references = ids.iter().map(String::as_str).collect::<Vec<_>>();
+    billing_transfers::lock_and_check_no_live_transfer(tx, &references, current_epoch()).await?;
+    Ok(())
 }
 
 /// Preserve paid evidence when a founding place can no longer be awarded.
@@ -962,6 +1026,7 @@ fn operation_from_row(
 }
 
 fn seat_from_row(row: &sqlx::postgres::PgRow) -> Result<SponsoredSeat, SponsoredBillingError> {
+    let founding_offer: Option<String> = row.try_get("founding_offer")?;
     Ok(SponsoredSeat {
         seat_id: row.try_get("seat_id")?,
         organization_id: row.try_get("organization_id")?,
@@ -970,6 +1035,10 @@ fn seat_from_row(row: &sqlx::postgres::PgRow) -> Result<SponsoredSeat, Sponsored
         effective_from: row.try_get("effective_from")?,
         effective_until: row.try_get("effective_until")?,
         state: SponsoredSeatState::parse(&row.try_get::<String, _>("state")?)?,
+        founding_offer: founding_offer.as_deref().map(parse_offer).transpose()?,
+        founding_price_end_epoch: row.try_get("founding_price_end_epoch")?,
+        founding_transition_status: row.try_get("founding_transition_status")?,
+        founding_transition_reason: row.try_get("founding_transition_reason")?,
     })
 }
 

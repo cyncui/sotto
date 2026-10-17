@@ -18,7 +18,7 @@ use crate::billing_catalogue::{BillingInterval, StripePriceObservation};
 use crate::cloud_provider::ProviderEnvironment;
 use crate::cloud_provider_stripe::{
     decode_invoice_payment, validate_personal_invoice_observation, StripeAllocationBinding,
-    StripeContractError, StripeCoverageConfig, StripeInterval, StripePersonalInvoiceFacts,
+    StripeContractError, StripeCoverageConfig, StripePersonalInvoiceFacts,
     StripePersonalInvoiceObservation, STRIPE_ALLOCATION_METADATA_KEY,
 };
 use crate::cloud_provider_stripe_corrections::{
@@ -52,6 +52,75 @@ pub struct StripeReadLimits {
     pub max_records: usize,
     pub max_retries: usize,
     pub max_retry_after: Duration,
+}
+
+/// A minimal account event identity returned by Stripe's Events API list endpoint.
+///
+/// The list response is only a discovery hint. Call `event_payload` to retrieve the complete
+/// event through the same authenticated session before applying any business transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StripeEventSummary {
+    pub id: String,
+    pub created: i64,
+    pub event_type: String,
+}
+
+/// One resumable page of Stripe event identities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StripeEventPage {
+    pub events: Vec<StripeEventSummary>,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
+}
+
+/// An event fetched through a client that first verified the configured Stripe account.
+///
+/// Its fields are private so API-read provenance cannot be fabricated by a caller or confused
+/// with a signed webhook. The payload still needs semantic/API-version validation before use.
+#[derive(Debug, Clone, PartialEq)]
+#[doc(hidden)]
+pub struct AuthenticatedStripeEvent {
+    event_id: String,
+    account_id: String,
+    environment: ProviderEnvironment,
+    payload: Value,
+}
+
+impl AuthenticatedStripeEvent {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        event_id: &str,
+        account_id: &str,
+        environment: ProviderEnvironment,
+        payload: Value,
+    ) -> Self {
+        Self {
+            event_id: event_id.into(),
+            account_id: account_id.into(),
+            environment,
+            payload,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn event_id(&self) -> &str {
+        &self.event_id
+    }
+
+    #[doc(hidden)]
+    pub fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
+    #[doc(hidden)]
+    pub fn environment(&self) -> ProviderEnvironment {
+        self.environment
+    }
+
+    #[doc(hidden)]
+    pub fn payload(&self) -> &Value {
+        &self.payload
+    }
 }
 
 impl Default for StripeReadLimits {
@@ -141,10 +210,17 @@ pub enum StripeReadError {
 }
 
 impl StripeReadError {
-    fn retryable(&self) -> bool {
+    pub(crate) fn is_retryable(&self) -> bool {
         matches!(
             self,
             Self::Transport | Self::Timeout | Self::RateLimited { .. } | Self::Retryable { .. }
+        )
+    }
+
+    pub(crate) fn is_evidence_rejection(&self) -> bool {
+        matches!(
+            self,
+            Self::MalformedResponse(_) | Self::Settlement(_) | Self::Observation(_)
         )
     }
 
@@ -373,11 +449,11 @@ impl StripeReadClient {
     /// The repair decoder owns event-shape validation. This method only binds the response to the
     /// requested event identifier and preserves the session's request, byte and deadline bounds.
     #[doc(hidden)]
-    pub async fn event_payload(
+    pub(crate) async fn event_payload(
         &self,
         session: &mut StripeReadSession,
         event_id: &str,
-    ) -> Result<Value, StripeReadError> {
+    ) -> Result<AuthenticatedStripeEvent, StripeReadError> {
         self.ensure_account(session).await?;
         validate_identifier(event_id)?;
         let path = format!("v1/events/{event_id}");
@@ -387,7 +463,150 @@ impl StripeReadClient {
         {
             return Err(StripeReadError::ContextMismatch);
         }
-        Ok(value)
+        validate_mode(
+            value.get("livemode").and_then(Value::as_bool),
+            self.environment,
+        )?;
+        if value
+            .get("account")
+            .is_some_and(|account| !account.is_null())
+            || value
+                .get("context")
+                .is_some_and(|context| !context.is_null())
+            || value
+                .get("created")
+                .and_then(Value::as_i64)
+                .is_none_or(|created| created < 0)
+            || value
+                .get("api_version")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            || !matches!(
+                value.get("type").and_then(Value::as_str),
+                Some("invoice.paid" | "invoice.payment_failed")
+            )
+            || value
+                .get("data")
+                .and_then(Value::as_object)
+                .and_then(|data| data.get("object"))
+                .and_then(Value::as_object)
+                .is_none()
+        {
+            return Err(StripeReadError::MalformedResponse(
+                "event context or identity",
+            ));
+        }
+        Ok(AuthenticatedStripeEvent {
+            event_id: event_id.to_owned(),
+            account_id: self.account_id.clone(),
+            environment: self.environment,
+            payload: value,
+        })
+    }
+
+    /// Read one bounded page of invoice events in a fixed half-open creation-time window.
+    ///
+    /// The caller persists `next_cursor` only after every event on the page has a durable
+    /// disposition. The list endpoint's object payload is intentionally not trusted for billing
+    /// decisions; each summary must be followed by `event_payload`.
+    #[doc(hidden)]
+    pub async fn invoice_events_page(
+        &self,
+        session: &mut StripeReadSession,
+        created_from: i64,
+        created_until: i64,
+        starting_after: Option<&str>,
+        page_size: usize,
+    ) -> Result<StripeEventPage, StripeReadError> {
+        self.ensure_account(session).await?;
+        if created_from < 0 || created_until <= created_from {
+            return Err(StripeReadError::InvalidConfig(
+                "event window must be a nonempty nonnegative interval",
+            ));
+        }
+        if !(1..=100).contains(&page_size) {
+            return Err(StripeReadError::InvalidConfig(
+                "event page size must be between one and one hundred",
+            ));
+        }
+        if let Some(cursor) = starting_after {
+            validate_identifier(cursor)?;
+        }
+        session.add_page(self.limits.max_pages)?;
+        let mut query = vec![
+            ("types[]".to_owned(), "invoice.paid".to_owned()),
+            ("types[]".to_owned(), "invoice.payment_failed".to_owned()),
+            ("created[gte]".to_owned(), created_from.to_string()),
+            ("created[lt]".to_owned(), created_until.to_string()),
+            ("limit".to_owned(), page_size.to_string()),
+        ];
+        if let Some(cursor) = starting_after {
+            query.push(("starting_after".to_owned(), cursor.to_owned()));
+        }
+        let page = self
+            .request_json(session, Method::GET, "v1/events", &query)
+            .await?;
+        if page.get("object").and_then(Value::as_str) != Some("list") {
+            return Err(StripeReadError::MalformedResponse("events.object"));
+        }
+        let has_more = page
+            .get("has_more")
+            .and_then(Value::as_bool)
+            .ok_or(StripeReadError::MalformedResponse("events.has_more"))?;
+        let data = page
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or(StripeReadError::MalformedResponse("events.data"))?;
+        if data.len() > page_size || (has_more && data.is_empty()) {
+            return Err(StripeReadError::InvalidPagination(
+                "event page size or continuation is invalid",
+            ));
+        }
+        session.add_records(data.len(), self.limits.max_records)?;
+        let mut seen = HashSet::new();
+        let mut events = Vec::with_capacity(data.len());
+        for value in data {
+            let id = required_id(value, "events.data.id")?;
+            let created = value
+                .get("created")
+                .and_then(Value::as_i64)
+                .filter(|created| *created >= created_from && *created < created_until)
+                .ok_or(StripeReadError::MalformedResponse("events.data.created"))?;
+            let event_type = value
+                .get("type")
+                .and_then(Value::as_str)
+                .filter(|event_type| {
+                    matches!(*event_type, "invoice.paid" | "invoice.payment_failed")
+                })
+                .ok_or(StripeReadError::MalformedResponse("events.data.type"))?
+                .to_owned();
+            let livemode = value
+                .get("livemode")
+                .and_then(Value::as_bool)
+                .ok_or(StripeReadError::MalformedResponse("events.data.livemode"))?;
+            validate_mode(Some(livemode), self.environment)?;
+            if !seen.insert(id.clone()) {
+                return Err(StripeReadError::InvalidPagination(
+                    "duplicate event id in page",
+                ));
+            }
+            events.push(StripeEventSummary {
+                id,
+                created,
+                event_type,
+            });
+        }
+        let next_cursor = events.last().map(|event| event.id.clone());
+        if has_more && next_cursor.as_deref() == starting_after {
+            return Err(StripeReadError::InvalidPagination(
+                "event cursor did not advance",
+            ));
+        }
+        Ok(StripeEventPage {
+            events,
+            has_more,
+            next_cursor,
+        })
     }
 
     pub async fn subscription_invoices(
@@ -813,6 +1032,14 @@ impl StripeReadClient {
                 StripeContractError::UnsupportedPrice,
             ));
         }
+        if line
+            .allocation_reference
+            .as_deref()
+            .zip(invoice.allocation_reference.as_deref())
+            .is_some_and(|(line_reference, invoice_reference)| line_reference != invoice_reference)
+        {
+            return Err(StripeReadError::ContextMismatch);
+        }
         let payments = self.invoice_payments(session, &invoice.id).await?;
         if payments.len() != 1 {
             return Err(StripeReadError::Observation(
@@ -838,11 +1065,13 @@ impl StripeReadClient {
                     .clone()
                     .ok_or(StripeReadError::MalformedResponse("line.subscription_item"))?,
                 invoice_line_id: line.id.clone(),
-                allocation_reference: invoice.allocation_reference.ok_or(
-                    StripeReadError::MalformedResponse(
+                allocation_reference: line
+                    .allocation_reference
+                    .clone()
+                    .or(invoice.allocation_reference)
+                    .ok_or(StripeReadError::MalformedResponse(
                         "invoice.metadata.sotto_allocation_reference",
-                    ),
-                )?,
+                    ))?,
                 price_id: line
                     .price_id
                     .clone()
@@ -884,8 +1113,18 @@ impl StripeReadClient {
         session: &mut StripeReadSession,
         binding: &StripeAllocationBinding,
     ) -> Result<StripePersonalInvoiceHistoryResult, StripeReadError> {
-        self.subscription(session, binding.subscription_id(), binding.customer_id())
+        let subscription = self
+            .subscription(session, binding.subscription_id(), binding.customer_id())
             .await?;
+        let recovery_currently_eligible =
+            matches!(subscription.status.as_deref(), Some("active" | "past_due"))
+                && subscription.cancel_at_period_end == Some(false)
+                && subscription.cancel_at.is_none()
+                && subscription.cancel_at_present
+                && subscription.canceled_at.is_none()
+                && subscription.canceled_at_present
+                && subscription.ended_at.is_none()
+                && subscription.ended_at_present;
         let invoices = self
             .subscription_invoices(
                 session,
@@ -1022,6 +1261,7 @@ impl StripeReadClient {
                 environment: self.environment,
                 subscription_id: binding.subscription_id().to_owned(),
                 customer_id: binding.customer_id().to_owned(),
+                recovery_currently_eligible,
                 entries,
             },
         ))
@@ -1396,7 +1636,7 @@ impl StripeReadClient {
                 Ok(value) => return Ok(value),
                 Err(error)
                     if method == Method::GET
-                        && error.retryable()
+                        && error.is_retryable()
                         && retries < self.limits.max_retries =>
                 {
                     let backoff = error
@@ -1651,6 +1891,14 @@ pub struct StripeNonPaidInvoice {
 }
 
 impl StripeNonPaidInvoice {
+    #[cfg(test)]
+    pub(crate) fn for_test(invoice_id: &str, status: &str) -> Self {
+        Self {
+            invoice_id: invoice_id.into(),
+            status: status.into(),
+        }
+    }
+
     pub fn invoice_id(&self) -> &str {
         &self.invoice_id
     }
@@ -1674,6 +1922,7 @@ pub struct StripePersonalInvoiceHistory {
     environment: ProviderEnvironment,
     subscription_id: String,
     customer_id: String,
+    recovery_currently_eligible: bool,
     entries: Vec<StripePersonalInvoiceHistoryEntry>,
 }
 
@@ -1698,6 +1947,10 @@ impl StripePersonalInvoiceHistory {
         &self.entries
     }
 
+    pub const fn recovery_currently_eligible(&self) -> bool {
+        self.recovery_currently_eligible
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(
         account_id: &str,
@@ -1706,11 +1959,31 @@ impl StripePersonalInvoiceHistory {
         customer_id: &str,
         entries: Vec<StripePersonalInvoiceHistoryEntry>,
     ) -> Self {
+        Self::for_test_with_recovery(
+            account_id,
+            environment,
+            subscription_id,
+            customer_id,
+            true,
+            entries,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_with_recovery(
+        account_id: &str,
+        environment: ProviderEnvironment,
+        subscription_id: &str,
+        customer_id: &str,
+        recovery_currently_eligible: bool,
+        entries: Vec<StripePersonalInvoiceHistoryEntry>,
+    ) -> Self {
         Self {
             account_id: account_id.into(),
             environment,
             subscription_id: subscription_id.into(),
             customer_id: customer_id.into(),
+            recovery_currently_eligible,
             entries,
         }
     }
@@ -1958,11 +2231,12 @@ fn validate_current_line(
             StripeContractError::ContextMismatch,
         ));
     }
-    let expected_price = match failure.interval() {
-        StripeInterval::Month => &config.monthly_price_id,
-        StripeInterval::Year => &config.annual_price_id,
-    };
-    if line.price_id.as_deref() != Some(expected_price.as_str()) {
+    if line
+        .price_id
+        .as_deref()
+        .and_then(|price_id| config.interval_for_price(price_id))
+        != Some(failure.interval())
+    {
         return Err(StripeReadError::MalformedResponse("line.price"));
     }
     Ok(())
@@ -2087,6 +2361,7 @@ pub struct StripeInvoiceLineResource {
     pub legacy_subscription_id: Option<String>,
     pub legacy_subscription_item_id: Option<String>,
     pub price_id: Option<String>,
+    pub allocation_reference: Option<String>,
     pub parent_type: Option<String>,
     pub pricing_type: Option<String>,
     pub livemode: Option<bool>,
@@ -2480,6 +2755,20 @@ fn parse_invoice(value: &Value) -> Result<StripeInvoiceResource, StripeReadError
             ));
         }
     };
+    let parent_allocation_reference = parent
+        .and_then(|parent| parent.get("subscription_details"))
+        .and_then(Value::as_object)
+        .map(|details| optional_allocation_reference(details.get("metadata")))
+        .transpose()?
+        .flatten();
+    let invoice_allocation_reference = optional_allocation_reference(value.get("metadata"))?;
+    if parent_allocation_reference
+        .as_deref()
+        .zip(invoice_allocation_reference.as_deref())
+        .is_some_and(|(parent, invoice)| parent != invoice)
+    {
+        return Err(StripeReadError::ContextMismatch);
+    }
     let legacy_subscription_id =
         optional_validated_ref(value.get("subscription"), "invoice.subscription")?;
     if parent_subscription_id
@@ -2510,7 +2799,7 @@ fn parse_invoice(value: &Value) -> Result<StripeInvoiceResource, StripeReadError
             value.get("amount_paid_off_stripe"),
             "invoice.amount_paid_off_stripe",
         )?,
-        allocation_reference: optional_allocation_reference(value.get("metadata"))?,
+        allocation_reference: parent_allocation_reference.or(invoice_allocation_reference),
         livemode: optional_bool(value.get("livemode"), "invoice.livemode")?,
         billing_reason_present: value.get("billing_reason").is_some(),
         collection_method_present: value.get("collection_method").is_some(),
@@ -2622,6 +2911,7 @@ fn parse_invoice_line(value: &Value) -> Result<StripeInvoiceLineResource, Stripe
             .map(|details| optional_validated_ref(details.get("price"), "line.price"))
             .transpose()?
             .flatten(),
+        allocation_reference: optional_allocation_reference(value.get("metadata"))?,
         parent_type: parent
             .map(|parent| optional_string(parent.get("type"), "line.parent.type"))
             .transpose()?
