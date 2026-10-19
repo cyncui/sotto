@@ -14,8 +14,12 @@ vi.mock("../api", () => ({
   fetchCloudExportChunk: vi.fn(),
   fetchCloudNotices: vi.fn(),
   fetchEligibility: vi.fn(),
+  fetchOrgs: vi.fn(),
+  fetchPayerTransferCapabilities: vi.fn(),
+  fetchPersonalLifecycle: vi.fn(),
   fetchPersonalQuote: vi.fn(),
   fetchPersonalOperation: vi.fn(),
+  me: vi.fn(),
   requestPersonalRefund: vi.fn(),
   startCloudExport: vi.fn(),
 }));
@@ -32,12 +36,22 @@ const paid: EligibilityView = {
   deploymentMode: "cloud",
 };
 
+const activeLifecycle: PersonalLifecycle = {
+  state: "active", paidThroughDate: "2030-01-01", cancelAtPeriodEnd: false, portalUrl: null,
+  foundingPriceEndEpoch: null, standardRenewalAmountPence: null,
+  foundingTransitionStatus: null, foundingTransitionReason: null,
+};
+
 afterEach(cleanup);
 
 describe("CloudAccountPanel cancellation", () => {
   beforeEach(() => {
     vi.resetAllMocks();
     vi.mocked(api.fetchCloudNotices).mockResolvedValue([]);
+    vi.mocked(api.fetchPersonalLifecycle).mockResolvedValue(activeLifecycle);
+    vi.mocked(api.fetchPayerTransferCapabilities).mockResolvedValue({ available: false, setupAvailable: false });
+    vi.mocked(api.me).mockResolvedValue(null);
+    vi.mocked(api.fetchOrgs).mockResolvedValue([]);
   });
 
   it("blocks overlapping billing actions, recovers from a failed cancellation, and preserves the paid term on retry", async () => {
@@ -78,7 +92,7 @@ describe("CloudAccountPanel cancellation", () => {
     expect(api.cancelPersonalBilling).toHaveBeenCalledTimes(2);
 
     await act(async () => {
-      resolveRetry({ state: "paid", paidThroughDate: "2030-01-01", cancelAtPeriodEnd: true, portalUrl: null });
+      resolveRetry({ ...activeLifecycle, state: "paid", cancelAtPeriodEnd: true });
     });
     expect(screen.getByRole("status")).toHaveTextContent("Cancellation requested. Your paid period remains available until it ends.");
     expect(screen.getByText("Cancellation is scheduled; access remains available until 2030-01-01.")).toBeInTheDocument();

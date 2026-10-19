@@ -51,6 +51,12 @@ services:
       # New Cloud subscriptions stay unavailable until the full lifecycle and public terms are
       # approved. This does not disable customer management or verified webhook processing.
       SOTTO_CLOUD_SALES_ENABLED: ${SOTTO_CLOUD_SALES_ENABLED:-0}
+      SOTTO_FOUNDING_SCHEDULE_WORKER_ENABLED: ${SOTTO_FOUNDING_SCHEDULE_WORKER_ENABLED:-0}
+      SOTTO_FOUNDING_SCHEDULE_PREFLIGHT_VERIFIED: ${SOTTO_FOUNDING_SCHEDULE_PREFLIGHT_VERIFIED:-0}
+      # Keep payer-transfer routes unavailable until provider execution and recovery are verified.
+      SOTTO_BILLING_TRANSFERS_ENABLED: ${SOTTO_BILLING_TRANSFERS_ENABLED:-0}
+      SOTTO_BILLING_TRANSFER_EXECUTION_ENABLED: ${SOTTO_BILLING_TRANSFER_EXECUTION_ENABLED:-0}
+      SOTTO_BILLING_TRANSFER_SETUP_ENABLED: ${SOTTO_BILLING_TRANSFER_SETUP_ENABLED:-0}
       # Machine eligibility enforcement remains dormant until the hosted CI policy is approved.
       SOTTO_MACHINE_ELIGIBILITY_ENFORCEMENT: ${SOTTO_MACHINE_ELIGIBILITY_ENFORCEMENT:-0}
       SOTTO_PROVIDER_REFRESH_INGEST_ENABLED: ${SOTTO_PROVIDER_REFRESH_INGEST_ENABLED:-0}
@@ -69,9 +75,13 @@ services:
       STRIPE_STANDARD_ANNUAL_PRICE_ID: ${STRIPE_STANDARD_ANNUAL_PRICE_ID:-}
       STRIPE_FOUNDING_MONTHLY_PRICE_ID: ${STRIPE_FOUNDING_MONTHLY_PRICE_ID:-}
       STRIPE_FOUNDING_ANNUAL_PRICE_ID: ${STRIPE_FOUNDING_ANNUAL_PRICE_ID:-}
+      STRIPE_CLOUD_PORTAL_CONFIGURATION_ID: ${STRIPE_CLOUD_PORTAL_CONFIGURATION_ID:-}
       SOTTO_SPONSORED_BILLING_ENABLED: ${SOTTO_SPONSORED_BILLING_ENABLED:-0}
       SOTTO_BILLING_CORRECTIONS_ENABLED: ${SOTTO_BILLING_CORRECTIONS_ENABLED:-0}
       SOTTO_BILLING_OPERATOR_TOKEN: ${SOTTO_BILLING_OPERATOR_TOKEN:-}
+      # The separate payer-transfer review token is optional; without it, /ops transfer routes are
+      # not registered. Keep it unset until manual transfer recovery is staffed.
+      SOTTO_BILLING_TRANSFER_OPERATOR_TOKEN: ${SOTTO_BILLING_TRANSFER_OPERATOR_TOKEN:-}
       # Anonymous daily version ping (random instance uuid + version + os/arch, nothing else -
       # README §Telemetry). On by default; set SOTTO_TELEMETRY=off in deploy/.env to opt out.
       SOTTO_TELEMETRY: ${SOTTO_TELEMETRY:-}

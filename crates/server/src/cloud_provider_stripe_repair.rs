@@ -366,7 +366,10 @@ pub(crate) async fn fetch_authenticated_repair_candidate(
     binding: &StripeAllocationBinding,
 ) -> Result<StripeRepairCandidate, StripeRepairError> {
     let event = client.event_payload(session, event_id).await?;
-    decode_authenticated_repair_event(&event, retrieved_at, config, binding)
+    if event.account_id() != config.account_id || event.environment() != config.environment {
+        return Err(StripeRepairError::ContextMismatch);
+    }
+    decode_authenticated_repair_event(event.payload(), retrieved_at, config, binding)
 }
 
 fn required_string(value: &Value, field: &'static str) -> Result<String, StripeRepairError> {

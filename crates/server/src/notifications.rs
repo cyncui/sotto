@@ -45,8 +45,12 @@ pub enum NoticeKind {
     ExportDeadline,
     ImpendingPurge,
     SponsorshipChange,
+    PayerTransferInvitation,
     FoundingExpiry,
     PriceChange,
+    RecoveryResolved,
+    SponsoredRenewalFailure,
+    SponsoredRenewalAction,
 }
 
 impl NoticeKind {
@@ -58,8 +62,12 @@ impl NoticeKind {
             Self::ExportDeadline => "export_deadline",
             Self::ImpendingPurge => "impending_purge",
             Self::SponsorshipChange => "sponsorship_change",
+            Self::PayerTransferInvitation => "payer_transfer_invitation",
             Self::FoundingExpiry => "founding_expiry",
             Self::PriceChange => "price_change",
+            Self::RecoveryResolved => "recovery_resolved",
+            Self::SponsoredRenewalFailure => "sponsored_renewal_failure",
+            Self::SponsoredRenewalAction => "sponsored_renewal_action",
         }
     }
 }
@@ -340,7 +348,7 @@ pub async fn list_for_user(pool: &PgPool, user_id: &str) -> NoticeResult<Vec<Not
                 status, last_error_code, extract(epoch from delivered_at)::bigint AS delivered_at, \
                 extract(epoch from created_at)::bigint AS created_at \
          FROM cloud_notice_outbox \
-         WHERE recipient_user_id=$1 AND status <> 'cancelled' \
+         WHERE recipient_user_id=$1 AND status <> 'cancelled' AND due_at <= now() \
          ORDER BY created_at DESC, notice_id DESC LIMIT $2",
     )
     .bind(user_id)
@@ -621,6 +629,18 @@ mod tests {
     #[test]
     fn kind_and_channel_names_are_stable() {
         assert_eq!(NoticeKind::PriceChange.as_str(), "price_change");
+        assert_eq!(
+            NoticeKind::SponsoredRenewalFailure.as_str(),
+            "sponsored_renewal_failure"
+        );
+        assert_eq!(
+            NoticeKind::SponsoredRenewalAction.as_str(),
+            "sponsored_renewal_action"
+        );
+        assert_eq!(
+            NoticeKind::PayerTransferInvitation.as_str(),
+            "payer_transfer_invitation"
+        );
         assert_eq!(NoticeChannel::InApp.as_str(), "in_app");
         assert_eq!(NoticeChannel::Email.as_str(), "email");
     }

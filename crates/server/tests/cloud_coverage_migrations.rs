@@ -770,6 +770,7 @@ async fn migration_0053_backfills_beneficiary_scopes_and_allows_event_fanout() {
     for table in [
         "cloud_provider_invalidation_associations",
         "cloud_provider_stripe_renewal_failures",
+        "cloud_provider_stripe_renewal_resolutions",
     ] {
         let primary_key: String = sqlx::query_scalar(
             "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
@@ -783,6 +784,14 @@ async fn migration_0053_backfills_beneficiary_scopes_and_allows_event_fanout() {
             primary_key.contains("beneficiary_id"),
             "{table}: {primary_key}"
         );
+        if table == "cloud_provider_stripe_renewal_failures"
+            || table == "cloud_provider_stripe_renewal_resolutions"
+        {
+            assert!(
+                primary_key.contains("allocation_id"),
+                "{table}: {primary_key}"
+            );
+        }
     }
     database.cleanup().await;
 }

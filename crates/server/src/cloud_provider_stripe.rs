@@ -17,6 +17,7 @@ use crate::billing::{
 use crate::cloud_provider::{
     PayerKind, ProviderAdapterError, ProviderContext, ProviderEnvironment, VerifiedProviderEvent,
 };
+use crate::cloud_provider_stripe_http::AuthenticatedStripeEvent;
 
 pub const STRIPE_NAMESPACE: &str = "stripe";
 pub const STRIPE_CURRENCY: &str = "gbp";
@@ -575,6 +576,36 @@ pub fn decode_paid_invoice(
 
     let event: RawStripeEvent =
         serde_json::from_slice(raw_payload).map_err(|_| StripeContractError::MalformedPayload)?;
+    decode_paid_invoice_event(event, config, binding, settlement)
+}
+
+/// Decode the same paid-invoice contract from a Stripe Event retrieved through the authenticated
+/// Events API. This path does not assert or fabricate webhook-signature provenance.
+pub(crate) fn decode_paid_invoice_from_authenticated_read(
+    event: &AuthenticatedStripeEvent,
+    config: &StripeCoverageConfig,
+    binding: &StripeAllocationBinding,
+    settlement: &StripePaymentSettlement,
+) -> Result<StripeCoverageEvidence, StripeContractError> {
+    if event.account_id() != config.account_id || event.environment() != config.environment {
+        return Err(StripeContractError::ContextMismatch);
+    }
+    let payload =
+        serde_json::to_vec(event.payload()).map_err(|_| StripeContractError::MalformedPayload)?;
+    let parsed: RawStripeEvent =
+        serde_json::from_slice(&payload).map_err(|_| StripeContractError::MalformedPayload)?;
+    if parsed.id != event.event_id() {
+        return Err(StripeContractError::ContextMismatch);
+    }
+    decode_paid_invoice_event(parsed, config, binding, settlement)
+}
+
+fn decode_paid_invoice_event(
+    event: RawStripeEvent,
+    config: &StripeCoverageConfig,
+    binding: &StripeAllocationBinding,
+    settlement: &StripePaymentSettlement,
+) -> Result<StripeCoverageEvidence, StripeContractError> {
     let account_provenance = validate_event_context(&event, config)?;
     let api_version = event
         .api_version

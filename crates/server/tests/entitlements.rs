@@ -39,6 +39,7 @@ fn app_with_cloud_sales(pool: PgPool, cloud_sales_enabled: bool) -> Router {
             webhook_secret: "whsec_test".into(),
             price_id: "price_test".into(),
             price_catalogue: None,
+            cloud_portal_configuration_id: cloud_sales_enabled.then(|| "bpc_test".into()),
             cloud_sales_enabled,
             return_url: "https://app.sotto.test".into(),
         });
@@ -59,6 +60,9 @@ fn app_with_billing(
         telemetry_ingest: false,
         cloud_action_enforcement_enabled: false,
         machine_eligibility_enforcement_enabled: false,
+        billing_transfers_enabled: false,
+        billing_transfer_execution_enabled: false,
+        billing_transfer_setup_enabled: false,
         pool,
         oauth: None,
         oauth_config: None,
@@ -67,6 +71,7 @@ fn app_with_billing(
         organisation_deletion_retention_days: DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
         organisation_deletion_metrics_token: None,
         organisation_deletion_operator_token: None,
+        billing_transfer_operator_token: None,
     };
     Router::new()
         .merge(sotto_server::org::router())

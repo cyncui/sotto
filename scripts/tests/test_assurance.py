@@ -2,11 +2,13 @@
 
 import importlib.machinery
 import importlib.util
+from io import BytesIO
 import json
 import os
 from pathlib import Path
 import tempfile
 import unittest
+from urllib.error import HTTPError
 from unittest.mock import patch
 
 
@@ -115,6 +117,39 @@ class AssuranceTests(unittest.TestCase):
         self.assertEqual(jobs, page)
         self.assertEqual(len(get_json.call_args_list), 3)
         self.assertIn("page=2", get_json.call_args_list[2].args[0])
+
+    def test_get_json_retries_transient_server_errors(self):
+        response = BytesIO(b'{"ok": true}')
+        transient = HTTPError("https://api.github.com/example", 502, "Bad Gateway", {}, None)
+        with patch.object(assurance, "urlopen", side_effect=[transient, response]) as open_url:
+            with patch.object(assurance.time, "sleep") as sleep:
+                result = assurance._get_json("https://api.github.com/example", "token")
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(open_url.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+    def test_get_json_does_not_retry_permanent_client_errors(self):
+        permanent = HTTPError("https://api.github.com/example", 400, "Bad Request", {}, None)
+        with patch.object(assurance, "urlopen", side_effect=permanent) as open_url:
+            with patch.object(assurance.time, "sleep") as sleep:
+                with self.assertRaisesRegex(assurance.AssuranceError, "HTTP Error 400"):
+                    assurance._get_json("https://api.github.com/example", "token")
+        open_url.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_get_json_stops_after_bounded_transient_retries(self):
+        transient_errors = [
+            HTTPError("https://api.github.com/example", 502, "Bad Gateway", {}, None)
+            for _ in range(len(assurance.API_RETRY_DELAYS) + 1)
+        ]
+        with patch.object(assurance, "urlopen", side_effect=transient_errors) as open_url:
+            with patch.object(assurance.time, "sleep") as sleep:
+                with self.assertRaisesRegex(assurance.AssuranceError, "HTTP Error 502"):
+                    assurance._get_json("https://api.github.com/example", "token")
+        self.assertEqual(open_url.call_count, len(assurance.API_RETRY_DELAYS) + 1)
+        self.assertEqual(
+            [call.args[0] for call in sleep.call_args_list], list(assurance.API_RETRY_DELAYS)
+        )
 
     def test_second_page_required_failure_reaches_validator(self):
         manifest = {

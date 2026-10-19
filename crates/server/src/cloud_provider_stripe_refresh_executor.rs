@@ -161,7 +161,21 @@ impl StripeRefreshExecutor {
                 sources,
             )
             .map_err(|_| "refresh_personal_binding")?;
-            let mut client = StripeHistoryClient::new(self.stripe.clone(), prepared);
+            let mut renewal_failures = Vec::new();
+            for detail in &personal {
+                let failures =
+                    crate::cloud_provider_stripe_renewal_store::load_personal_renewal_failures(
+                        &self.pool,
+                        context,
+                        &detail.allocation,
+                        Default::default(),
+                    )
+                    .await
+                    .map_err(|_| "refresh_personal_renewals")?;
+                renewal_failures.extend(failures);
+            }
+            let mut client = StripeHistoryClient::new(self.stripe.clone(), prepared)
+                .with_renewal_failures(renewal_failures);
             let collection = collect_provider_history(
                 &mut client,
                 context,
@@ -192,9 +206,24 @@ impl StripeRefreshExecutor {
                 group.iter().map(|detail| detail.binding.clone()).collect(),
             );
             let anchor = &group[0].allocation;
-            let collection = if event.subscription_id.as_deref()
-                == Some(anchor.subscription_id.as_str())
-            {
+            let mut renewal_failures = Vec::new();
+            for detail in group {
+                renewal_failures.extend(
+                    crate::cloud_provider_stripe_renewal_store::load_renewal_failures(
+                        &self.pool,
+                        context,
+                        &detail.allocation,
+                        Default::default(),
+                    )
+                    .await
+                    .map_err(|_| "refresh_sponsored_renewals")?,
+                );
+            }
+            let collection = if use_triggering_sponsored_invoice(
+                &event.event_type,
+                event.subscription_id.as_deref(),
+                &anchor.subscription_id,
+            ) {
                 collect_sponsored_collection(
                     &self.pool,
                     &self.stripe,
@@ -204,6 +233,7 @@ impl StripeRefreshExecutor {
                     anchor,
                     &sponsor_ticket,
                     self.sponsored_limits,
+                    &renewal_failures,
                 )
                 .await
             } else {
@@ -215,6 +245,7 @@ impl StripeRefreshExecutor {
                     anchor,
                     &sponsor_ticket,
                     self.sponsored_limits,
+                    &renewal_failures,
                 )
                 .await
             }
@@ -246,13 +277,21 @@ impl StripeRefreshExecutor {
     }
 }
 
+fn use_triggering_sponsored_invoice(
+    event_type: &str,
+    event_subscription_id: Option<&str>,
+    allocation_subscription_id: &str,
+) -> bool {
+    event_type == "invoice.paid" && event_subscription_id == Some(allocation_subscription_id)
+}
+
 fn refresh_input_matches_stripe(
     context: &ProviderContext,
     event_type: &str,
     personal_coverage: &StripeCoverageConfig,
     sponsored_coverage: &SponsoredStripeCoverageConfig,
 ) -> bool {
-    event_type == "invoice.paid"
+    matches!(event_type, "invoice.paid" | "invoice.payment_failed")
         && context.namespace == crate::cloud_provider_stripe::STRIPE_NAMESPACE
         && context.account_id == personal_coverage.account_id
         && context.account_id == sponsored_coverage.account_id()
@@ -468,6 +507,25 @@ mod tests {
             "invoice.paid",
             &personal_config(),
             &sponsored_config(),
+        ));
+    }
+
+    #[test]
+    fn only_paid_events_use_the_triggering_sponsored_invoice() {
+        assert!(use_triggering_sponsored_invoice(
+            "invoice.paid",
+            Some("sub_sponsor"),
+            "sub_sponsor"
+        ));
+        assert!(!use_triggering_sponsored_invoice(
+            "invoice.payment_failed",
+            Some("sub_sponsor"),
+            "sub_sponsor"
+        ));
+        assert!(!use_triggering_sponsored_invoice(
+            "invoice.paid",
+            Some("sub_other"),
+            "sub_sponsor"
         ));
     }
 }

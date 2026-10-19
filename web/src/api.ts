@@ -180,6 +180,220 @@ export interface CloudNotice {
   createdAtEpoch: number;
 }
 
+export interface PayerTransferCapabilities {
+  available: boolean;
+  setupAvailable: boolean;
+}
+
+export async function fetchPayerTransferCapabilities(): Promise<PayerTransferCapabilities> {
+  const body = await authedJson<{
+    payer_transfers_available?: unknown;
+    payer_transfer_setup_available?: unknown;
+  }>("/server/info");
+  // Older servers do not advertise transfer journeys. Missing or malformed flags fail closed.
+  return {
+    available: body.payer_transfers_available === true,
+    setupAvailable: body.payer_transfer_setup_available === true,
+  };
+}
+
+export interface PayerTransferQuote {
+  quoteId: string;
+  quoteVersion: number;
+  quoteExpiresAtEpoch: number;
+  beneficiaryId: string;
+  counterpartyUserId: string;
+  sourceKind: "personal" | "sponsor";
+  sourceOrganizationId: string | null;
+  destinationKind: "personal" | "sponsor";
+  destinationOrganizationId: string | null;
+  offer: BillingOffer;
+  amountPence: number;
+  currency: string;
+  interval: string;
+  effectiveFrom: number;
+  creditPence: number;
+  founding: boolean;
+}
+
+export interface PayerTransfer {
+  transferId: string;
+  beneficiaryId: string;
+  participantRole: "initiator" | "counterparty";
+  sourceKind: "personal" | "sponsor";
+  sourceOrganizationId: string | null;
+  destinationKind: "personal" | "sponsor";
+  destinationOrganizationId: string | null;
+  offer: BillingOffer;
+  amountPence: number;
+  currency: string;
+  interval: string;
+  effectiveFrom: number;
+  quoteExpiresAtEpoch: number;
+  consentExpiresAtEpoch: number;
+  personalPaymentSetupNeeded: boolean;
+  state: string;
+  resultCode: string | null;
+}
+
+function parsePayerTransfer(body: {
+  transfer_id: string;
+  beneficiary_id: string;
+  participant_role: "initiator" | "counterparty";
+  source_kind: "personal" | "sponsor";
+  source_organization_id: string | null;
+  destination_kind: "personal" | "sponsor";
+  destination_organization_id: string | null;
+  offer: BillingOffer;
+  amount_pence: number;
+  currency: string;
+  interval: string;
+  effective_from: number;
+  quote_expires_at_epoch: number;
+  consent_expires_at_epoch: number;
+  personal_payment_setup_needed: boolean;
+  state: string;
+  result_code: string | null;
+}): PayerTransfer {
+  return {
+    transferId: body.transfer_id,
+    beneficiaryId: body.beneficiary_id,
+    participantRole: body.participant_role,
+    sourceKind: body.source_kind,
+    sourceOrganizationId: body.source_organization_id,
+    destinationKind: body.destination_kind,
+    destinationOrganizationId: body.destination_organization_id,
+    offer: body.offer,
+    amountPence: body.amount_pence,
+    currency: body.currency,
+    interval: body.interval,
+    effectiveFrom: body.effective_from,
+    quoteExpiresAtEpoch: body.quote_expires_at_epoch,
+    consentExpiresAtEpoch: body.consent_expires_at_epoch,
+    personalPaymentSetupNeeded: body.personal_payment_setup_needed,
+    state: body.state,
+    resultCode: body.result_code,
+  };
+}
+
+export async function fetchPayerTransfers(before?: string): Promise<{
+  transfers: PayerTransfer[];
+  nextCursor: string | null;
+}> {
+  const query = new URLSearchParams({ limit: "50" });
+  if (before !== undefined) query.set("before", before);
+  const body = await authedJson<{
+    transfers: Parameters<typeof parsePayerTransfer>[0][];
+    next_cursor: string | null;
+  }>(`/billing/transfers?${query.toString()}`);
+  return {
+    transfers: body.transfers.map(parsePayerTransfer),
+    nextCursor: body.next_cursor,
+  };
+}
+
+export async function fetchPayerTransfer(transferId: string): Promise<PayerTransfer> {
+  return parsePayerTransfer(
+    await authedJson<Parameters<typeof parsePayerTransfer>[0]>(
+      `/billing/transfers/${encodeURIComponent(transferId)}`,
+    ),
+  );
+}
+
+export async function quotePayerTransfer(input: {
+  beneficiaryId: string;
+  counterpartyUserId: string;
+  destinationKind: "personal" | "sponsor";
+  destinationOrganizationId?: string;
+}): Promise<PayerTransferQuote> {
+  const body = await postJson<{
+    quote_id: string;
+    quote_version: number;
+    quote_expires_at_epoch: number;
+    beneficiary_id: string;
+    source_kind: "personal" | "sponsor";
+    source_organization_id: string | null;
+    destination_kind: "personal" | "sponsor";
+    destination_organization_id: string | null;
+    offer: BillingOffer;
+    amount_pence: number;
+    currency: string;
+    interval: string;
+    effective_from: number;
+    credit_pence: number;
+    founding: boolean;
+  }>("/billing/transfers/quote", {
+    beneficiary_id: input.beneficiaryId,
+    counterparty_user_id: input.counterpartyUserId,
+    destination_kind: input.destinationKind,
+    destination_organization_id: input.destinationOrganizationId ?? null,
+  });
+  return {
+    quoteId: body.quote_id,
+    quoteVersion: body.quote_version,
+    quoteExpiresAtEpoch: body.quote_expires_at_epoch,
+    beneficiaryId: body.beneficiary_id,
+    counterpartyUserId: input.counterpartyUserId,
+    sourceKind: body.source_kind,
+    sourceOrganizationId: body.source_organization_id,
+    destinationKind: body.destination_kind,
+    destinationOrganizationId: body.destination_organization_id,
+    offer: body.offer,
+    amountPence: body.amount_pence,
+    currency: body.currency,
+    interval: body.interval,
+    effectiveFrom: body.effective_from,
+    creditPence: body.credit_pence,
+    founding: body.founding,
+  };
+}
+
+export async function beginPayerTransfer(input: {
+  quote: PayerTransferQuote;
+  idempotencyKey: string;
+}): Promise<PayerTransfer> {
+  const quote = input.quote;
+  const body = await postJson<Parameters<typeof parsePayerTransfer>[0]>("/billing/transfers", {
+    beneficiary_id: quote.beneficiaryId,
+    counterparty_user_id: quote.counterpartyUserId,
+    destination_kind: quote.destinationKind,
+    destination_organization_id: quote.destinationOrganizationId,
+    quote_id: quote.quoteId,
+    quote_version: quote.quoteVersion,
+    quote_expires_at_epoch: quote.quoteExpiresAtEpoch,
+    idempotency_key: input.idempotencyKey,
+  });
+  return parsePayerTransfer(body);
+}
+
+export async function acceptPayerTransfer(transferId: string): Promise<PayerTransfer> {
+  return parsePayerTransfer(
+    await postJson<Parameters<typeof parsePayerTransfer>[0]>(
+      `/billing/transfers/${encodeURIComponent(transferId)}/accept`,
+      {},
+    ),
+  );
+}
+
+export async function withdrawPayerTransfer(transferId: string): Promise<PayerTransfer> {
+  return parsePayerTransfer(
+    await postJson<Parameters<typeof parsePayerTransfer>[0]>(
+      `/billing/transfers/${encodeURIComponent(transferId)}/withdraw`,
+      {},
+    ),
+  );
+}
+
+export async function createPayerTransferPaymentSetup(
+  transferId: string,
+): Promise<{ checkoutUrl: string | null }> {
+  const body = await postJson<{ checkout_url: string | null }>(
+    `/billing/transfers/${encodeURIComponent(transferId)}/payment-method`,
+    {},
+  );
+  return { checkoutUrl: body.checkout_url };
+}
+
 export async function fetchCloudNotices(): Promise<CloudNotice[]> {
   const body = await authedJson<Array<{
     notice_id: string;
@@ -325,6 +539,14 @@ export interface PersonalLifecycle {
   paidThroughDate: string | null;
   cancelAtPeriodEnd: boolean;
   portalUrl: string | null;
+  foundingPriceEndEpoch: number | null;
+  standardRenewalAmountPence: number | null;
+  foundingTransitionStatus: string | null;
+  foundingTransitionReason: string | null;
+}
+
+export async function fetchPersonalLifecycle(): Promise<PersonalLifecycle> {
+  return parsePersonalLifecycle(await authedJson<PersonalLifecycleResponse>("/billing/personal/lifecycle"));
 }
 
 export async function createPersonalPortal(): Promise<PersonalLifecycle> {
@@ -344,6 +566,10 @@ interface PersonalLifecycleResponse {
   paid_through_date: string | null;
   cancel_at_period_end: boolean;
   portal_url: string | null;
+  founding_price_end_epoch: number | null;
+  standard_renewal_amount_pence: number | null;
+  founding_transition_status: string | null;
+  founding_transition_reason: string | null;
 }
 
 function parsePersonalLifecycle(body: PersonalLifecycleResponse): PersonalLifecycle {
@@ -352,6 +578,10 @@ function parsePersonalLifecycle(body: PersonalLifecycleResponse): PersonalLifecy
     paidThroughDate: body.paid_through_date,
     cancelAtPeriodEnd: body.cancel_at_period_end,
     portalUrl: body.portal_url,
+    foundingPriceEndEpoch: body.founding_price_end_epoch,
+    standardRenewalAmountPence: body.standard_renewal_amount_pence,
+    foundingTransitionStatus: body.founding_transition_status,
+    foundingTransitionReason: body.founding_transition_reason,
   };
 }
 
@@ -412,14 +642,22 @@ export interface SponsoredSeat {
   effectiveFrom: number;
   effectiveUntil: number | null;
   state: string;
+  foundingPriceEndEpoch: number | null;
+  standardRenewalAmountPence: number | null;
+  foundingTransitionStatus: string | null;
+  foundingTransitionReason: string | null;
 }
 
 export async function fetchSponsoredSeats(orgId: string): Promise<SponsoredSeat[]> {
   const rows = await authedJson<Array<{
     seat_id: string; beneficiary_id: string; offer: string;
     effective_from: number; effective_until: number | null; state: string;
+    founding_price_end_epoch: number | null;
+    standard_renewal_amount_pence: number | null;
+    founding_transition_status: string | null;
+    founding_transition_reason: string | null;
   }>>(`/orgs/${encodeURIComponent(orgId)}/billing/sponsored/seats`);
-  return rows.map((row) => ({ seatId: row.seat_id, beneficiaryId: row.beneficiary_id, offer: row.offer, effectiveFrom: row.effective_from, effectiveUntil: row.effective_until, state: row.state }));
+  return rows.map((row) => ({ seatId: row.seat_id, beneficiaryId: row.beneficiary_id, offer: row.offer, effectiveFrom: row.effective_from, effectiveUntil: row.effective_until, state: row.state, foundingPriceEndEpoch: row.founding_price_end_epoch, standardRenewalAmountPence: row.standard_renewal_amount_pence, foundingTransitionStatus: row.founding_transition_status, foundingTransitionReason: row.founding_transition_reason }));
 }
 
 export interface SponsoredQuote {

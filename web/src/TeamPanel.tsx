@@ -21,6 +21,7 @@ import {
 } from "./api";
 import { decryptOrgName, openOrgKey, sealGrantTo } from "./vault";
 import { OrganisationDeletionPanel } from "./OrganisationDeletionPanel";
+import { SponsoredTransferStart } from "./PayerTransferStart";
 
 interface NamedOrg {
   org: Org;
@@ -254,6 +255,7 @@ export function TeamPanel({
       if (result.checkoutUrl !== null) window.location.assign(result.checkoutUrl);
       else setNotice("Seat checkout is pending provider confirmation. Reload shortly.");
     } catch (e) {
+      if (!isCurrent()) return;
       // A conflict means this price or quote can no longer be honoured. Force a fresh server
       // quote before another checkout attempt instead of resubmitting the stale one.
       if (e instanceof Error && e.message.includes("(409)")) {
@@ -262,7 +264,7 @@ export function TeamPanel({
       }
       setError(message(e));
     } finally {
-      setSponsoredBusy(false);
+      if (isCurrent()) setSponsoredBusy(false);
     }
   }
 
@@ -440,9 +442,26 @@ export function TeamPanel({
               <p className="muted">Seat changes are quoted before checkout and take effect only after the provider confirms payment.</p>
               {sponsoredSeats.length === 0 ? <p className="muted">No sponsored seats are active.</p> : (
                 <ul className="items">
-                  {sponsoredSeats.map((seat) => <li key={seat.seatId}>{seat.beneficiaryId}<span className="meta">{seat.state} · {seat.offer}{seat.effectiveUntil === null ? " · ongoing" : ` · ends ${new Date(seat.effectiveUntil * 1000).toLocaleDateString("en-GB")}`}</span></li>)}
+                  {sponsoredSeats.map((seat) => {
+                    const transitionStatus = seat.foundingTransitionStatus;
+                    const transitionReason = seat.foundingTransitionReason === "provider_authentication"
+                      ? "Stripe credentials or permissions need attention"
+                      : seat.foundingTransitionReason === "provider_malformed"
+                        ? "the provider schedule could not be verified"
+                        : seat.foundingTransitionReason === "invoice_price_mismatch"
+                          ? "the renewal price did not match"
+                          : seat.foundingTransitionReason === "invoice_boundary_missing"
+                            ? "the renewal period could not be verified"
+                            : seat.foundingTransitionReason === null ? "" : "the transition needs to be checked";
+                    const transitionCopy = transitionStatus === null ? "" :
+                      seat.foundingPriceEndEpoch === null || seat.standardRenewalAmountPence === null
+                        ? ` · founding transition date is not verified${transitionReason === "" ? "" : `; ${transitionReason}`}`
+                        : ` · founding price until ${new Date(seat.foundingPriceEndEpoch * 1000).toLocaleDateString("en-GB")}, then ${new Intl.NumberFormat("en-GB", { style: "currency", currency: "GBP" }).format(seat.standardRenewalAmountPence / 100)} (${transitionStatus === "scheduled" ? "scheduled" : transitionStatus === "not_required" ? "no transition required" : `not yet confirmed${transitionReason === "" ? "" : `: ${transitionReason}`}`})`;
+                    return <li key={seat.seatId}>{seat.beneficiaryId}<span className="meta">{seat.state} · {seat.offer}{seat.effectiveUntil === null ? " · ongoing" : ` · ends ${new Date(seat.effectiveUntil * 1000).toLocaleDateString("en-GB")}`}{transitionCopy}</span></li>;
+                  })}
                 </ul>
               )}
+              {orgs !== null && <SponsoredTransferStart sourceOrganizationId={openOrg.org.id} seats={sponsoredSeats} organisations={orgs.map((row) => row.org)} />}
               <form className="row" onSubmit={(e) => { e.preventDefault(); void addSponsoredSeat(); }}>
                 <label>Change <select value={sponsoredAction} onChange={(e) => { setSponsoredQuote(null); setSponsoredAction(e.target.value as "add" | "remove" | "replace"); }} disabled={sponsoredBusy}><option value="add">Add seat</option><option value="remove">Remove seat</option><option value="replace">Replace seat</option></select></label>
                 <label>Beneficiary user id<input value={sponsoredBeneficiary} onChange={(e) => { setSponsoredQuote(null); setSponsoredBeneficiary(e.target.value); }} disabled={sponsoredBusy} /></label>

@@ -44,6 +44,15 @@ pub struct RegistrationReceipt {
     pub outcome: RegistrationOutcome,
 }
 
+/// The durable result of ending one source after its provider-confirmed paid interval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetirementReceipt {
+    pub source_id: String,
+    pub source_set_generation: i64,
+    pub projection_revision: Option<i64>,
+    pub outcome: RegistrationOutcome,
+}
+
 /// The lifecycle state of a durable collection attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CollectionStatus {
@@ -369,6 +378,149 @@ pub async fn register_source(
     })
 }
 
+/// Retire a source from future account-wide collections after its paid interval has ended.
+///
+/// Call only after the provider has confirmed the end and the boundary is in the past. The row
+/// remains as immutable history; new collection snapshots omit it, while attempts created before
+/// retirement remain replayable against their original generation.
+pub async fn retire_source(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: &str,
+    beneficiary_id: &str,
+    source_id: &str,
+    provider_end_reference: &str,
+    effective_until_epoch: i64,
+) -> Result<RetirementReceipt, ReconciliationError> {
+    validate_operation_id(operation_id)?;
+    validate_identifier(beneficiary_id, "beneficiary_id")?;
+    validate_identifier(source_id, "source_id")?;
+    validate_identifier(provider_end_reference, "provider_end_reference")?;
+    if effective_until_epoch <= 0 {
+        return Err(ReconciliationError::InvalidSource(
+            "retirement boundary must be positive".into(),
+        ));
+    }
+    let coordinator = sqlx::query(
+        "SELECT source_set_generation FROM cloud_coverage_coordinators \
+         WHERE beneficiary_id = $1 FOR UPDATE",
+    )
+    .bind(beneficiary_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(ReconciliationError::NoSources)?;
+    let generation: i64 = coordinator.try_get("source_set_generation")?;
+    let source_exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM cloud_coverage_sources \
+         WHERE source_id = $1 AND beneficiary_id = $2)",
+    )
+    .bind(source_id)
+    .bind(beneficiary_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if !source_exists {
+        return Err(ReconciliationError::InvalidSource(
+            "source does not belong to beneficiary".into(),
+        ));
+    }
+    if let Some(row) = sqlx::query(
+        "SELECT beneficiary_id, effective_until_epoch, retirement_operation_id, provider_end_reference, \
+                source_set_generation FROM cloud_coverage_source_retirements \
+         WHERE source_id = $1",
+    )
+    .bind(source_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    {
+        let stored_beneficiary: String = row.try_get("beneficiary_id")?;
+        let stored_boundary: i64 = row.try_get("effective_until_epoch")?;
+        let stored_operation: String = row.try_get("retirement_operation_id")?;
+        let stored_provider_reference: String = row.try_get("provider_end_reference")?;
+        let stored_generation: i64 = row.try_get("source_set_generation")?;
+        if stored_beneficiary != beneficiary_id
+            || stored_boundary != effective_until_epoch
+            || stored_operation != operation_id
+            || stored_provider_reference != provider_end_reference
+        {
+            return Err(ReconciliationError::RegistrationConflict);
+        }
+        return Ok(RetirementReceipt {
+            source_id: source_id.to_string(),
+            source_set_generation: stored_generation,
+            projection_revision: None,
+            outcome: RegistrationOutcome::AlreadyApplied,
+        });
+    }
+    let operation_exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM cloud_coverage_source_retirements \
+         WHERE beneficiary_id = $1 AND retirement_operation_id = $2)",
+    )
+    .bind(beneficiary_id)
+    .bind(operation_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if operation_exists {
+        return Err(ReconciliationError::RegistrationConflict);
+    }
+    let boundary_elapsed: bool =
+        sqlx::query_scalar("SELECT $1 <= EXTRACT(EPOCH FROM now())::BIGINT")
+            .bind(effective_until_epoch)
+            .fetch_one(&mut **tx)
+            .await?;
+    if !boundary_elapsed {
+        return Err(ReconciliationError::InvalidSource(
+            "source cannot be retired before its paid interval ends".into(),
+        ));
+    }
+    let expected_revision = current_revision(tx, beneficiary_id).await?;
+    let next_generation = generation
+        .checked_add(1)
+        .ok_or(ReconciliationError::GenerationOverflow)?;
+    sqlx::query(
+        "INSERT INTO cloud_coverage_source_retirements \
+         (source_id, beneficiary_id, effective_until_epoch, retirement_operation_id, \
+          provider_end_reference, source_set_generation) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(source_id)
+    .bind(beneficiary_id)
+    .bind(effective_until_epoch)
+    .bind(operation_id)
+    .bind(provider_end_reference)
+    .bind(next_generation)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "UPDATE cloud_coverage_collection_attempts SET status = 'superseded' \
+         WHERE beneficiary_id = $1 AND status = 'pending'",
+    )
+    .bind(beneficiary_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "UPDATE cloud_coverage_coordinators SET source_set_generation = $2, current_attempt_id = NULL \
+         WHERE beneficiary_id = $1",
+    )
+    .bind(beneficiary_id)
+    .bind(next_generation)
+    .execute(&mut **tx)
+    .await?;
+    let publication = publish(
+        tx,
+        beneficiary_id,
+        expected_revision,
+        &format!("source-retirement:{operation_id}"),
+        &format!("source-retirement:{source_id}:{effective_until_epoch}"),
+        &unavailable_projection(),
+    )
+    .await?;
+    Ok(RetirementReceipt {
+        source_id: source_id.to_string(),
+        source_set_generation: next_generation,
+        projection_revision: Some(publication.revision),
+        outcome: projection_outcome(publication.outcome),
+    })
+}
+
 /// Begin a collection against the current complete source set.
 ///
 /// The returned ticket is durable only after the caller commits. The caller must roll back on
@@ -425,9 +577,15 @@ pub async fn begin_collection(
     let source_rows = sqlx::query(
         "SELECT beneficiary_id, source_id, provider_namespace, external_allocation_reference, \
                 ownership_evidence_reference \
-         FROM cloud_coverage_sources WHERE beneficiary_id = $1 ORDER BY source_id COLLATE \"C\"",
+         FROM cloud_coverage_sources AS source WHERE source.beneficiary_id = $1 \
+           AND NOT EXISTS (SELECT 1 FROM cloud_coverage_source_retirements AS retirement \
+                           WHERE retirement.source_id = source.source_id \
+                             AND retirement.beneficiary_id = source.beneficiary_id \
+                             AND retirement.source_set_generation <= $2) \
+         ORDER BY source_id COLLATE \"C\"",
     )
     .bind(beneficiary_id)
+    .bind(generation)
     .fetch_all(&mut **tx)
     .await?;
     if source_rows.is_empty() || generation == 0 {
@@ -884,11 +1042,15 @@ async fn validate_stored_bindings(
     ticket: &CollectionTicket,
 ) -> Result<(), ReconciliationError> {
     let rows = sqlx::query(
-        "SELECT beneficiary_id, source_id, provider_namespace, external_allocation_reference, \
-                ownership_evidence_reference, registration_source_set_generation \
-         FROM cloud_coverage_sources \
-         WHERE beneficiary_id = $1 AND registration_source_set_generation <= $2 \
-         ORDER BY source_id COLLATE \"C\"",
+        "SELECT source.beneficiary_id, source.source_id, source.provider_namespace, \
+                source.external_allocation_reference, source.ownership_evidence_reference \
+         FROM cloud_coverage_sources AS source \
+         WHERE source.beneficiary_id = $1 AND source.registration_source_set_generation <= $2 \
+           AND NOT EXISTS (SELECT 1 FROM cloud_coverage_source_retirements AS retirement \
+                           WHERE retirement.source_id = source.source_id \
+                             AND retirement.beneficiary_id = source.beneficiary_id \
+                             AND retirement.source_set_generation <= $2) \
+         ORDER BY source.source_id COLLATE \"C\"",
     )
     .bind(&ticket.beneficiary_id)
     .bind(ticket.source_set_generation)
@@ -898,12 +1060,20 @@ async fn validate_stored_bindings(
         .iter()
         .map(source_binding_from_row)
         .collect::<Result<Vec<_>, _>>()?;
-    let latest_generation = rows
-        .iter()
-        .map(|row| row.try_get("registration_source_set_generation"))
-        .collect::<Result<Vec<i64>, sqlx::Error>>()?
-        .into_iter()
-        .max();
+    let latest_generation = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT GREATEST( \
+             (SELECT max(source.registration_source_set_generation) \
+              FROM cloud_coverage_sources AS source \
+              WHERE source.beneficiary_id = $1 \
+                AND source.registration_source_set_generation <= $2), \
+             (SELECT max(retirement.source_set_generation) \
+              FROM cloud_coverage_source_retirements AS retirement \
+              WHERE retirement.beneficiary_id = $1 AND retirement.source_set_generation <= $2))",
+    )
+    .bind(&ticket.beneficiary_id)
+    .bind(ticket.source_set_generation)
+    .fetch_one(&mut **tx)
+    .await?;
     if latest_generation != Some(ticket.source_set_generation)
         || authoritative.is_empty()
         || authoritative != ticket.source_bindings

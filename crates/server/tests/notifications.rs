@@ -133,6 +133,45 @@ async fn enqueue_is_idempotent_and_cancelled_notice_is_not_listed() {
     cleanup(&pool, USER_ID).await;
 }
 
+#[tokio::test]
+async fn account_notice_list_hides_future_due_rows_but_keeps_due_rows() {
+    let _guard = notification_test_lock().lock().await;
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    const USER_ID: &str = "notification-test-due-filter";
+    cleanup(&pool, USER_ID).await;
+    seed_user(&pool, USER_ID).await;
+
+    let now_epoch: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+        .fetch_one(&pool)
+        .await
+        .expect("read database time");
+    let due = in_app_intent(USER_ID, "event-due", now_epoch.saturating_sub(1));
+    let future = in_app_intent(USER_ID, "event-future", now_epoch.saturating_add(3600));
+    notifications::enqueue(&pool, &due)
+        .await
+        .expect("enqueue due notice");
+    notifications::enqueue(&pool, &future)
+        .await
+        .expect("enqueue future notice");
+    // Cancelled rows stay excluded regardless of their due date.
+    let cancelled = in_app_intent(USER_ID, "event-cancelled", now_epoch.saturating_sub(1));
+    notifications::enqueue(&pool, &cancelled)
+        .await
+        .expect("enqueue cancellable notice");
+    notifications::cancel(&pool, USER_ID, "event-cancelled", "renewal-failure-v1")
+        .await
+        .expect("cancel due notice");
+
+    let notices = notifications::list_for_user(&pool, USER_ID)
+        .await
+        .expect("list due notices");
+    assert_eq!(notices.len(), 1);
+    assert!(notices[0].due_at_epoch <= now_epoch);
+    cleanup(&pool, USER_ID).await;
+}
+
 struct RetrySender;
 
 #[async_trait]

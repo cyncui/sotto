@@ -700,6 +700,7 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
         webhook_secret: WEBHOOK_SECRET.into(),
         price_id: "price_legacy_test".into(),
         price_catalogue: Some(catalogue),
+        cloud_portal_configuration_id: None,
         cloud_sales_enabled: false,
         return_url: "https://app.sotto.test".into(),
     })
@@ -709,6 +710,9 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
         telemetry_ingest: false,
         cloud_action_enforcement_enabled: false,
         machine_eligibility_enforcement_enabled: false,
+        billing_transfers_enabled: false,
+        billing_transfer_execution_enabled: false,
+        billing_transfer_setup_enabled: false,
         pool: pool.clone(),
         oauth: None,
         oauth_config: None,
@@ -717,6 +721,7 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
         organisation_deletion_retention_days: DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
         organisation_deletion_metrics_token: None,
         organisation_deletion_operator_token: None,
+        billing_transfer_operator_token: None,
     };
     let app = Router::new()
         .merge(sotto_server::billing::router())
@@ -920,6 +925,11 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
     .execute(&mut *cleanup)
     .await
     .unwrap();
+    sqlx::query("DELETE FROM billing_founding_schedule_jobs WHERE beneficiary_id = $1")
+        .bind(&founding_user)
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
     sqlx::query("DELETE FROM billing_founding_awards WHERE beneficiary_id = $1")
         .bind(&founding_user)
         .execute(&mut *cleanup)

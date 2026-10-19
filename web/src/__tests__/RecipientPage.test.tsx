@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -75,7 +75,9 @@ describe("RecipientPage", () => {
     expect(reveal).toHaveFocus();
     fireEvent.click(reveal);
     expect(await screen.findByRole("textbox", { name: "Shared secret" })).toHaveValue(secret);
-    expect(screen.getByRole("heading", { name: "Shared secret" })).toHaveFocus();
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "Shared secret" })).toHaveFocus();
+    });
   });
 
   it("reports a missing fragment without fetching the share", async () => {
@@ -201,6 +203,9 @@ describe("RecipientPage", () => {
     });
 
     const textarea = await revealSecret();
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: "Shared secret" })).toHaveFocus(),
+    );
     const copy = screen.getByRole("button", { name: "Copy secret" });
     copy.focus();
     fireEvent.click(copy);
