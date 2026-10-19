@@ -92,6 +92,9 @@ export function VaultView({
   const [copyBusy, setCopyBusy] = useState(false);
   const [copyFeedback, setCopyFeedback] = useState<string | null>(null);
   const copyGeneration = useRef(0);
+  const [linkCopyBusy, setLinkCopyBusy] = useState(false);
+  const [linkCopyFeedback, setLinkCopyFeedback] = useState<string | null>(null);
+  const linkCopyGeneration = useRef(0);
   const [secretQuery, setSecretQuery] = useState("");
   // Org members of the active project (loaded when an org env is opened), for the share picker.
   const [members, setMembers] = useState<Member[] | null>(null);
@@ -106,6 +109,8 @@ export function VaultView({
   const rotatingEnvRef = useRef<string | null>(null);
   const [sharingEnvId, setSharingEnvId] = useState<string | null>(null);
   const sharingEnvRef = useRef<string | null>(null);
+  const [creatingShare, setCreatingShare] = useState(false);
+  const creatingShareRef = useRef(false);
   // Selection loads can resolve out of order; only the latest generation may update the view.
   const projectLoad = useRef(0);
   const envLoad = useRef(0);
@@ -406,6 +411,9 @@ export function VaultView({
     ++copyGeneration.current;
     setCopyBusy(false);
     setCopyFeedback(null);
+    ++linkCopyGeneration.current;
+    setLinkCopyBusy(false);
+    setLinkCopyFeedback(null);
     setError(null);
     try {
       const value = decryptSecretValue(openEnv.vaultKey, openEnv.envId, ns.entry);
@@ -436,7 +444,41 @@ export function VaultView({
     }
   }
 
+  async function copyShareLink(current: Revealed) {
+    if (current.link === null || linkCopyBusy) {
+      return;
+    }
+    const generation = ++linkCopyGeneration.current;
+    setLinkCopyBusy(true);
+    setLinkCopyFeedback(null);
+    try {
+      if (navigator.clipboard?.writeText === undefined) {
+        throw new Error("clipboard unavailable");
+      }
+      await navigator.clipboard.writeText(current.link);
+      if (generation === linkCopyGeneration.current) {
+        setLinkCopyFeedback("Share link copied.");
+      }
+    } catch {
+      if (generation === linkCopyGeneration.current) {
+        setLinkCopyFeedback(
+          "Copy failed. Select the share link above and copy it manually.",
+        );
+      }
+    } finally {
+      if (generation === linkCopyGeneration.current) {
+        setLinkCopyBusy(false);
+      }
+    }
+  }
+
   async function share(current: Revealed) {
+    if (creatingShareRef.current) {
+      return;
+    }
+    creatingShareRef.current = true;
+    setCreatingShare(true);
+    setError(null);
     const generation = revealGeneration.current;
     try {
       const { encBlob, fragmentKey } = sealForShare(current.value);
@@ -450,6 +492,9 @@ export function VaultView({
       if (generation === revealGeneration.current) {
         setError(message(e));
       }
+    } finally {
+      creatingShareRef.current = false;
+      setCreatingShare(false);
     }
   }
 
@@ -471,6 +516,9 @@ export function VaultView({
     }
     const id = revealed.id;
     ++revealGeneration.current;
+    ++linkCopyGeneration.current;
+    setLinkCopyBusy(false);
+    setLinkCopyFeedback(null);
     setRevealed(null);
     secretButtons.current.get(id)?.focus();
   }
@@ -667,8 +715,12 @@ export function VaultView({
             Hide secret
           </button>
           {revealed.link === null ? (
-            <button className="ghost" onClick={() => void share(revealed)}>
-              Create one-time share link
+            <button
+              className="ghost"
+              onClick={() => void share(revealed)}
+              disabled={creatingShare}
+            >
+              {creatingShare ? "Creating…" : "Create one-time share link"}
             </button>
           ) : (
             <>
@@ -683,6 +735,15 @@ export function VaultView({
                 rows={2}
                 spellCheck={false}
               />
+              <button
+                disabled={linkCopyBusy}
+                onClick={() => void copyShareLink(revealed)}
+              >
+                {linkCopyBusy ? "Copying…" : "Copy share link"}
+              </button>
+              {linkCopyFeedback !== null && (
+                <p role="status">{linkCopyFeedback}</p>
+              )}
             </>
           )}
         </section>

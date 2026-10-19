@@ -55,14 +55,54 @@ entitlement model. Stripe configuration must be paired with `cloud`; the mode re
 New hosted purchases have a separate default-off switch, `SOTTO_CLOUD_SALES_ENABLED=0`. Turning it
 off pauses new quotes and checkout sessions while existing billing portals, cancellation, refund
 handling, and verified webhook settlement remain available. Enabling it requires Cloud mode, all
-Stripe credentials, and the complete four-price hosted catalogue. It does not authorise a launch
-by itself. Operator procedures and deployment controls are maintained separately from the public
-deployment guide.
+Stripe credentials, the complete four-price hosted catalogue, and a safe Customer Portal
+configuration. It does not authorise a launch by itself. Operator procedures and deployment
+controls are maintained separately from the public deployment guide.
 
 Hosted catalogue variables are `STRIPE_STANDARD_MONTHLY_PRICE_ID`,
 `STRIPE_STANDARD_ANNUAL_PRICE_ID`, `STRIPE_FOUNDING_MONTHLY_PRICE_ID`, and
 `STRIPE_FOUNDING_ANNUAL_PRICE_ID`. Compose passes them separately from the legacy
 `STRIPE_PRICE_ID`. The catalogue must be complete; partial configuration fails at boot.
+Founding prices remain unavailable unless `SOTTO_FOUNDING_SCHEDULE_WORKER_ENABLED=1`; the switch
+defaults to `0` and requires a complete hosted catalogue plus
+`SOTTO_FOUNDING_SCHEDULE_PREFLIGHT_VERIFIED=1`. Keep both switches at `0` until the founding
+interval-change protection, safe Customer Portal configuration, and complete schedule and renewal
+flow have passed a Stripe test-mode rehearsal. The worker requires
+`STRIPE_CLOUD_PORTAL_CONFIGURATION_ID` even when new sales are off. Set the preflight value to `1`
+only after recording that evidence. The worker switch does not enable Cloud sales by itself.
+
+Create a dedicated Stripe Customer Portal configuration for Cloud and set its id in
+`STRIPE_CLOUD_PORTAL_CONFIGURATION_ID`. Enable payment-method updates and period-end cancellation
+with no cancellation proration, and disable subscription updates. Sotto retrieves and checks this
+configuration before issuing Cloud quotes and checkout sessions, and passes it to Cloud portal
+sessions when configured. This applies the server owned price catalogue consistently: customers
+can't switch to a plan that Sotto doesn't track for invoice verification. When the variable is
+unset, portal sessions keep Stripe's default configuration as before. The configured portal allows
+payment-method updates and period-end cancellation, with subscription changes disabled.
+This applies to all Cloud customers, including existing organisation subscriptions that use the
+legacy Team billing path; those customers also receive period-end cancellation and cannot change
+plans in the portal once this configuration is set.
+
+Stripe does not allow customers to update or cancel a subscription while a subscription schedule
+is attached. Sotto's founding transition worker attaches such a schedule, so this portal setting
+does not provide a cancellation path for a schedule-managed founder. Keep the worker disabled until
+Sotto's cancellation route can safely end a scheduled subscription and that flow has passed a
+Stripe test-mode rehearsal. The id is not a secret; the API key needs read access to Customer
+Portal configurations and write access to create portal sessions.
+
+Hosted paid-invoice coverage intake and its refresh worker are staged separately and default off:
+`SOTTO_PROVIDER_REFRESH_INGEST_ENABLED=0` and `SOTTO_PROVIDER_REFRESH_WORKER_ENABLED=0`. These
+controls apply only to the hosted billing deployment; self-hosted installations can leave them
+disabled. For the current Stripe integration, enabling either control requires `STRIPE_ACCOUNT_ID`,
+a test or live restricted API key, and the complete hosted price catalogue. Startup verifies the
+provider account and configured prices before enabling either path. Intake accepts only verified,
+fully paid personal subscription invoices with a matching durable allocation reference; its source
+registration, invoice receipt, invalidation, and queued refresh are committed together. The worker
+reads bounded provider history outside database transactions and publishes coverage only after the
+prepared collection still matches its registered source set. An invoice received before its
+Checkout subscription is linked is retried without recording a receipt. Neither switch enables
+sales, reconciliation, or Cloud action enforcement; leave these values disabled until the hosted
+provider lifecycle has been exercised and reviewed.
 
 Human hosted action checks are shadow-only by default. They record would-deny decisions while
 existing ACL, grant, lifecycle, and export responses remain unchanged. Do not set

@@ -11,6 +11,7 @@ use std::time::Duration;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use clap::{CommandFactory, Parser, Subcommand};
+use inquire::Confirm;
 use zeroize::{Zeroize, Zeroizing};
 
 use sotto_cli::clipboard;
@@ -160,6 +161,19 @@ enum Command {
     Unlock,
     /// Lock the store (clear the cached session).
     Lock,
+    /// Manage project-declared tasks for local agent workflows.
+    #[command(
+        after_help = "Examples:\n  sotto task validate\n  sotto task approve test --env dev\n  sotto task approvals\n  sotto task run test --env dev\n  sotto task revoke test --env dev\n\nTask approval requires a local interactive terminal. Running a task requires a current approval and an unlocked Sotto session. Approved project code receives plaintext secrets from the selected environment; Sotto is not a sandbox."
+    )]
+    Task {
+        #[command(subcommand)]
+        command: TaskCommand,
+    },
+    /// Start a local MCP server over stdio for project-declared agent tasks.
+    #[command(
+        after_help = "The server uses stdin/stdout for MCP messages. Configure your MCP host to launch `sotto mcp` from the project directory. Run `sotto unlock` separately before calling run_task."
+    )]
+    Mcp,
     /// Show identity, session, and project status.
     Status {
         /// Output as a JSON object.
@@ -207,13 +221,16 @@ enum Command {
     },
     /// Show a secret's version history (from the server; run after `login`).
     #[command(
-        after_help = "Examples:\n  sotto history DATABASE_URL\n  sotto history DATABASE_URL --reveal\n\nHistory and rollback use the server and require login and an unlocked local store. History normally shows version numbers and sizes; --reveal prints plaintext values."
+        after_help = "Examples:\n  sotto history DATABASE_URL\n  sotto history DATABASE_URL --json\n  sotto history DATABASE_URL --reveal\n\nHistory and rollback use the server and require login and an unlocked local store. History normally shows version numbers and sizes; --json prints metadata as a JSON array with version, readable, and size_bytes fields. --reveal prints plaintext values."
     )]
     History {
         name: String,
         /// Show each version's value, not just its number and size.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "json")]
         reveal: bool,
+        /// Output metadata as a JSON array without secret values.
+        #[arg(long, conflicts_with = "reveal")]
+        json: bool,
     },
     /// Restore an old version of a secret as a new version (local until you `push`).
     #[command(
@@ -328,6 +345,20 @@ enum EnvCommand {
 }
 
 #[derive(Subcommand)]
+enum TaskCommand {
+    /// Validate `sotto.tasks.toml` without opening the local secret store.
+    Validate,
+    /// Approve one declared task for one environment after reviewing its full command.
+    Approve { name: String },
+    /// List local task approvals for this project.
+    Approvals,
+    /// Revoke approval for one task and environment.
+    Revoke { name: String },
+    /// Run one locally approved task with the selected Sotto environment.
+    Run { name: String },
+}
+
+#[derive(Subcommand)]
 enum TokenCommand {
     /// Create a machine token for the active environment; prints the SOTTO_TOKEN once.
     Create {
@@ -380,7 +411,17 @@ enum OrgCommand {
     /// Invite an existing Sotto user into an org by email; prints their user id.
     Invite { org_id: String, email: String },
     /// List an org's members and their ids.
-    Members { org_id: String },
+    #[command(after_help = r#"Examples:
+  sotto org members <org-id>
+  sotto org members <org-id> --json
+
+--json prints one {"user_id":...,"role":...,"has_keys":...} object per member, where has_keys reports whether an account public key is on file. The key itself is never printed. Stdout carries the JSON array only; diagnostics stay on stderr."#)]
+    Members {
+        org_id: String,
+        /// Output as a JSON array.
+        #[arg(long)]
+        json: bool,
+    },
     /// Remove a member and rotate every environment they could access.
     Remove { org_id: String, user_id: String },
     /// Show the org's plan: tier, trial, and the limits in effect.
@@ -438,6 +479,52 @@ fn run() -> Result<()> {
     if let Some(Command::Completions { shell }) = &cli.command {
         clap_complete::generate(*shell, &mut Cli::command(), "sotto", &mut io::stdout());
         return Ok(());
+    }
+
+    // Task declaration validation needs only the project config and task file. Handle it before
+    // opening local state or the keychain, so validation cannot prompt or initialise secret data.
+    if let Some(Command::Task {
+        command: TaskCommand::Validate,
+    }) = &cli.command
+    {
+        let cwd = std::env::current_dir().map_err(|error| Error::Io(error.to_string()))?;
+        let (_, manifest) = sotto_cli::agent_tasks::TaskManifest::discover(&cwd)?;
+        let count = manifest.tasks().len();
+        let noun = if count == 1 { "task" } else { "tasks" };
+        println!("valid: {count} {noun}");
+        return Ok(());
+    }
+
+    // Task approvals are a separate local capability. These commands use only the project
+    // declaration and approval store; they never open the secret store or keychain.
+    if let Some(Command::Task { command }) = &cli.command {
+        match command {
+            TaskCommand::Approve { name } => {
+                let environment = cli.env.as_deref().ok_or_else(|| {
+                    Error::MissingArgument(
+                        "missing required option --env <ENVIRONMENT> for task approval".into(),
+                    )
+                })?;
+                return approve_task(name, environment);
+            }
+            TaskCommand::Approvals => return list_task_approvals(cli.env.as_deref()),
+            TaskCommand::Revoke { name } => {
+                let environment = cli.env.as_deref().ok_or_else(|| {
+                    Error::MissingArgument(
+                        "missing required option --env <ENVIRONMENT> for task revocation".into(),
+                    )
+                })?;
+                return revoke_task_approval(name, environment);
+            }
+            TaskCommand::Run { .. } => {
+                cli.env.as_deref().ok_or_else(|| {
+                    Error::MissingArgument(
+                        "missing required option --env <ENVIRONMENT> for task execution".into(),
+                    )
+                })?;
+            }
+            TaskCommand::Validate => {}
+        }
     }
 
     // Machine mode: with SOTTO_TOKEN set, `run`/`export` decrypt entirely in memory - no store,
@@ -504,6 +591,10 @@ fn run() -> Result<()> {
         let _ = cmd.write_help(&mut std::io::stderr());
         eprintln!();
         std::process::exit(2);
+    }
+
+    if matches!(&cli.command, Some(Command::Mcp)) {
+        return run_mcp_server();
     }
 
     let store_path = sotto_cli::paths::store_path()?;
@@ -672,6 +763,27 @@ fn run() -> Result<()> {
             eprintln!("locked");
             Ok(())
         }
+        Command::Task { command } => match command {
+            TaskCommand::Validate
+            | TaskCommand::Approve { .. }
+            | TaskCommand::Approvals
+            | TaskCommand::Revoke { .. } => {
+                unreachable!("task commands are handled before store init")
+            }
+            TaskCommand::Run { name } => run_approved_task_cli(
+                &app,
+                &cwd,
+                &name,
+                cli.env.as_deref().ok_or_else(|| {
+                    Error::MissingArgument(
+                        "missing required option --env <ENVIRONMENT> for task execution".into(),
+                    )
+                })?,
+            ),
+        },
+        Command::Mcp => Err(Error::Input(
+            "MCP server must start before local command setup".into(),
+        )),
         Command::Status { json } => status(&app, &cwd, json, &theme),
         Command::Set { name, value, stdin } => {
             let config = effective_config(&cwd, cli.env.as_deref())?;
@@ -774,10 +886,10 @@ fn run() -> Result<()> {
             eprintln!("removed {name}");
             Ok(())
         }
-        Command::History { name, reveal } => {
+        Command::History { name, reveal, json } => {
             let config = effective_config(&cwd, cli.env.as_deref())?;
             ensure_unlocked(&store, &keychain)?;
-            history(&store, &keychain, &config, &name, reveal)
+            history(&store, &keychain, &config, &name, reveal, json)
         }
         Command::Rollback { name, version } => {
             let config = effective_config(&cwd, cli.env.as_deref())?;
@@ -847,6 +959,291 @@ fn run() -> Result<()> {
         },
         Command::Completions { .. } => unreachable!("completions are handled before store init"),
         Command::Theme { .. } => unreachable!("theme commands are handled before store init"),
+    }
+}
+
+fn run_approved_task_cli(app: &App, cwd: &Path, task_name: &str, environment: &str) -> Result<()> {
+    let (_, discovered_root) = Config::discover(cwd)?;
+    let project_root = std::fs::canonicalize(&discovered_root)
+        .map_err(|error| Error::Io(format!("resolving project root: {error}")))?;
+    let approvals = open_task_approval_store(&project_root)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| Error::Io(format!("starting task runtime: {error}")))?;
+    let (cancel, receiver) = tokio::sync::watch::channel(false);
+    let signal_sender = cancel.clone();
+    runtime.spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            let _ = signal_sender.send(true);
+        }
+    });
+    let run = sotto_cli::agent_runner::run_approved_task(
+        app,
+        &approvals,
+        cwd,
+        task_name,
+        environment,
+        receiver,
+    )?;
+    let outcome = runtime.block_on(run)?;
+    match outcome.status {
+        sotto_cli::agent_runner::TaskRunStatus::Completed => {
+            eprintln!("{}", outcome.summary());
+            Ok(())
+        }
+        _ => Err(Error::Input(outcome.summary())),
+    }
+}
+
+fn run_mcp_server() -> Result<()> {
+    let cwd = std::env::current_dir().map_err(|error| Error::Io(error.to_string()))?;
+    let (_, discovered_root) = Config::discover(&cwd)?;
+    let project_root = std::fs::canonicalize(&discovered_root)
+        .map_err(|error| Error::Io(format!("resolving project root: {error}")))?;
+    // Fail startup before creating local Sotto state if the project's task declaration is
+    // missing or invalid. The server reloads it for listing and the runner revalidates on launch.
+    sotto_cli::agent_tasks::TaskManifest::load_from(&project_root)?;
+    let approvals = open_task_approval_store(&project_root)?;
+
+    let store_path = sotto_cli::paths::store_path()?;
+    if let Some(parent) = store_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| Error::Io(format!("creating {}: {error}", parent.display())))?;
+    }
+    let store = Store::open(&store_path)?;
+    let keychain = OsKeychain::new(KEYCHAIN_SERVICE);
+
+    // MCP does not need the machine token, unlock password, or secret key from its parent
+    // environment. Unlock must have happened separately and is read from the OS keychain.
+    for name in ["SOTTO_TOKEN", "SOTTO_PASSWORD", "SOTTO_SECRET_KEY"] {
+        std::env::remove_var(name);
+    }
+
+    let server =
+        sotto_cli::agent_mcp::SottoMcpServer::new(project_root, store, keychain, approvals);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| Error::Io(format!("starting MCP runtime: {error}")))?;
+    runtime.block_on(sotto_cli::agent_mcp::serve_stdio(server))
+}
+
+fn approve_task(name: &str, environment: &str) -> Result<()> {
+    if !prompts::can_prompt() {
+        return Err(Error::MissingArgument(
+            "task approval requires an interactive terminal; no approval was recorded".into(),
+        ));
+    }
+
+    let cwd = std::env::current_dir().map_err(|error| Error::Io(error.to_string()))?;
+    let (config, project_root) = Config::discover(&cwd)?;
+    let project_root = std::fs::canonicalize(&project_root)
+        .map_err(|error| Error::Io(format!("resolving project root: {error}")))?;
+    let project_root_key = sotto_cli::agent_approvals::project_root_key(&project_root);
+    let manifest = sotto_cli::agent_tasks::TaskManifest::load_from(&project_root)?;
+    let task = manifest
+        .tasks()
+        .iter()
+        .find(|task| task.name() == name)
+        .ok_or_else(|| Error::NotFound(format!("agent task `{name}`")))?;
+    if !task
+        .environments()
+        .iter()
+        .any(|allowed| allowed == environment)
+    {
+        return Err(Error::Input(format!(
+            "task `{name}` does not allow environment {environment:?}"
+        )));
+    }
+
+    println!("Review this task before approving it:");
+    let resolved_executable = task.resolve_executable(&project_root)?;
+
+    println!("Project identity: {:?}", config.project_id);
+    println!("Project root: {:?}", project_root);
+    println!("Task: {:?}", task.name());
+    println!("Description: {}", task.description());
+    println!("Resolved executable: {resolved_executable:?}");
+    if task.args().is_empty() {
+        println!("Arguments: (none)");
+    } else {
+        for (index, argument) in task.args().iter().enumerate() {
+            println!("Argument {index}: {argument:?}");
+        }
+    }
+    println!(
+        "Working directory: {:?}",
+        task.working_directory(&project_root)
+    );
+    println!("Sotto environment: {environment:?}");
+    let timeout = task
+        .timeout_seconds()
+        .unwrap_or(sotto_cli::agent_tasks::DEFAULT_TASK_TIMEOUT_SECONDS);
+    println!("Execution timeout: {timeout} seconds");
+    println!(
+        "Trust warning: Sotto is not a sandbox. Current project code will receive this environment's plaintext secrets and may disclose them."
+    );
+
+    let confirmed = match Confirm::new("Approve this task and environment?")
+        .with_default(false)
+        .prompt()
+    {
+        Ok(confirmed) => confirmed,
+        Err(
+            inquire::InquireError::OperationCanceled | inquire::InquireError::OperationInterrupted,
+        ) => false,
+        Err(error) => return Err(Error::Input(format!("approval prompt failed: {error}"))),
+    };
+    if !confirmed {
+        eprintln!("approval cancelled");
+        return Ok(());
+    }
+
+    let declaration_fingerprint = manifest.fingerprint_for(name)?;
+    let fingerprint = sotto_cli::agent_approvals::approval_fingerprint(
+        &declaration_fingerprint,
+        &resolved_executable,
+    )?;
+    let approvals = open_task_approval_store(&project_root)?;
+    approvals.approve(
+        &config.project_id,
+        &project_root_key,
+        name,
+        environment,
+        &fingerprint,
+    )?;
+    eprintln!("approved task {name:?} for environment {environment:?}");
+    Ok(())
+}
+
+fn list_task_approvals(environment: Option<&str>) -> Result<()> {
+    if environment.is_some_and(str::is_empty) {
+        return Err(Error::Input(
+            "task approval environment filter must not be empty".into(),
+        ));
+    }
+    let cwd = std::env::current_dir().map_err(|error| Error::Io(error.to_string()))?;
+    let (config, project_root) = Config::discover(&cwd)?;
+    let project_root = std::fs::canonicalize(&project_root)
+        .map_err(|error| Error::Io(format!("resolving project root: {error}")))?;
+    let project_root_key = sotto_cli::agent_approvals::project_root_key(&project_root);
+    let approvals = open_task_approval_store(&project_root)?;
+    let rows = approvals.list(&config.project_id, &project_root_key)?;
+    let rows = rows
+        .into_iter()
+        .filter(|approval| environment.is_none_or(|env| approval.environment == env))
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        println!("no task approvals for this project");
+        return Ok(());
+    }
+    for approval in rows {
+        println!("{:?} --env {:?}", approval.task_name, approval.environment);
+    }
+    Ok(())
+}
+
+fn revoke_task_approval(name: &str, environment: &str) -> Result<()> {
+    let cwd = std::env::current_dir().map_err(|error| Error::Io(error.to_string()))?;
+    let (config, project_root) = Config::discover(&cwd)?;
+    let project_root = std::fs::canonicalize(&project_root)
+        .map_err(|error| Error::Io(format!("resolving project root: {error}")))?;
+    let project_root_key = sotto_cli::agent_approvals::project_root_key(&project_root);
+    let approvals = open_task_approval_store(&project_root)?;
+    if approvals.revoke(&config.project_id, &project_root_key, name, environment)? {
+        eprintln!("revoked approval for task {name:?} and environment {environment:?}");
+    } else {
+        eprintln!("no approval found for task {name:?} and environment {environment:?}");
+    }
+    Ok(())
+}
+
+fn open_task_approval_store(
+    project_root: &Path,
+) -> Result<sotto_cli::agent_approvals::ApprovalStore> {
+    let data_dir = sotto_cli::paths::data_dir()?;
+    ensure_approval_data_dir_outside_project(&data_dir, project_root)?;
+    std::fs::create_dir_all(&data_dir)
+        .map_err(|error| Error::Io(format!("creating {}: {error}", data_dir.display())))?;
+    let data_dir = std::fs::canonicalize(&data_dir)
+        .map_err(|error| Error::Io(format!("resolving approval data directory: {error}")))?;
+    ensure_approval_data_dir_outside_project(&data_dir, project_root)?;
+    sotto_cli::agent_approvals::ApprovalStore::open(&data_dir)
+}
+
+fn ensure_approval_data_dir_outside_project(data_dir: &Path, project_root: &Path) -> Result<()> {
+    let resolved = resolve_path_with_missing_tail(data_dir)?;
+    if resolved.starts_with(project_root) {
+        return Err(Error::Input(
+            "task approvals must be stored outside the project checkout; change SOTTO_DATA_DIR"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve existing path components (including symlinks) without creating a missing tail.
+fn resolve_path_with_missing_tail(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| Error::Io(format!("resolving current directory: {error}")))?
+            .join(path)
+    };
+
+    let mut resolved = PathBuf::new();
+    let mut has_missing_component = false;
+    for component in absolute.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+            std::path::Component::RootDir => resolved.push(component.as_os_str()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                resolved.pop();
+                if has_missing_component {
+                    match std::fs::canonicalize(&resolved) {
+                        Ok(canonical) => {
+                            resolved = canonical;
+                            has_missing_component = false;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(Error::Io(format!(
+                                "resolving approval data directory {}: {error}",
+                                resolved.display()
+                            )))
+                        }
+                    }
+                }
+            }
+            std::path::Component::Normal(name) if has_missing_component => resolved.push(name),
+            std::path::Component::Normal(name) => {
+                let candidate = resolved.join(name);
+                match std::fs::canonicalize(&candidate) {
+                    Ok(canonical) => resolved = canonical,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        resolved = candidate;
+                        has_missing_component = true;
+                    }
+                    Err(error) => {
+                        return Err(Error::Io(format!(
+                            "resolving approval data directory {}: {error}",
+                            candidate.display()
+                        )))
+                    }
+                }
+            }
+        }
+    }
+    match std::fs::canonicalize(&resolved) {
+        Ok(canonical) => Ok(canonical),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(resolved),
+        Err(error) => Err(Error::Io(format!(
+            "resolving approval data directory {}: {error}",
+            resolved.display()
+        ))),
     }
 }
 
@@ -944,8 +1341,13 @@ fn org_command(store: &Store, keychain: &dyn Keychain, command: OrgCommand) -> R
             println!("{}", invited.user_id);
             Ok(())
         }
-        OrgCommand::Members { org_id } => {
-            for m in remote::team::members(&client, &org_id)? {
+        OrgCommand::Members { org_id, json } => {
+            let members = remote::team::members(&client, &org_id)?;
+            if json {
+                println!("{}", org_members_json(&members)?);
+                return Ok(());
+            }
+            for m in members {
                 let keys = if m.public_key.is_some() {
                     "keys"
                 } else {
@@ -1704,21 +2106,26 @@ fn history(
     config: &Config,
     name: &str,
     reveal: bool,
+    json: bool,
 ) -> Result<()> {
     let master = session::current_master_key(keychain)?.ok_or(Error::Locked)?;
     let keypair = session::account_keypair(store, &master)?;
     let client = sync_client(keychain)?;
-    let versions = remote::sync::history(&client, store, &keypair, config, name)?;
+    let mut versions = remote::sync::history(&client, store, &keypair, config, name)?;
     if reveal {
         eprintln!("warning: --reveal prints secret values in plaintext");
     }
     let count = versions.len();
-    for mut v in versions {
-        println!("{}", history_line(v.version, v.value.as_deref(), reveal));
-        // Zeroize each decrypted plaintext as soon as it's printed, so the whole history isn't left
-        // resident in memory for the rest of the command.
-        if let Some(value) = v.value.as_mut() {
-            value.zeroize();
+    if json {
+        println!("{}", history_json(&mut versions)?);
+    } else {
+        for mut v in versions {
+            println!("{}", history_line(v.version, v.value.as_deref(), reveal));
+            // Zeroize each decrypted plaintext as soon as it's printed, so the whole history isn't left
+            // resident in memory for the rest of the command.
+            if let Some(value) = v.value.as_mut() {
+                value.zeroize();
+            }
         }
     }
     eprintln!(
@@ -1887,6 +2294,32 @@ fn env_list_json(environments: &[String], active: &str) -> Result<String> {
     to_json(&value)
 }
 
+/// Stable machine-readable shape for `sotto org members <org-id> --json`.
+///
+/// Returns a JSON array of one object per member, in the order the server listed them. Stdout
+/// contains JSON only; diagnostics stay on stderr. An organisation with no members yields `[]`.
+///
+/// ```text
+/// [{"user_id":"user-1","role":"admin","has_keys":true},
+///  {"user_id":"user-2","role":"member","has_keys":false}]
+/// ```
+///
+/// `has_keys` reports whether the member has an account public key on file, so a script can tell
+/// a member who cannot be granted a vault key. The key itself is never serialised.
+fn org_members_json(members: &[remote::api::MemberInfo]) -> Result<String> {
+    let value: Vec<_> = members
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "user_id": m.user_id,
+                "role": m.role,
+                "has_keys": m.public_key.is_some(),
+            })
+        })
+        .collect();
+    to_json(&value)
+}
+
 /// Stable machine-readable shape for `sotto token ls --json`.
 ///
 /// Returns a JSON array of one object per token, in the order the server listed them. Stdout
@@ -2032,6 +2465,32 @@ fn history_line(version: i64, value: Option<&[u8]>, reveal: bool) -> String {
         (Some(value), false) => format!("v{version}  ({} bytes)", value.len()),
         (None, _) => format!("v{version}  (unreadable - run `sotto pull` first)"),
     }
+}
+
+/// Stable machine-readable shape for `sotto history --json`.
+///
+/// Returns metadata only, in newest-first order. Values are zeroized before this function
+/// returns; unreadable rows remain present with a null `size_bytes`.
+fn history_json(versions: &mut [remote::sync::HistoryVersion]) -> Result<String> {
+    let rows: Vec<_> = versions
+        .iter_mut()
+        .map(|version| {
+            let (readable, size_bytes) = match version.value.as_mut() {
+                Some(value) => {
+                    let size_bytes = value.len();
+                    value.zeroize();
+                    (true, Some(size_bytes))
+                }
+                None => (false, None),
+            };
+            serde_json::json!({
+                "version": version.version,
+                "readable": readable,
+                "size_bytes": size_bytes,
+            })
+        })
+        .collect();
+    to_json(&rows)
 }
 
 /// Decrypt all secrets as UTF-8 text pairs (for injection/export). Errors on non-UTF-8 values.
@@ -2187,16 +2646,17 @@ mod tests {
     use sotto_cli::commands::App;
     use sotto_cli::config::Config;
     use sotto_cli::keychain::MemoryKeychain;
-    use sotto_cli::remote::api::MachineTokenInfo;
+    use sotto_cli::remote::api::{MachineTokenInfo, MemberInfo};
+    use sotto_cli::remote::sync::HistoryVersion;
     use sotto_cli::session;
     use sotto_cli::store::Store;
     use sotto_cli::vault::Vault;
     use std::time::Duration;
 
     use super::{
-        display_secret, env_list_json, history_line, import_dotenv, login_config,
-        machine_token_list_json, set_confirmation, Cli, CloudCommand, Command, EnvCommand,
-        SharesCommand, ThemeCommand, TokenCommand,
+        display_secret, env_list_json, history_json, history_line, import_dotenv, login_config,
+        machine_token_list_json, org_members_json, set_confirmation, Cli, CloudCommand, Command,
+        EnvCommand, OrgCommand, SharesCommand, ThemeCommand, TokenCommand,
     };
 
     #[test]
@@ -2277,6 +2737,8 @@ mod tests {
             .render_long_help()
             .to_string();
         assert!(history.contains("sotto history DATABASE_URL --reveal"));
+        assert!(history.contains("sotto history DATABASE_URL --json"));
+        assert!(history.contains("size_bytes"));
         assert!(history.contains("--reveal prints plaintext values"));
 
         let rollback = command
@@ -2287,6 +2749,69 @@ mod tests {
         assert!(rollback.contains("sotto rollback DATABASE_URL 2"));
         assert!(rollback.contains("without erasing history"));
         assert!(rollback.contains("1 or greater"), "{rollback}");
+    }
+
+    #[test]
+    fn history_parser_accepts_json_and_rejects_reveal_conflict() {
+        let cli = Cli::try_parse_from(["sotto", "history", "DATABASE_URL", "--json"])
+            .expect("history JSON should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::History {
+                json: true,
+                reveal: false,
+                ..
+            })
+        ));
+
+        let error =
+            match Cli::try_parse_from(["sotto", "history", "DATABASE_URL", "--json", "--reveal"]) {
+                Ok(_) => panic!("history JSON and reveal should conflict"),
+                Err(error) => error,
+            };
+        assert!(error.to_string().contains("cannot be used with"));
+    }
+
+    #[test]
+    fn history_json_contains_metadata_only_for_all_rows() {
+        let mut versions = vec![
+            HistoryVersion {
+                version: 3,
+                value: Some(b"readable".to_vec()),
+            },
+            HistoryVersion {
+                version: 2,
+                value: Some(vec![0xff, 0x00]),
+            },
+            HistoryVersion {
+                version: 1,
+                value: Some(Vec::new()),
+            },
+            HistoryVersion {
+                version: 0,
+                value: None,
+            },
+        ];
+
+        let output = history_json(&mut versions).expect("history JSON should serialize");
+        let rows: serde_json::Value =
+            serde_json::from_str(&output).expect("history JSON should parse");
+        assert_eq!(
+            rows,
+            serde_json::json!([
+                {"version": 3, "readable": true, "size_bytes": 8},
+                {"version": 2, "readable": true, "size_bytes": 2},
+                {"version": 1, "readable": true, "size_bytes": 0},
+                {"version": 0, "readable": false, "size_bytes": null},
+            ])
+        );
+        assert!(rows
+            .as_array()
+            .expect("history rows should be an array")
+            .iter()
+            .all(|row| row.get("value").is_none()));
+        assert_eq!(versions[0].value, Some(Vec::new()));
+        assert_eq!(versions[1].value, Some(Vec::new()));
     }
 
     #[test]
@@ -2742,6 +3267,68 @@ mod tests {
             panic!("expected TokenCommand::Ls");
         };
         assert!(json);
+    }
+
+    #[test]
+    fn org_members_json_parser_parses_flag() {
+        let cli = Cli::try_parse_from(["sotto", "org", "members", "org-1", "--json"])
+            .expect("sotto org members --json should parse");
+        let Some(Command::Org {
+            command: OrgCommand::Members { org_id, json },
+        }) = cli.command
+        else {
+            panic!("expected OrgCommand::Members");
+        };
+        assert_eq!(org_id, "org-1");
+        assert!(json);
+
+        let cli = Cli::try_parse_from(["sotto", "org", "members", "org-1"])
+            .expect("sotto org members should parse");
+        let Some(Command::Org {
+            command: OrgCommand::Members { org_id, json },
+        }) = cli.command
+        else {
+            panic!("expected OrgCommand::Members");
+        };
+        assert_eq!(org_id, "org-1");
+        assert!(!json);
+    }
+
+    #[test]
+    fn org_members_json_reports_key_presence_and_omits_the_key() {
+        let members = vec![
+            MemberInfo {
+                user_id: "user-1".into(),
+                role: "admin".into(),
+                public_key: Some("cHVibGljLWtleQ".into()),
+            },
+            MemberInfo {
+                user_id: "user-2".into(),
+                role: "member".into(),
+                public_key: None,
+            },
+            MemberInfo {
+                user_id: "quote\"and\\slash".into(),
+                role: "member".into(),
+                public_key: Some("cHVibGljLWtleQ".into()),
+            },
+        ];
+        let value: serde_json::Value =
+            serde_json::from_str(&org_members_json(&members).unwrap()).unwrap();
+
+        assert_eq!(value[0]["user_id"], "user-1");
+        assert_eq!(value[0]["role"], "admin");
+        assert_eq!(value[0]["has_keys"], true);
+        assert_eq!(value[1]["has_keys"], false);
+        assert_eq!(value[2]["user_id"], "quote\"and\\slash");
+
+        let first = value[0].as_object().unwrap();
+        assert!(first.contains_key("user_id"));
+        assert!(first.contains_key("role"));
+        assert!(first.contains_key("has_keys"));
+        assert!(!first.contains_key("public_key"));
+
+        assert_eq!(org_members_json(&[]).unwrap(), "[]");
     }
 
     #[test]

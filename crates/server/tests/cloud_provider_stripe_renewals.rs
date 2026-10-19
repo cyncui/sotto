@@ -28,8 +28,9 @@ use sotto_server::cloud_provider_stripe_http::{
     StripeRenewalCurrentState, StripeRenewalNeedsEvidence, StripeRenewalObservationResult,
 };
 use sotto_server::cloud_provider_stripe_renewal_store::{
-    accept_personal_renewal_failure, load_personal_renewal_failures,
-    StripeRenewalFailureDisposition, StripeRenewalFailureLoadError, StripeRenewalFailureLoadLimits,
+    accept_personal_renewal_failure, accept_personal_renewal_failure_with_provenance,
+    load_personal_renewal_failures, StripeRenewalFailureDisposition, StripeRenewalFailureLoadError,
+    StripeRenewalFailureLoadLimits, StripeRenewalFailureProvenance,
 };
 use sotto_server::cloud_provider_stripe_renewals::{
     decode_personal_renewal_failure, StripeRenewalFailureNeedsEvidence, StripeRenewalFailureResult,
@@ -270,6 +271,78 @@ fn signed_failure() -> Value {
             }]}
         }}
     })
+}
+
+#[tokio::test]
+async fn sponsored_failure_read_ignores_a_late_event_for_a_closed_invoice() {
+    let closed_invoice = json!({
+        "id":"in_sponsored_closed",
+        "object":"invoice",
+        "customer":"cus_renewal",
+        "parent":{"type":"subscription_details","subscription_details":{"subscription":"sub_renewal"}},
+        "status":"paid",
+        "livemode":false
+    });
+    let server = mock_server(HashMap::from([
+        (
+            "/v1/account".into(),
+            vec![json!({"id":"acct_test_renewal","object":"account","livemode":false})],
+        ),
+        (
+            "/v1/invoices/in_sponsored_closed".into(),
+            vec![closed_invoice],
+        ),
+        (
+            "/v1/invoices/in_sponsored_missing_status".into(),
+            vec![json!({
+                "id":"in_sponsored_missing_status",
+                "object":"invoice",
+                "customer":"cus_renewal",
+                "parent":{"type":"subscription_details","subscription_details":{"subscription":"sub_renewal"}},
+                "livemode":false
+            })],
+        ),
+    ]))
+    .await;
+    let client = StripeReadClient::for_test(
+        "sk_test_renewal",
+        &config(),
+        server.origin.clone(),
+        limits(),
+    )
+    .unwrap();
+    let mut session = client.session();
+
+    let result = client
+        .sponsored_failure_invoice(
+            &mut session,
+            "in_sponsored_closed",
+            "cus_renewal",
+            "sub_renewal",
+        )
+        .await
+        .expect("a closed invoice is a stale failure delivery");
+
+    assert!(result.is_none());
+    assert!(matches!(
+        client
+            .sponsored_failure_invoice(
+                &mut session,
+                "in_sponsored_missing_status",
+                "cus_renewal",
+                "sub_renewal",
+            )
+            .await,
+        Err(StripeReadError::MalformedResponse("invoice.status"))
+    ));
+    assert_eq!(
+        server.requests.lock().unwrap().as_slice(),
+        [
+            "GET /v1/account",
+            "GET /v1/invoices/in_sponsored_closed",
+            "GET /v1/invoices/in_sponsored_missing_status"
+        ]
+    );
 }
 
 fn signed(value: &Value, timestamp: i64) -> (Vec<u8>, String) {
@@ -1041,6 +1114,16 @@ async fn signed_failure_round_trips_through_the_durable_store_and_bounds_history
     );
     assert_eq!(accepted.accepted_generation, 1);
     accept.commit().await.unwrap();
+    let provenance: String = sqlx::query_scalar(
+        "SELECT evidence_provenance FROM cloud_provider_stripe_renewal_failures \
+         WHERE event_id = $1 AND allocation_id = $2",
+    )
+    .bind(&first_id)
+    .bind(&allocation_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(provenance, "signed_webhook");
 
     let loaded = load_personal_renewal_failures(
         &pool,
@@ -1053,10 +1136,16 @@ async fn signed_failure_round_trips_through_the_durable_store_and_bounds_history
     assert_eq!(loaded, vec![first.clone()]);
 
     let mut replay = pool.begin().await.unwrap();
-    let replayed =
-        accept_personal_renewal_failure(&mut replay, &context, &allocation, &first, true)
-            .await
-            .unwrap();
+    let replayed = accept_personal_renewal_failure_with_provenance(
+        &mut replay,
+        &context,
+        &allocation,
+        &first,
+        StripeRenewalFailureProvenance::AuthenticatedApiRead,
+        true,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         replayed.disposition,
         StripeRenewalFailureDisposition::AlreadyAccepted

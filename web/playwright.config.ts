@@ -64,6 +64,7 @@ export default defineConfig({
         STRIPE_STANDARD_ANNUAL_PRICE_ID: "price_e2e_standard_annual",
         STRIPE_FOUNDING_MONTHLY_PRICE_ID: "price_e2e_founding_monthly",
         STRIPE_FOUNDING_ANNUAL_PRICE_ID: "price_e2e_founding_annual",
+        STRIPE_CLOUD_PORTAL_CONFIGURATION_ID: "bpc_e2e_mock",
         SOTTO_TELEMETRY: "off",
       },
     },

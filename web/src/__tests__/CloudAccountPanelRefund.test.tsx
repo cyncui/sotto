@@ -12,8 +12,12 @@ vi.mock("../api", () => ({
   fetchCloudExportChunk: vi.fn(),
   fetchCloudNotices: vi.fn(),
   fetchEligibility: vi.fn(),
+  fetchOrgs: vi.fn(),
+  fetchPayerTransferCapabilities: vi.fn(),
+  fetchPersonalLifecycle: vi.fn(),
   fetchPersonalQuote: vi.fn(),
   fetchPersonalOperation: vi.fn(),
+  me: vi.fn(),
   requestPersonalRefund: vi.fn(),
   startCloudExport: vi.fn(),
 }));
@@ -57,6 +61,14 @@ describe("CloudAccountPanel personal refunds", () => {
     vi.resetAllMocks();
     vi.mocked(api.fetchEligibility).mockResolvedValue(paidPersonalAccount);
     vi.mocked(api.fetchCloudNotices).mockResolvedValue([]);
+    vi.mocked(api.fetchPersonalLifecycle).mockResolvedValue({
+      state: "active", paidThroughDate: null, cancelAtPeriodEnd: false, portalUrl: null,
+      foundingPriceEndEpoch: null, standardRenewalAmountPence: null,
+      foundingTransitionStatus: null, foundingTransitionReason: null,
+    });
+    vi.mocked(api.fetchPayerTransferCapabilities).mockResolvedValue({ available: false, setupAvailable: false });
+    vi.mocked(api.me).mockResolvedValue(null);
+    vi.mocked(api.fetchOrgs).mockResolvedValue([]);
   });
 
   it("submits one full refund request only after a click and blocks duplicates while pending", async () => {

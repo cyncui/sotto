@@ -361,6 +361,7 @@ const apiProxy = {
   "/auth/me": api,
   "/auth/logout": api,
   "/account": api,
+  "/billing": api,
   "/projects": api,
   "/environments": api,
   "/orgs": api,

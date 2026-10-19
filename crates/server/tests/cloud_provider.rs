@@ -10,10 +10,10 @@ use sotto_server::cloud_coverage::ConfirmedPaidInterval;
 use sotto_server::cloud_coverage_reconciliation::SourceObservation;
 use sotto_server::cloud_provider::{
     accept_provider_invalidation, complete_verified_event, prepare_verified_event,
-    record_verified_event, reject_verified_event, replay_verified_event, AllocationState,
-    ApplyDisposition, EventDisposition, InvalidationDisposition, PayerKind, ProviderContext,
-    ProviderEnvironment, RejectionDisposition, VerifiedAllocation, VerifiedCollection,
-    VerifiedProviderEvent,
+    record_verified_event, register_verified_allocation, reject_verified_event,
+    replay_verified_event, AllocationState, ApplyDisposition, EventDisposition,
+    InvalidationDisposition, PayerKind, ProviderContext, ProviderEnvironment, RejectionDisposition,
+    VerifiedAllocation, VerifiedCollection, VerifiedProviderEvent,
 };
 use sotto_server::cloud_provider_refresh_jobs::{claim_due, complete, fail};
 use sotto_server::db;
@@ -531,6 +531,231 @@ async fn applying_verified_event_commits_allocation_and_projection_once() {
 }
 
 #[tokio::test]
+async fn one_provider_event_tracks_and_completes_each_beneficiary_scope_independently() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let context = context();
+    let suffix = Uuid::new_v4().to_string();
+    let payer_id = format!("fanout-payer-{suffix}");
+    let customer_id = format!("fanout-customer-{suffix}");
+    let subscription_id = format!("fanout-subscription-{suffix}");
+    let event_id = format!("fanout-event-{suffix}");
+    let event = VerifiedProviderEvent::from_payload(
+        &event_id,
+        "invoice.paid",
+        1_700_000_000,
+        Some(subscription_id.clone()),
+        None,
+        br#"{"status":"paid","items":2}"#,
+    )
+    .unwrap();
+    let beneficiaries = [
+        format!("fanout-beneficiary-a-{suffix}"),
+        format!("fanout-beneficiary-b-{suffix}"),
+    ];
+    let allocations = beneficiaries
+        .iter()
+        .enumerate()
+        .map(|(index, beneficiary)| {
+            VerifiedAllocation::new(
+                format!("fanout-allocation-{index}-{suffix}"),
+                &payer_id,
+                &customer_id,
+                PayerKind::Sponsor,
+                beneficiary,
+                &subscription_id,
+                format!("si_fanout_{index}"),
+                format!("fanout-external-{index}-{suffix}"),
+                format!("fanout-source-{index}-{suffix}"),
+                0,
+                None,
+                AllocationState::Active,
+                format!("fanout-ownership-{index}-{suffix}"),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    for beneficiary in &beneficiaries {
+        sqlx::query(
+            "INSERT INTO users (id, oauth_provider, oauth_subject) \
+             VALUES ($1, 'cloud-provider-test', $1)",
+        )
+        .bind(beneficiary)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let mut accept = pool.begin().await.unwrap();
+    record_verified_event(&mut accept, &context, &event)
+        .await
+        .unwrap();
+    for allocation in &allocations {
+        register_verified_allocation(&mut accept, &context, allocation)
+            .await
+            .unwrap();
+    }
+    for allocation in &allocations {
+        assert_eq!(
+            accept_provider_invalidation(&mut accept, &context, &event, allocation, true)
+                .await
+                .unwrap(),
+            InvalidationDisposition::Accepted { generation: 1 }
+        );
+    }
+    // This test checks fan-out state, not worker claim order. Keep these pending jobs future-due
+    // so the parallel retry test cannot claim them through the global claim_due helper.
+    sqlx::query(
+        "UPDATE cloud_provider_refresh_jobs \
+         SET available_at = now() + interval '1 day' WHERE event_id = $1",
+    )
+    .bind(&event_id)
+    .execute(&mut *accept)
+    .await
+    .unwrap();
+    accept.commit().await.unwrap();
+
+    let scope_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM cloud_provider_event_scopes WHERE event_id = $1")
+            .bind(&event_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let job_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM cloud_provider_refresh_jobs WHERE event_id = $1")
+            .bind(&event_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(scope_count, 2);
+    assert_eq!(job_count, 2);
+    let due_job_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_provider_refresh_jobs \
+         WHERE event_id = $1 AND available_at <= now()",
+    )
+    .bind(&event_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(due_job_count, 0);
+
+    let collections = allocations
+        .iter()
+        .enumerate()
+        .map(|(index, allocation)| VerifiedCollection {
+            aggregate_evidence_reference: format!("fanout-aggregate-{index}-{suffix}"),
+            observations: vec![SourceObservation::Complete {
+                source_id: allocation.source_id.clone(),
+                evidence_reference: format!("fanout-evidence-{index}-{suffix}"),
+                paid_intervals: vec![ConfirmedPaidInterval {
+                    coverage_id: format!("fanout-coverage-{index}-{suffix}"),
+                    source_id: allocation.source_id.clone(),
+                    starts_at: 0,
+                    paid_until: 100,
+                    failed_renewal_id: None,
+                }],
+            }],
+        })
+        .collect::<Vec<_>>();
+    for index in 0..2 {
+        let receipt = prepare_and_complete(
+            &pool,
+            &context,
+            &event,
+            &allocations[index],
+            &collections[index],
+            &format!("fanout-run-{index}-{suffix}"),
+        )
+        .await;
+        assert_eq!(receipt.outcome, ApplyDisposition::Applied);
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM cloud_provider_event_receipts WHERE event_id = $1",
+        )
+        .bind(&event_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, if index == 0 { "pending" } else { "applied" });
+    }
+
+    let applied_scopes: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_provider_event_scopes \
+         WHERE event_id = $1 AND status = 'applied'",
+    )
+    .bind(&event_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(applied_scopes, 2);
+
+    sqlx::query("DELETE FROM cloud_provider_invalidation_associations WHERE event_id = $1")
+        .bind(&event_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_provider_event_receipts WHERE event_id = $1")
+        .bind(&event_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    for allocation in &allocations {
+        sqlx::query("DELETE FROM cloud_provider_allocations WHERE allocation_id = $1")
+            .bind(&allocation.allocation_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM cloud_coverage_revision_facts WHERE beneficiary_id = $1")
+            .bind(&allocation.beneficiary_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE cloud_coverage_coordinators SET current_attempt_id = NULL WHERE beneficiary_id = $1",
+        )
+        .bind(&allocation.beneficiary_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        for table in [
+            "cloud_coverage_collection_attempts",
+            "cloud_coverage_sources",
+            "cloud_coverage_coordinators",
+        ] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE beneficiary_id = $1"))
+                .bind(&allocation.beneficiary_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "UPDATE cloud_coverage_heads SET current_revision = NULL WHERE beneficiary_id = $1",
+        )
+        .bind(&allocation.beneficiary_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        for table in ["cloud_coverage_revisions", "cloud_coverage_heads"] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE beneficiary_id = $1"))
+                .bind(&allocation.beneficiary_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(&allocation.beneficiary_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query("DELETE FROM cloud_provider_payers WHERE payer_id = $1")
+        .bind(&payer_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn accepted_provider_invalidation_fences_an_inflight_collection() {
     let Some(pool) = pool_or_skip().await else {
         return;
@@ -784,31 +1009,33 @@ async fn accepted_provider_invalidation_fences_an_inflight_collection() {
     assert_eq!(applied.outcome, ApplyDisposition::Applied);
 
     sqlx::query(
-        "UPDATE cloud_provider_event_receipts \
-         SET allocation_id = 'invalidation-rebind-other', coverage_source_id = 'invalidation-rebind-other' \
-         WHERE event_id = $1",
+        "UPDATE cloud_provider_invalidation_associations \
+         SET event_type = 'invoice.changed' WHERE event_id = $1",
     )
-    .bind(&event_id)
+    .bind(&change_event_id)
     .execute(&pool)
     .await
     .unwrap();
     let mut applied_rebind = pool.begin().await.unwrap();
-    let rebind_result =
-        accept_provider_invalidation(&mut applied_rebind, &context, &event, &allocation, true)
-            .await;
+    let rebind_result = accept_provider_invalidation(
+        &mut applied_rebind,
+        &context,
+        &change_event,
+        &allocation,
+        true,
+    )
+    .await;
     assert!(matches!(
         rebind_result,
-        Err(sotto_server::cloud_provider::ProviderAdapterError::AllocationConflict)
+        Err(sotto_server::cloud_provider::ProviderAdapterError::InvalidationConflict)
     ));
     applied_rebind.rollback().await.unwrap();
     sqlx::query(
-        "UPDATE cloud_provider_event_receipts \
-         SET allocation_id = $2, coverage_source_id = $3 \
-         WHERE event_id = $1",
+        "UPDATE cloud_provider_invalidation_associations \
+         SET event_type = $2 WHERE event_id = $1",
     )
-    .bind(&event_id)
-    .bind(&allocation_id)
-    .bind(&source_id)
+    .bind(&change_event_id)
+    .bind(&change_event.event_type)
     .execute(&pool)
     .await
     .unwrap();

@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -75,7 +75,9 @@ describe("RecipientPage", () => {
     expect(reveal).toHaveFocus();
     fireEvent.click(reveal);
     expect(await screen.findByRole("textbox", { name: "Shared secret" })).toHaveValue(secret);
-    expect(screen.getByRole("heading", { name: "Shared secret" })).toHaveFocus();
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "Shared secret" })).toHaveFocus();
+    });
   });
 
   it("reports a missing fragment without fetching the share", async () => {
@@ -128,6 +130,46 @@ describe("RecipientPage", () => {
     expect(wasm.share_open).toHaveBeenCalledWith(new Uint8Array(32), new Uint8Array([2]));
   });
 
+  it("reports an unavailable share without attempting decryption", async () => {
+    const unavailable = "This link is invalid, expired, revoked, or has already been viewed.";
+    vi.mocked(api.fetchShare).mockRejectedValue(new api.ShareUnavailable(unavailable));
+    render(<RecipientPage token="share-token" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Reveal secret" }));
+
+    expect((await screen.findByRole("alert")).textContent).toBe(unavailable);
+    expect(screen.getByRole("button", { name: "Reveal secret" })).toBeEnabled();
+    expect(screen.queryByRole("textbox", { name: "Shared secret" })).not.toBeInTheDocument();
+    expect(api.fetchShare).toHaveBeenCalledExactlyOnceWith("share-token");
+    expect(wasm.share_open).not.toHaveBeenCalled();
+    expect(wasm.share_passphrase_key).not.toHaveBeenCalled();
+  });
+
+  it("retries a failed share fetch only after another explicit reveal", async () => {
+    vi.mocked(api.fetchShare).mockRejectedValueOnce(new Error("temporary fetch failure"));
+    render(<RecipientPage token="share-token" />);
+    fireEvent.click(screen.getByRole("button", { name: "Reveal secret" }));
+
+    expect((await screen.findByRole("alert")).textContent).toBe(
+      "Couldn't reveal the secret: temporary fetch failure",
+    );
+    expect(screen.getByRole("button", { name: "Reveal secret" })).toBeEnabled();
+    expect(screen.queryByRole("textbox", { name: "Shared secret" })).not.toBeInTheDocument();
+    expect(wasm.share_open).not.toHaveBeenCalled();
+    expect(wasm.share_passphrase_key).not.toHaveBeenCalled();
+    await act(async () => {});
+    expect(api.fetchShare).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Reveal secret" }));
+
+    expect(await screen.findByRole("textbox", { name: "Shared secret" })).toHaveValue(secret);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(api.fetchShare).toHaveBeenCalledTimes(2);
+    expect(api.fetchShare).toHaveBeenNthCalledWith(2, "share-token");
+    expect(wasm.share_open).toHaveBeenCalledExactlyOnceWith(new Uint8Array(32), new Uint8Array([2]));
+    expect(wasm.share_passphrase_key).not.toHaveBeenCalled();
+  });
+
   it("copies the exact revealed value and announces success after the write completes", async () => {
     const write = deferred();
     const writeText = vi.fn(() => write.promise);
@@ -161,6 +203,9 @@ describe("RecipientPage", () => {
     });
 
     const textarea = await revealSecret();
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: "Shared secret" })).toHaveFocus(),
+    );
     const copy = screen.getByRole("button", { name: "Copy secret" });
     copy.focus();
     fireEvent.click(copy);

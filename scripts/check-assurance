@@ -6,12 +6,15 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = ROOT / ".ci" / "assurance-checks.json"
+API_RETRY_DELAYS = (1, 2, 4)
+RETRYABLE_HTTP_STATUSES = {429, 500, 502, 503, 504}
 
 
 class AssuranceError(Exception):
@@ -87,11 +90,23 @@ def validate_run(manifest, group_name, run, jobs, *, expected_sha=None, tested_s
 
 def _get_json(url, token):
     request = Request(url, headers={"Accept": "application/vnd.github+json", "Authorization": f"Bearer {token}"})
-    try:
-        with urlopen(request, timeout=30) as response:
-            return json.load(response)
-    except (HTTPError, URLError, TimeoutError, ValueError) as error:
-        raise AssuranceError(f"GitHub API request failed: {error}") from error
+    for attempt in range(len(API_RETRY_DELAYS) + 1):
+        try:
+            with urlopen(request, timeout=30) as response:
+                return json.load(response)
+        except HTTPError as error:
+            error.close()
+            if error.code in RETRYABLE_HTTP_STATUSES and attempt < len(API_RETRY_DELAYS):
+                time.sleep(API_RETRY_DELAYS[attempt])
+                continue
+            raise AssuranceError(f"GitHub API request failed: {error}") from error
+        except (URLError, TimeoutError) as error:
+            if attempt < len(API_RETRY_DELAYS):
+                time.sleep(API_RETRY_DELAYS[attempt])
+                continue
+            raise AssuranceError(f"GitHub API request failed: {error}") from error
+        except ValueError as error:
+            raise AssuranceError(f"GitHub API returned invalid JSON: {error}") from error
 
 
 def fetch_run(repository, run_id, token):

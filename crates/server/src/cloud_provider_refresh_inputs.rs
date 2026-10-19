@@ -44,6 +44,12 @@ pub async fn load(
                 allocation.external_allocation_reference, allocation.effective_from, \
                 allocation.effective_until, allocation.state, allocation.ownership_evidence_reference \
          FROM cloud_provider_event_receipts AS receipt \
+         JOIN cloud_provider_event_scopes AS scope \
+           ON scope.provider_namespace = receipt.provider_namespace \
+          AND scope.provider_account_id = receipt.provider_account_id \
+          AND scope.provider_environment = receipt.provider_environment \
+          AND scope.event_id = receipt.event_id \
+          AND scope.beneficiary_id = $6 \
          JOIN cloud_provider_allocations AS allocation \
            ON allocation.allocation_id = $5 \
          JOIN cloud_provider_payers AS payer ON payer.payer_id = allocation.payer_id \
@@ -58,6 +64,7 @@ pub async fn load(
            AND allocation.provider_environment = $3 \
            AND allocation.beneficiary_id = $6 \
            AND allocation.coverage_source_id = $7 \
+           AND scope.status = 'pending' \
            AND source.beneficiary_id = allocation.beneficiary_id \
            AND payer.provider_namespace = $1 \
            AND payer.provider_account_id = $2 \

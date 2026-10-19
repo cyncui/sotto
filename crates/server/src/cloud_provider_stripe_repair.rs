@@ -319,13 +319,9 @@ pub(crate) fn decode_authenticated_repair_event(
         .and_then(|details| details.get("price"))
         .and_then(Value::as_str)
         .ok_or(StripeRepairError::Malformed("price"))?;
-    let interval = if price_id == config.monthly_price_id {
-        StripeInterval::Month
-    } else if price_id == config.annual_price_id {
-        StripeInterval::Year
-    } else {
-        return Err(StripeRepairError::Unsupported("price"));
-    };
+    let interval = config
+        .interval_for_price(price_id)
+        .ok_or(StripeRepairError::Unsupported("price"))?;
     let period = line
         .get("period")
         .and_then(Value::as_object)
@@ -370,7 +366,10 @@ pub(crate) async fn fetch_authenticated_repair_candidate(
     binding: &StripeAllocationBinding,
 ) -> Result<StripeRepairCandidate, StripeRepairError> {
     let event = client.event_payload(session, event_id).await?;
-    decode_authenticated_repair_event(&event, retrieved_at, config, binding)
+    if event.account_id() != config.account_id || event.environment() != config.environment {
+        return Err(StripeRepairError::ContextMismatch);
+    }
+    decode_authenticated_repair_event(event.payload(), retrieved_at, config, binding)
 }
 
 fn required_string(value: &Value, field: &'static str) -> Result<String, StripeRepairError> {

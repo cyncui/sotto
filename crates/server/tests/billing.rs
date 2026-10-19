@@ -3,27 +3,47 @@
 //! in-memory adapter and no test calls the real Stripe API.
 
 use async_trait::async_trait;
-use axum::body::Body;
+use axum::body::{to_bytes, Body};
+use axum::extract::State;
 use axum::http::{Request, StatusCode};
+use axum::response::Response;
+use axum::routing::any;
 use axum::Router;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use sqlx::PgPool;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::{PgPool, Row};
+use std::collections::HashMap;
+use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 use tower::ServiceExt;
+use uuid::Uuid;
 
 use sotto_server::auth::session;
 use sotto_server::billing::{
-    BillingState, ProviderResult, SubscriptionObservation, SubscriptionProvider,
+    BillingState, ProviderError, ProviderResult, SubscriptionObservation, SubscriptionProvider,
     SubscriptionSnapshot, SubscriptionStatus, STRIPE_API_VERSION,
 };
-use sotto_server::billing_catalogue::BillingOffer;
+use sotto_server::billing_catalogue::{BillingOffer, BillingPriceIds};
 use sotto_server::billing_operations::{self, BeginOperation};
+use sotto_server::cloud_provider::{
+    register_verified_allocation, AllocationState, PayerKind as ProviderPayerKind, ProviderContext,
+    ProviderEnvironment, VerifiedAllocation,
+};
+use sotto_server::cloud_provider_stripe::StripeCoverageConfig;
+use sotto_server::cloud_provider_stripe_http::{StripeReadClient, StripeReadLimits};
 use sotto_server::config::{BillingConfig, DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS};
 use sotto_server::db;
-use sotto_server::founding_allocator::FoundingDate;
+use sotto_server::founding_allocator::{
+    reserve_with_payer_kind_until, FoundingDate, FoundingOffer, FoundingPayerKind,
+    ReservationOutcome,
+};
 use sotto_server::personal_billing;
 use sotto_server::state::AppState;
+use tokio::net::TcpListener;
+use url::Url;
 
 const WEBHOOK_SECRET: &str = "whsec_test_secret";
 
@@ -34,33 +54,147 @@ async fn pool_or_skip() -> Option<PgPool> {
     Some(pool)
 }
 
+async fn one_connection_pool_or_skip() -> Option<PgPool> {
+    if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
+        return None;
+    }
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL is required");
+    let options = PgConnectOptions::from_str(&url).expect("parse DATABASE_URL");
+    assert!(
+        matches!(options.get_host(), "localhost" | "127.0.0.1" | "::1"),
+        "refusing one-connection coverage test against non-local host: {}",
+        options.get_host()
+    );
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("connect one-connection test pool");
+    db::migrate(&pool)
+        .await
+        .expect("migrate one-connection pool");
+    Some(pool)
+}
+
 fn app(pool: PgPool, configured: bool) -> Router {
-    let state = AppState {
-        deployment_mode: sotto_server::config::DeploymentMode::SelfHosted,
-        telemetry_ingest: false,
-        cloud_action_enforcement_enabled: false,
-        machine_eligibility_enforcement_enabled: false,
+    app_with_billing(
         pool,
-        oauth: None,
-        oauth_config: None,
-        billing: configured.then(|| {
+        configured.then(|| {
             BillingState::from_config(BillingConfig {
                 api_key: "rk_test_never_called".into(),
                 webhook_secret: WEBHOOK_SECRET.into(),
                 price_id: "price_test".into(),
                 price_catalogue: None,
+                cloud_portal_configuration_id: Some("bpc_test".into()),
                 cloud_sales_enabled: true,
                 return_url: "https://app.sotto.test".into(),
             })
         }),
+    )
+}
+
+fn app_with_billing(pool: PgPool, billing: Option<BillingState>) -> Router {
+    app_with_billing_mode(
+        pool,
+        billing,
+        sotto_server::config::DeploymentMode::SelfHosted,
+    )
+}
+
+fn app_with_billing_mode(
+    pool: PgPool,
+    billing: Option<BillingState>,
+    deployment_mode: sotto_server::config::DeploymentMode,
+) -> Router {
+    let state = AppState {
+        deployment_mode,
+        telemetry_ingest: false,
+        cloud_action_enforcement_enabled: false,
+        machine_eligibility_enforcement_enabled: false,
+        billing_transfers_enabled: false,
+        billing_transfer_execution_enabled: false,
+        billing_transfer_setup_enabled: false,
+        pool,
+        oauth: None,
+        oauth_config: None,
+        billing,
         organisation_deletion_enabled: false,
         organisation_deletion_retention_days: DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
         organisation_deletion_metrics_token: None,
         organisation_deletion_operator_token: None,
+        billing_transfer_operator_token: None,
     };
     Router::new()
         .merge(sotto_server::billing::router())
+        .merge(sotto_server::person_eligibility::router())
         .with_state(state)
+}
+
+async fn get_eligibility(app: &Router, token: &str) -> (StatusCode, serde_json::Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/account/eligibility")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("eligibility request");
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+#[derive(Clone)]
+struct StripeMockResponses(Arc<Mutex<HashMap<String, serde_json::Value>>>);
+
+async fn stripe_mock_handler(
+    State(responses): State<StripeMockResponses>,
+    request: Request<Body>,
+) -> Response<Body> {
+    let mut value = responses
+        .0
+        .lock()
+        .unwrap()
+        .get(request.uri().path())
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({"error":"not found"}));
+    let status = value
+        .get("_http_status")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|status| u16::try_from(status).ok())
+        .and_then(|status| StatusCode::from_u16(status).ok())
+        .unwrap_or(if value.get("error").is_some() {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::OK
+        });
+    if let Some(object) = value.as_object_mut() {
+        object.remove("_http_status");
+    }
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&value).unwrap()))
+        .unwrap()
+}
+
+async fn stripe_mock_server(
+    responses: HashMap<String, serde_json::Value>,
+) -> (Url, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let state = StripeMockResponses(Arc::new(Mutex::new(responses)));
+    let router = Router::new()
+        .fallback(any(stripe_mock_handler))
+        .with_state(state);
+    let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (Url::parse(&format!("http://{address}/")).unwrap(), task)
 }
 
 struct TestProvider {
@@ -80,7 +214,12 @@ impl SubscriptionProvider for TestProvider {
         Ok("https://stripe.test/checkout".into())
     }
 
-    async fn create_portal(&self, _customer: &str, _return_url: &str) -> ProviderResult<String> {
+    async fn create_portal(
+        &self,
+        _customer: &str,
+        _return_url: &str,
+        _configuration_id: Option<&str>,
+    ) -> ProviderResult<String> {
         Ok("https://stripe.test/portal".into())
     }
 
@@ -91,11 +230,16 @@ impl SubscriptionProvider for TestProvider {
         Ok(self.observation.clone())
     }
 
-    async fn personal_subscription_period_end(
+    async fn personal_subscription_period(
         &self,
         _subscription_id: &str,
-    ) -> ProviderResult<Option<i64>> {
-        Ok(self.personal_period_end)
+    ) -> ProviderResult<Option<sotto_server::billing::PersonalSubscriptionPeriod>> {
+        Ok(self.personal_period_end.map(|end_epoch| {
+            sotto_server::billing::PersonalSubscriptionPeriod {
+                start_epoch: end_epoch - 30 * 24 * 60 * 60,
+                end_epoch,
+            }
+        }))
     }
 
     async fn cancel_subscription(
@@ -108,12 +252,74 @@ impl SubscriptionProvider for TestProvider {
     }
 }
 
+struct CancellationCountingProvider {
+    calls: Arc<AtomicUsize>,
+    pool: PgPool,
+    user_id: String,
+    intent_visible: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl SubscriptionProvider for CancellationCountingProvider {
+    async fn create_checkout(
+        &self,
+        _org_id: &str,
+        _customer: Option<&str>,
+        _success_url: &str,
+        _cancel_url: &str,
+    ) -> ProviderResult<String> {
+        Ok("https://stripe.test/checkout".into())
+    }
+
+    async fn create_portal(
+        &self,
+        _customer: &str,
+        _return_url: &str,
+        _configuration_id: Option<&str>,
+    ) -> ProviderResult<String> {
+        Ok("https://stripe.test/portal".into())
+    }
+
+    async fn get_subscription(
+        &self,
+        _subscription_id: &str,
+    ) -> ProviderResult<SubscriptionObservation> {
+        Ok(SubscriptionObservation::Missing)
+    }
+
+    async fn cancel_subscription(
+        &self,
+        _subscription_id: &str,
+        _idempotency_key: &str,
+        _org_id: &str,
+    ) -> ProviderResult<SubscriptionObservation> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        let intent: bool = sqlx::query_scalar(
+            "SELECT cancellation_requested_at IS NOT NULL FROM billing_personal_accounts \
+             WHERE user_id = $1",
+        )
+        .bind(&self.user_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|_| ProviderError {
+            status: None,
+            code: Some("test_database_error".into()),
+            kind: sotto_server::billing::ProviderErrorKind::Unknown,
+        })?;
+        self.intent_visible.store(intent, Ordering::Relaxed);
+        Ok(SubscriptionObservation::Missing)
+    }
+}
+
 fn app_with_provider(pool: PgPool, provider: Arc<dyn SubscriptionProvider>) -> Router {
     let state = AppState {
         deployment_mode: sotto_server::config::DeploymentMode::SelfHosted,
         telemetry_ingest: false,
         cloud_action_enforcement_enabled: false,
         machine_eligibility_enforcement_enabled: false,
+        billing_transfers_enabled: false,
+        billing_transfer_execution_enabled: false,
+        billing_transfer_setup_enabled: false,
         pool,
         oauth: None,
         oauth_config: None,
@@ -127,6 +333,7 @@ fn app_with_provider(pool: PgPool, provider: Arc<dyn SubscriptionProvider>) -> R
         organisation_deletion_retention_days: DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
         organisation_deletion_metrics_token: None,
         organisation_deletion_operator_token: None,
+        billing_transfer_operator_token: None,
     };
     Router::new()
         .merge(sotto_server::billing::router())
@@ -219,6 +426,28 @@ async fn post_authed(app: &Router, uri: &str, token: &str) -> StatusCode {
     response.status()
 }
 
+async fn post_authed_json(
+    app: &Router,
+    uri: &str,
+    token: &str,
+    body: serde_json::Value,
+) -> StatusCode {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .expect("request");
+    response.status()
+}
+
 async fn org_billing_state(
     pool: &PgPool,
     org_id: &str,
@@ -292,6 +521,301 @@ async fn billing_endpoints_are_503_when_unconfigured() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     let status = post_webhook(&app, "{}", Some("t=1,v1=00")).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn personal_cancellation_persists_intent_before_acknowledging_provider_acceptance() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let fixture = Uuid::new_v4().simple().to_string();
+    let user_id = format!("billing-user-cancel-{fixture}");
+    let token = seed_user(&pool, &user_id).await;
+    let operation_id =
+        seed_personal_account(&pool, &user_id, &format!("personal-cancel-{fixture}")).await;
+    sqlx::query(
+        "UPDATE billing_personal_accounts SET state = 'active', stripe_customer_id = $2, \
+           stripe_subscription_id = $3 WHERE user_id = $1",
+    )
+    .bind(&user_id)
+    .bind(format!("cus_cancel_{fixture}"))
+    .bind(format!("sub_cancel_{fixture}"))
+    .execute(&pool)
+    .await
+    .expect("activate personal subscription fixture");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let intent_visible = Arc::new(AtomicBool::new(false));
+    let app = app_with_provider(
+        pool.clone(),
+        Arc::new(CancellationCountingProvider {
+            calls: calls.clone(),
+            pool: pool.clone(),
+            user_id: user_id.clone(),
+            intent_visible: intent_visible.clone(),
+        }),
+    );
+
+    assert_eq!(
+        post_authed_json(
+            &app,
+            "/billing/personal/cancel",
+            &token,
+            serde_json::json!({"idempotency_key": format!("cancel-{fixture}")}),
+        )
+        .await,
+        StatusCode::OK
+    );
+    let cancellation: (bool, bool) = sqlx::query_as(
+        "SELECT cancel_at_period_end, cancellation_requested_at IS NOT NULL \
+         FROM billing_personal_accounts WHERE user_id = $1",
+    )
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read accepted cancellation");
+    assert_eq!(cancellation, (true, true));
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert!(
+        intent_visible.load(Ordering::Relaxed),
+        "cancellation intent must be committed before the provider call"
+    );
+
+    sqlx::query("DELETE FROM billing_personal_accounts WHERE user_id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("clean personal account");
+    sqlx::query("DELETE FROM billing_operations WHERE operation_id = $1")
+        .bind(operation_id)
+        .execute(&pool)
+        .await
+        .expect("clean billing operation");
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("clean user");
+}
+
+#[tokio::test]
+async fn already_flagged_personal_cancellation_still_reconciles_provider_state() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let fixture = Uuid::new_v4().simple().to_string();
+    let user_id = format!("billing-user-cancel-retry-{fixture}");
+    let token = seed_user(&pool, &user_id).await;
+    let operation_id =
+        seed_personal_account(&pool, &user_id, &format!("personal-cancel-retry-{fixture}")).await;
+    sqlx::query(
+        "UPDATE billing_personal_accounts SET state = 'active', cancel_at_period_end = TRUE, \
+           stripe_customer_id = $2, stripe_subscription_id = $3 WHERE user_id = $1",
+    )
+    .bind(&user_id)
+    .bind(format!("cus_cancel_retry_{fixture}"))
+    .bind(format!("sub_cancel_retry_{fixture}"))
+    .execute(&pool)
+    .await
+    .expect("seed cancellation already accepted by webhook");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let intent_visible = Arc::new(AtomicBool::new(false));
+    let app = app_with_provider(
+        pool.clone(),
+        Arc::new(CancellationCountingProvider {
+            calls: calls.clone(),
+            pool: pool.clone(),
+            user_id: user_id.clone(),
+            intent_visible: intent_visible.clone(),
+        }),
+    );
+
+    assert_eq!(
+        post_authed_json(
+            &app,
+            "/billing/personal/cancel",
+            &token,
+            serde_json::json!({"idempotency_key": format!("cancel-retry-{fixture}")}),
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert!(intent_visible.load(Ordering::Relaxed));
+    let intent_recorded: bool = sqlx::query_scalar(
+        "SELECT cancellation_requested_at IS NOT NULL FROM billing_personal_accounts WHERE user_id = $1",
+    )
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read cancellation intent");
+    assert!(intent_recorded);
+
+    sqlx::query("DELETE FROM billing_personal_accounts WHERE user_id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("clean personal account");
+    sqlx::query("DELETE FROM billing_operations WHERE operation_id = $1")
+        .bind(operation_id)
+        .execute(&pool)
+        .await
+        .expect("clean billing operation");
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("clean user");
+}
+
+#[tokio::test]
+async fn personal_subscription_events_track_cancel_at_and_reactivation() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let fixture = Uuid::new_v4().simple().to_string();
+    let user_id = format!("billing-user-cancel-at-{fixture}");
+    seed_user(&pool, &user_id).await;
+    let operation_id =
+        seed_personal_account(&pool, &user_id, &format!("personal-cancel-at-{fixture}")).await;
+    let subscription_id = format!("sub_cancel_at_{fixture}");
+    sqlx::query(
+        "UPDATE billing_personal_accounts SET state = 'active', stripe_subscription_id = $2, \
+           cancellation_requested_at = now() WHERE user_id = $1",
+    )
+    .bind(&user_id)
+    .bind(&subscription_id)
+    .execute(&pool)
+    .await
+    .expect("seed schedule-managed cancellation intent");
+    let award_id = format!("founding-cancel-at-{fixture}");
+    let cohort_ordinal = i64::from_str_radix(&fixture[..2], 16).unwrap() % 100 + 1;
+    sqlx::query(
+        "INSERT INTO billing_founding_awards \
+         (award_id, beneficiary_id, payer_kind, payer_id, offer, cohort_ordinal, \
+          original_start_date, original_end_date, original_start_epoch, original_end_epoch) \
+         VALUES ($1, $2, 'personal', $2, 'founding_monthly', $3, \
+                 '2026-01-01', '2027-01-01', 1767225600, 1798761600)",
+    )
+    .bind(&award_id)
+    .bind(&user_id)
+    .bind(cohort_ordinal)
+    .execute(&pool)
+    .await
+    .expect("seed founding award");
+    sqlx::query(
+        "INSERT INTO billing_founding_schedule_jobs \
+         (job_id, award_id, beneficiary_id, payer_kind, payer_id, provider_subscription_id, \
+          provider_idempotency_key, state) \
+         VALUES ($1, $2, $3, 'personal', $3, $4, $5, 'not_required')",
+    )
+    .bind(format!("founding-schedule:{award_id}"))
+    .bind(&award_id)
+    .bind(&user_id)
+    .bind(&subscription_id)
+    .bind(format!("founding-transition:{award_id}:1"))
+    .execute(&pool)
+    .await
+    .expect("seed ended founding schedule job");
+    let app = app(pool.clone(), true);
+    let event = |event_id: &str, created: i64, cancel_at: Option<i64>, schedule: Option<&str>| {
+        serde_json::json!({
+            "id": event_id,
+            "created": created,
+            "api_version": STRIPE_API_VERSION,
+            "type": "customer.subscription.updated",
+            "data": { "object": {
+                "id": subscription_id,
+                "status": "active",
+                "cancel_at_period_end": false,
+                "cancel_at": cancel_at,
+                "schedule": schedule,
+                "metadata": {"personal_user_id": user_id}
+            }}
+        })
+        .to_string()
+    };
+
+    let cancelling = event(
+        &format!("evt_personal_cancel_at_{fixture}"),
+        1_900_000_000,
+        Some(1_902_592_000),
+        Some("sched_personal"),
+    );
+    assert_eq!(
+        post_webhook(&app, &cancelling, Some(&stripe_signature(&cancelling))).await,
+        StatusCode::OK
+    );
+    let cancellation: (bool, bool) = sqlx::query_as(
+        "SELECT cancel_at_period_end, cancellation_requested_at IS NOT NULL \
+         FROM billing_personal_accounts WHERE user_id = $1",
+    )
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read schedule cancellation state");
+    assert_eq!(cancellation, (true, true));
+
+    let reactivated = event(
+        &format!("evt_personal_reactivated_{fixture}"),
+        1_900_000_001,
+        None,
+        None,
+    );
+    assert_eq!(
+        post_webhook(&app, &reactivated, Some(&stripe_signature(&reactivated))).await,
+        StatusCode::OK
+    );
+    let cancellation: (bool, bool) = sqlx::query_as(
+        "SELECT cancel_at_period_end, cancellation_requested_at IS NOT NULL \
+         FROM billing_personal_accounts WHERE user_id = $1",
+    )
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read reactivated subscription state");
+    assert_eq!(cancellation, (false, false));
+    let resumed: (String, i64, String) = sqlx::query_as(
+        "SELECT state, version, provider_idempotency_key \
+         FROM billing_founding_schedule_jobs WHERE award_id = $1",
+    )
+    .bind(&award_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read founding transition after reactivation");
+    assert_eq!(
+        resumed,
+        (
+            "pending".into(),
+            2,
+            format!("founding-transition:{award_id}:2"),
+        )
+    );
+
+    sqlx::query("DELETE FROM billing_founding_schedule_jobs WHERE award_id = $1")
+        .bind(&award_id)
+        .execute(&pool)
+        .await
+        .expect("clean founding schedule job");
+    sqlx::query("DELETE FROM billing_founding_awards WHERE award_id = $1")
+        .bind(&award_id)
+        .execute(&pool)
+        .await
+        .expect("clean founding award");
+    sqlx::query("DELETE FROM billing_personal_accounts WHERE user_id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("clean personal account");
+    sqlx::query("DELETE FROM billing_operations WHERE operation_id = $1")
+        .bind(operation_id)
+        .execute(&pool)
+        .await
+        .expect("clean billing operation");
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("clean user");
 }
 
 #[tokio::test]
@@ -689,6 +1213,1895 @@ async fn personal_paid_checkout_webhook_records_provider_term() {
     .await
     .expect("renewed personal account");
     assert_eq!(renewed_epoch, 2_100_000_000,);
+}
+
+#[tokio::test]
+async fn personal_renewal_notices_follow_signed_failure_and_matching_paid_invoice() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let fixture = Uuid::new_v4().simple().to_string();
+    let user_id = format!("billing-renewal-notice-user-{fixture}");
+    let operation_key = format!("renewal-notice-{fixture}");
+    let subscription_id = format!("sub_notice_{fixture}");
+    let customer_id = format!("cus_notice_{fixture}");
+    let invoice_id = format!("in_notice_{fixture}");
+    let first_failure_event = format!("evt_notice_failure_{fixture}");
+    let retry_failure_event = format!("evt_notice_retry_{fixture}");
+    let mismatch_failure_event = format!("evt_notice_mismatch_{fixture}");
+    let unbound_failure_event = format!("evt_notice_unbound_{fixture}");
+    let unrelated_paid_event = format!("evt_notice_unrelated_paid_{fixture}");
+    let recovered_paid_event = format!("evt_notice_recovered_paid_{fixture}");
+    let paid_before_failure_event = format!("evt_notice_paid_first_{fixture}");
+    let late_failure_event = format!("evt_notice_late_failure_{fixture}");
+    seed_user(&pool, &user_id).await;
+    let operation_id = seed_personal_account(&pool, &user_id, &operation_key).await;
+    let paid_through = FoundingDate::from_unix_seconds(1_900_000_000)
+        .expect("valid paid-through date")
+        .to_unix_seconds();
+    sqlx::query(
+        "UPDATE billing_personal_accounts SET state='active', stripe_customer_id=$2, \
+           stripe_subscription_id=$3, paid_through_epoch=$4, paid_through_date=$5 \
+         WHERE user_id=$1",
+    )
+    .bind(&user_id)
+    .bind(&customer_id)
+    .bind(&subscription_id)
+    .bind(paid_through)
+    .bind(
+        FoundingDate::from_unix_seconds(paid_through)
+            .unwrap()
+            .to_string(),
+    )
+    .execute(&pool)
+    .await
+    .expect("activate personal billing fixture");
+    let app = app_with_provider(
+        pool.clone(),
+        Arc::new(TestProvider {
+            observation: SubscriptionObservation::Missing,
+            personal_period_end: None,
+        }),
+    );
+
+    let make_failure = |event_id: &str,
+                        created: i64,
+                        failed_invoice_id: &str,
+                        period_start: i64| {
+        serde_json::json!({
+            "id": event_id,
+            "created": created,
+            "api_version": STRIPE_API_VERSION,
+            "type": "invoice.payment_failed",
+            "livemode": false,
+            "data": { "object": {
+                "object": "invoice", "id": failed_invoice_id, "customer": customer_id,
+                "parent": {"type":"subscription_details", "subscription_details":{"subscription":subscription_id}},
+                "status":"open", "billing_reason":"subscription_cycle", "collection_method":"charge_automatically",
+                "amount_due":299, "amount_remaining":299, "amount_paid":0,
+                "lines":{"data":[{"parent":{"type":"subscription_item_details", "subscription_item_details":{"subscription":subscription_id}},
+                    "period":{"start":period_start, "end":period_start + 2_592_000}}]}
+            }}
+        }).to_string()
+    };
+    let make_paid = |event_id: &str, created: i64, paid_invoice_id: &str, period_start: i64| {
+        serde_json::json!({
+            "id": event_id,
+            "created": created,
+            "api_version": STRIPE_API_VERSION,
+            "type": "invoice.paid",
+            "livemode": false,
+            "data": { "object": {
+                "object":"invoice", "id":paid_invoice_id, "customer":customer_id,
+                "payment_intent":format!("pi_{fixture}_{event_id}"), "status":"paid",
+                "billing_reason":"subscription_cycle", "period_end":period_start + 2_592_000,
+                "lines":{"data":[{"parent":{"type":"subscription_item_details", "subscription_item_details":{"subscription":subscription_id}},
+                    "period":{"start":period_start, "end":period_start + 2_592_000}}]},
+                "parent":{"type":"subscription_details", "subscription_details":{"subscription":subscription_id}}
+            }}
+        }).to_string()
+    };
+    let send = |payload: String| {
+        let app = app.clone();
+        async move {
+            let signature = stripe_signature(&payload);
+            post_webhook(&app, &payload, Some(&signature)).await
+        }
+    };
+
+    let failed_payload = make_failure(&first_failure_event, 100, &invoice_id, paid_through);
+    let invalid_signature = stripe_signature("different body");
+    assert_eq!(
+        post_webhook(&app, &failed_payload, Some(&invalid_signature)).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(send(failed_payload).await, StatusCode::OK);
+    // Stripe can emit more than one failure event for the same invoice. The customer sees one
+    // notice with the original deadline, even though the delivery ids differ.
+    let retry_payload = make_failure(&retry_failure_event, 101, &invoice_id, paid_through);
+    assert_eq!(send(retry_payload).await, StatusCode::OK);
+    let mut mismatched_customer: serde_json::Value = serde_json::from_str(&make_failure(
+        &mismatch_failure_event,
+        102,
+        &format!("in_mismatch_{fixture}"),
+        paid_through,
+    ))
+    .unwrap();
+    mismatched_customer["data"]["object"]["customer"] =
+        serde_json::Value::String(format!("cus_unbound_{fixture}"));
+    assert_eq!(send(mismatched_customer.to_string()).await, StatusCode::OK);
+    let unbound_payload = make_failure(
+        &unbound_failure_event,
+        103,
+        &format!("in_unbound_{fixture}"),
+        paid_through,
+    )
+    .replace(&subscription_id, &format!("sub_unbound_{fixture}"))
+    .replace(&customer_id, &format!("cus_unbound_{fixture}"));
+    assert_eq!(send(unbound_payload).await, StatusCode::OK);
+    let failed_notice = sqlx::query(
+        "SELECT event_key, payload, extract(epoch FROM due_at)::bigint AS due_at \
+         FROM cloud_notice_outbox WHERE recipient_user_id=$1 AND kind='failed_renewal'",
+    )
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load failed renewal notice");
+    let event_key: String = failed_notice.try_get("event_key").unwrap();
+    let failure_content: serde_json::Value = failed_notice.try_get("payload").unwrap();
+    assert!(event_key.starts_with("personal-renewal-v1:"));
+    assert!(!event_key.contains(&subscription_id));
+    assert!(!event_key.contains(&invoice_id));
+    assert_eq!(
+        failure_content["deadline_epoch"].as_i64(),
+        Some(paid_through + sotto_server::cloud_coverage::RENEWAL_RECOVERY_SECONDS)
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM cloud_notice_outbox WHERE recipient_user_id=$1 AND kind='failed_renewal'",
+        )
+        .bind(&user_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        1
+    );
+
+    // A different paid invoice does not resolve this failed invoice.
+    let next_period = paid_through + 2_592_000;
+    let unrelated_payload = make_paid(
+        &unrelated_paid_event,
+        104,
+        &format!("in_unrelated_{fixture}"),
+        next_period,
+    );
+    assert_eq!(send(unrelated_payload).await, StatusCode::OK);
+    let resolved_before_matching_payment: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_notice_outbox WHERE recipient_user_id=$1 AND kind='recovery_resolved'",
+    )
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(resolved_before_matching_payment, 0);
+
+    // The matching invoice can be paid later. Its resolution is committed with the billing
+    // update, while the failed notice's key, deadline and content stay unchanged.
+    let recovered_payload = make_paid(&recovered_paid_event, 105, &invoice_id, paid_through);
+    assert_eq!(send(recovered_payload).await, StatusCode::OK);
+    let resolved_notice: serde_json::Value = sqlx::query_scalar(
+        "SELECT payload FROM cloud_notice_outbox WHERE recipient_user_id=$1 AND kind='recovery_resolved'",
+    )
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load recovery resolved notice");
+    assert_eq!(resolved_notice["title"], "Your Cloud renewal is up to date");
+    let visible_notices = sotto_server::notifications::list_for_user(&pool, &user_id)
+        .await
+        .expect("list renewal notices after payment");
+    assert_eq!(visible_notices.len(), 1);
+    assert_eq!(visible_notices[0].kind, "recovery_resolved");
+    let failed_after_recovery: (String, serde_json::Value) = sqlx::query_as(
+        "SELECT event_key, payload FROM cloud_notice_outbox \
+         WHERE recipient_user_id=$1 AND kind='failed_renewal'",
+    )
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(failed_after_recovery.0, event_key);
+    assert_eq!(failed_after_recovery.1, failure_content);
+
+    // If payment is processed before the failure event, the paid-through row makes the late
+    // failure stale and prevents a notice that contradicts the final billing state.
+    let current_paid_through = paid_through + 2_592_000 * 2;
+    let paid_first_invoice = format!("in_paid_first_{fixture}");
+    let paid_first = make_paid(
+        &paid_before_failure_event,
+        106,
+        &paid_first_invoice,
+        current_paid_through,
+    );
+    assert_eq!(send(paid_first).await, StatusCode::OK);
+    let late_failure = make_failure(
+        &late_failure_event,
+        107,
+        &paid_first_invoice,
+        current_paid_through,
+    );
+    assert_eq!(send(late_failure).await, StatusCode::OK);
+    let failure_notice_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_notice_outbox WHERE recipient_user_id=$1 AND kind='failed_renewal'",
+    )
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(failure_notice_count, 1);
+
+    // A late payment can arrive after the subscription itself was cancelled. It should retire
+    // the stale failure warning without presenting the cancelled subscription as active again.
+    sqlx::query("UPDATE billing_personal_accounts SET state='canceled' WHERE user_id=$1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE cloud_notice_outbox SET status='pending', cancelled_at=NULL \
+         WHERE recipient_user_id=$1 AND kind='failed_renewal'",
+    )
+    .bind(&user_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let late_paid_after_cancel = make_paid(
+        &format!("evt_paid_after_cancel_{fixture}"),
+        108,
+        &invoice_id,
+        paid_through,
+    );
+    assert_eq!(send(late_paid_after_cancel).await, StatusCode::OK);
+    let (account_state, failed_notice_status): (String, String) = sqlx::query_as(
+        "SELECT (SELECT state FROM billing_personal_accounts WHERE user_id=$1), \
+                (SELECT status FROM cloud_notice_outbox WHERE recipient_user_id=$1 \
+                   AND kind='failed_renewal')",
+    )
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(account_state, "canceled");
+    assert_eq!(failed_notice_status, "cancelled");
+    let visible_after_cancelled_payment =
+        sotto_server::notifications::list_for_user(&pool, &user_id)
+            .await
+            .expect("list notices after late cancelled payment");
+    assert!(visible_after_cancelled_payment
+        .iter()
+        .all(|notice| notice.kind != "failed_renewal"));
+
+    // Notices contain only fixed copy and dates, never the payment, invoice, customer or
+    // subscription references used to derive their opaque identity.
+    let payload_text: String = sqlx::query_scalar(
+        "SELECT string_agg(payload::text, ' ') FROM cloud_notice_outbox WHERE recipient_user_id=$1",
+    )
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    for provider_reference in [&subscription_id, &customer_id, &invoice_id] {
+        assert!(!payload_text.contains(provider_reference));
+    }
+    assert!(failed_notice.try_get::<i64, _>("due_at").unwrap() > 0);
+
+    sqlx::query("DELETE FROM cloud_notice_outbox WHERE recipient_user_id=$1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM billing_personal_accounts WHERE user_id=$1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM billing_operations WHERE operation_id=$1")
+        .bind(&operation_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let webhook_event_ids = vec![
+        first_failure_event,
+        retry_failure_event,
+        mismatch_failure_event,
+        unbound_failure_event,
+        unrelated_paid_event,
+        recovered_paid_event,
+        paid_before_failure_event,
+        late_failure_event,
+        format!("evt_paid_after_cancel_{fixture}"),
+    ];
+    sqlx::query(
+        "DELETE FROM stripe_subscription_watermarks \
+         WHERE subscription_id=$1 OR event_id = ANY($2)",
+    )
+    .bind(&subscription_id)
+    .bind(&webhook_event_ids)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM stripe_webhook_events WHERE event_id = ANY($1)")
+        .bind(&webhook_event_ids)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM users WHERE id=$1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn personal_renewal_notice_enqueue_failure_rolls_back_its_webhook_receipt() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let fixture = Uuid::new_v4().simple().to_string();
+    let user_id = format!("billing-renewal-rollback-user-{fixture}");
+    seed_user(&pool, &user_id).await;
+    let operation_id =
+        seed_personal_account(&pool, &user_id, &format!("renewal-rollback-{fixture}")).await;
+    let subscription_id = format!("sub_notice_rollback_{fixture}");
+    let customer_id = format!("cus_notice_rollback_{fixture}");
+    let event_id = format!("evt_notice_rollback_{fixture}");
+    let invoice_id = format!("in_notice_rollback_{fixture}");
+    let paid_through = FoundingDate::from_unix_seconds(1_900_000_000)
+        .expect("valid paid-through date")
+        .to_unix_seconds();
+    sqlx::query(
+        "UPDATE billing_personal_accounts SET state='active', stripe_customer_id=$2, \
+           stripe_subscription_id=$3, paid_through_epoch=$4, paid_through_date=$5 \
+         WHERE user_id=$1",
+    )
+    .bind(&user_id)
+    .bind(&customer_id)
+    .bind(&subscription_id)
+    .bind(paid_through)
+    .bind(
+        FoundingDate::from_unix_seconds(paid_through)
+            .unwrap()
+            .to_string(),
+    )
+    .execute(&pool)
+    .await
+    .expect("activate personal billing fixture");
+    let function_name = format!("fail_notice_insert_{fixture}");
+    let trigger_name = format!("fail_notice_insert_trigger_{fixture}");
+    sqlx::query(&format!(
+        "CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN IF NEW.recipient_user_id = '{user_id}' THEN \
+           RAISE EXCEPTION 'intentional notice enqueue failure'; \
+         END IF; RETURN NEW; END $$"
+    ))
+    .execute(&pool)
+    .await
+    .expect("install recipient-scoped notice fault");
+    sqlx::query(&format!(
+        "CREATE TRIGGER {trigger_name} BEFORE INSERT ON cloud_notice_outbox \
+         FOR EACH ROW EXECUTE FUNCTION {function_name}()"
+    ))
+    .execute(&pool)
+    .await
+    .expect("install notice fault trigger");
+
+    let payload = serde_json::json!({
+        "id": event_id,
+        "created": 100,
+        "api_version": STRIPE_API_VERSION,
+        "type": "invoice.payment_failed",
+        "livemode": false,
+        "data": { "object": {
+            "object":"invoice", "id":invoice_id, "customer":customer_id,
+            "parent":{"type":"subscription_details", "subscription_details":{"subscription":subscription_id}},
+            "status":"open", "billing_reason":"subscription_cycle", "collection_method":"charge_automatically",
+            "amount_remaining":299,
+            "lines":{"data":[{"parent":{"type":"subscription_item_details", "subscription_item_details":{"subscription":subscription_id}},
+                "period":{"start":paid_through, "end":paid_through + 2_592_000}}]}
+        }}
+    })
+    .to_string();
+    let app = app_with_provider(
+        pool.clone(),
+        Arc::new(TestProvider {
+            observation: SubscriptionObservation::Missing,
+            personal_period_end: None,
+        }),
+    );
+    assert_eq!(
+        post_webhook(&app, &payload, Some(&stripe_signature(&payload))).await,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    sqlx::query(&format!(
+        "DROP TRIGGER {trigger_name} ON cloud_notice_outbox"
+    ))
+    .execute(&pool)
+    .await
+    .expect("remove notice fault trigger");
+    sqlx::query(&format!("DROP FUNCTION {function_name}()"))
+        .execute(&pool)
+        .await
+        .expect("remove notice fault");
+
+    let counts: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM stripe_webhook_events WHERE event_id=$1), \
+                (SELECT count(*) FROM cloud_notice_outbox WHERE recipient_user_id=$2)",
+    )
+    .bind(&event_id)
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("query rolled-back rows");
+    assert_eq!(counts, (0, 0));
+
+    sqlx::query("DELETE FROM billing_personal_accounts WHERE user_id=$1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM billing_operations WHERE operation_id=$1")
+        .bind(&operation_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM users WHERE id=$1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn personal_renewal_notice_is_committed_before_coverage_history_retry() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let fixture = Uuid::new_v4().simple().to_string();
+    let user_id = format!("billing-renewal-read-failure-user-{fixture}");
+    let operation_id = format!("personal-renewal-read-failure-{fixture}");
+    let subscription_id = format!("sub_read_failure_{fixture}");
+    let customer_id = format!("cus_read_failure_{fixture}");
+    let account_id = format!("acct_read_failure_{fixture}");
+    let allocation_reference = format!("alloc_read_failure_{fixture}");
+    let allocation_id = format!("allocation_read_failure_{fixture}");
+    let payer_id = format!("payer_read_failure_{fixture}");
+    let source_id = format!("source_read_failure_{fixture}");
+    let event_id = format!("evt_read_failure_{fixture}");
+    let invoice_id = format!("in_read_failure_{fixture}");
+    seed_user(&pool, &user_id).await;
+    let seeded_operation = seed_personal_account(&pool, &user_id, &operation_id).await;
+    let paid_through = FoundingDate::from_unix_seconds(1_900_000_000)
+        .expect("valid paid-through date")
+        .to_unix_seconds();
+    sqlx::query(
+        "UPDATE billing_personal_accounts SET state='active', stripe_customer_id=$2, \
+           stripe_subscription_id=$3, allocation_reference=$4, paid_through_epoch=$5, \
+           paid_through_date=$6 WHERE user_id=$1",
+    )
+    .bind(&user_id)
+    .bind(&customer_id)
+    .bind(&subscription_id)
+    .bind(&allocation_reference)
+    .bind(paid_through)
+    .bind(
+        FoundingDate::from_unix_seconds(paid_through)
+            .unwrap()
+            .to_string(),
+    )
+    .execute(&pool)
+    .await
+    .expect("bind active personal account");
+
+    let coverage = StripeCoverageConfig::new(
+        &account_id,
+        ProviderEnvironment::Test,
+        "price_read_failure_month",
+        "price_read_failure_year",
+    )
+    .unwrap();
+    let context = ProviderContext::new("stripe", &account_id, ProviderEnvironment::Test).unwrap();
+    let allocation = VerifiedAllocation::new(
+        &allocation_id,
+        &payer_id,
+        &customer_id,
+        ProviderPayerKind::Personal,
+        &user_id,
+        &subscription_id,
+        "si_read_failure",
+        &allocation_reference,
+        &source_id,
+        0,
+        None,
+        AllocationState::Active,
+        format!("stripe:renewal-notice-owner:{fixture}"),
+    )
+    .unwrap();
+    let mut register = pool.begin().await.expect("begin allocation registration");
+    register_verified_allocation(&mut register, &context, &allocation)
+        .await
+        .expect("register personal allocation");
+    register
+        .commit()
+        .await
+        .expect("commit allocation registration");
+
+    // The feature's coverage read fails before it can link predecessor evidence. The signed
+    // billing fact still has enough local binding to create its customer notice and pending
+    // receipt, so the customer is not left uninformed while Stripe retries the coverage work.
+    let (origin, stripe_task) = stripe_mock_server(HashMap::from([(
+        "/v1/account".into(),
+        serde_json::json!({"_http_status":500,"error":{"message":"temporary read failure"}}),
+    )]))
+    .await;
+    let stripe = StripeReadClient::for_test(
+        "sk_test_read_failure",
+        &coverage,
+        origin,
+        StripeReadLimits::default(),
+    )
+    .unwrap();
+    let billing = BillingState::with_provider_and_cloud_sales(
+        Arc::new(TestProvider {
+            observation: SubscriptionObservation::Missing,
+            personal_period_end: None,
+        }),
+        WEBHOOK_SECRET.into(),
+        "https://app.sotto.test".into(),
+        false,
+    )
+    .with_personal_coverage(coverage, stripe, true);
+    let app = app_with_billing_mode(
+        pool.clone(),
+        Some(billing),
+        sotto_server::config::DeploymentMode::Cloud,
+    );
+    let payload = serde_json::json!({
+        "id":event_id, "created":100, "api_version":STRIPE_API_VERSION,
+        "type":"invoice.payment_failed", "livemode":false,
+        "data":{"object":{
+            "object":"invoice", "id":invoice_id, "customer":customer_id,
+            "parent":{"type":"subscription_details", "subscription_details":{"subscription":subscription_id}},
+            "status":"open", "billing_reason":"subscription_cycle", "collection_method":"charge_automatically",
+            "amount_due":299, "amount_remaining":299, "amount_paid":0,
+            "metadata":{"sotto_allocation_reference":allocation_reference},
+            "lines":{"data":[{"id":"il_failed_read", "parent":{"type":"subscription_item_details", "subscription_item_details":{"subscription":subscription_id, "subscription_item":"si_read_failure"}},
+                "period":{"start":paid_through, "end":paid_through + 2_592_000}}]}
+        }}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(&app, &payload, Some(&stripe_signature(&payload))).await,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Stripe must retry the still-unresolved coverage evidence"
+    );
+    let (notice_count, processed): (i64, bool) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM cloud_notice_outbox WHERE recipient_user_id=$1 AND kind='failed_renewal'), \
+                (SELECT processed_at IS NOT NULL FROM stripe_webhook_events WHERE event_id=$2)",
+    )
+    .bind(&user_id)
+    .bind(&event_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read notice and pending receipt");
+    assert_eq!(notice_count, 1);
+    assert!(!processed);
+
+    sqlx::query("DELETE FROM cloud_notice_outbox WHERE recipient_user_id=$1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM stripe_webhook_events WHERE event_id=$1")
+        .bind(&event_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_provider_allocations WHERE allocation_id=$1")
+        .bind(&allocation_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_coverage_sources WHERE source_id=$1")
+        .bind(&source_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_provider_payers WHERE payer_id=$1")
+        .bind(&payer_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_coverage_coordinators WHERE beneficiary_id=$1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    for table in [
+        "cloud_coverage_heads",
+        "cloud_coverage_revision_facts",
+        "cloud_coverage_revisions",
+    ] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE beneficiary_id=$1"))
+            .bind(&user_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query("DELETE FROM billing_personal_accounts WHERE user_id=$1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM billing_operations WHERE operation_id=$1")
+        .bind(&seeded_operation)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM users WHERE id=$1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    stripe_task.abort();
+}
+
+#[tokio::test]
+async fn personal_invoice_paid_is_not_blocked_by_an_open_transfer_invitation() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let fixture = Uuid::new_v4().simple().to_string();
+    let user_id = format!("billing-transfer-webhook-{fixture}-user");
+    let counterparty_id = format!("billing-transfer-webhook-{fixture}-counterparty");
+    let organization_id = format!("billing-transfer-webhook-{fixture}-org");
+    let transfer_id = format!("transfer:webhook-{fixture}");
+    seed_user(&pool, &user_id).await;
+    seed_user(&pool, &counterparty_id).await;
+    let operation_id =
+        seed_personal_account(&pool, &user_id, &format!("transfer-webhook-{fixture}")).await;
+
+    sqlx::query("INSERT INTO organizations (id, enc_name, created_by) VALUES ($1, decode('6f7267', 'hex'), $2)")
+        .bind(&organization_id)
+        .bind(&counterparty_id)
+        .execute(&pool)
+        .await
+        .expect("insert transfer destination organisation");
+
+    let provider = Arc::new(TestProvider {
+        observation: SubscriptionObservation::Missing,
+        personal_period_end: Some(1_900_000_000),
+    });
+    let app = app_with_provider(pool.clone(), provider);
+    let checkout_event_id = format!("evt_transfer_webhook_checkout_{fixture}");
+    let checkout = serde_json::json!({
+        "id": checkout_event_id,
+        "created": 1_800_000_000,
+        "api_version": STRIPE_API_VERSION,
+        "type": "checkout.session.completed",
+        "data": { "object": {
+            "client_reference_id": format!("personal:{operation_id}"),
+            "payment_status": "paid",
+            "customer": format!("cus_transfer_webhook_{fixture}"),
+            "subscription": format!("sub_transfer_webhook_{fixture}"),
+            "payment_intent": format!("pi_transfer_webhook_{fixture}")
+        }}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(&app, &checkout, Some(&stripe_signature(&checkout))).await,
+        StatusCode::OK
+    );
+
+    sqlx::query(
+        "INSERT INTO billing_transfer_intents \
+         (transfer_id, actor_user_id, counterparty_user_id, beneficiary_id, source_kind, \
+          destination_kind, destination_organization_id, offer, quote_version, \
+          quote_expires_at_epoch, consent_expires_at_epoch, effective_from, idempotency_key, \
+          request_hash, provider_idempotency_key, source_provider_subscription_id, state) \
+         VALUES ($1,$2,$3,$2,'personal','sponsor',$4,'standard_monthly',1, \
+                 1900000000,2000000000,2000000000,$1,$1,$1,$5,'awaiting_consent')",
+    )
+    .bind(&transfer_id)
+    .bind(&user_id)
+    .bind(&counterparty_id)
+    .bind(&organization_id)
+    .bind(format!("sub_transfer_webhook_{fixture}"))
+    .execute(&pool)
+    .await
+    .expect("insert open transfer invitation");
+
+    let invoice_event_id = format!("evt_transfer_webhook_invoice_{fixture}");
+    let invoice = serde_json::json!({
+        "id": invoice_event_id,
+        "created": 1_800_000_001,
+        "api_version": STRIPE_API_VERSION,
+        "type": "invoice.paid",
+        "data": { "object": {
+            "id": format!("in_transfer_webhook_{fixture}"),
+            "payment_intent": format!("pi_transfer_webhook_renewal_{fixture}"),
+            "period_end": 1_950_000_000,
+            "lines": { "data": [{
+                "parent": {
+                    "type": "subscription_item_details",
+                    "subscription_item_details": {
+                        "subscription": format!("sub_transfer_webhook_{fixture}")
+                    }
+                },
+                "period": { "end": 2_000_000_000 }
+            }]},
+            "parent": {
+                "type": "subscription_details",
+                "subscription_details": {
+                    "subscription": format!("sub_transfer_webhook_{fixture}")
+                }
+            }
+        }}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(&app, &invoice, Some(&stripe_signature(&invoice))).await,
+        StatusCode::OK,
+        "an invitation must not make the paid invoice retry or roll back"
+    );
+    let (paid_through, processed): (i64, bool) = sqlx::query_as(
+        "SELECT account.paid_through_epoch, event.processed_at IS NOT NULL \
+         FROM billing_personal_accounts AS account \
+         JOIN stripe_webhook_events AS event ON event.event_id = $2 \
+         WHERE account.user_id = $1",
+    )
+    .bind(&user_id)
+    .bind(&invoice_event_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load paid invoice and webhook receipt");
+    assert_eq!(paid_through, 2_000_000_000);
+    assert!(processed);
+
+    let event_ids = vec![checkout_event_id, invoice_event_id];
+    sqlx::query("DELETE FROM stripe_subscription_watermarks WHERE event_id = ANY($1)")
+        .bind(&event_ids)
+        .execute(&pool)
+        .await
+        .expect("clean webhook watermarks");
+    sqlx::query("DELETE FROM stripe_webhook_events WHERE event_id = ANY($1)")
+        .bind(&event_ids)
+        .execute(&pool)
+        .await
+        .expect("clean webhook receipts");
+    sqlx::query("DELETE FROM billing_transfer_intents WHERE transfer_id = $1")
+        .bind(&transfer_id)
+        .execute(&pool)
+        .await
+        .expect("clean transfer invitation");
+    sqlx::query("DELETE FROM billing_personal_accounts WHERE user_id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("clean personal account");
+    sqlx::query("DELETE FROM billing_personal_events WHERE user_id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("clean personal billing events");
+    sqlx::query("DELETE FROM billing_operations WHERE actor_user_id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("clean billing operation");
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(&organization_id)
+        .execute(&pool)
+        .await
+        .expect("clean destination organisation");
+    sqlx::query("DELETE FROM sessions WHERE user_id = ANY($1)")
+        .bind(vec![user_id.clone(), counterparty_id.clone()])
+        .execute(&pool)
+        .await
+        .expect("clean test sessions");
+    sqlx::query("DELETE FROM users WHERE id = ANY($1)")
+        .bind(vec![user_id, counterparty_id])
+        .execute(&pool)
+        .await
+        .expect("clean test users");
+}
+
+#[tokio::test]
+async fn personal_invoice_first_delivery_waits_for_checkout_binding_then_queues_coverage() {
+    let Some(pool) = one_connection_pool_or_skip().await else {
+        return;
+    };
+    let fixture = Uuid::new_v4().simple().to_string();
+    let user_id = format!("billing-coverage-user-{fixture}");
+    let token = seed_user(&pool, &user_id).await;
+    let operation_id =
+        seed_personal_account(&pool, &user_id, &format!("personal-coverage-{fixture}")).await;
+    let allocation_reference: String = sqlx::query_scalar(
+        "SELECT allocation_reference FROM billing_personal_accounts WHERE operation_id = $1",
+    )
+    .bind(&operation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("personal allocation reference");
+
+    let catalogue = BillingPriceIds {
+        standard_monthly: "price_coverage_month".into(),
+        standard_annual: "price_coverage_year".into(),
+        founding_monthly: "price_coverage_found_month".into(),
+        founding_annual: "price_coverage_found_year".into(),
+    };
+    let coverage = StripeCoverageConfig::new(
+        "acct_coverage_test",
+        ProviderEnvironment::Test,
+        catalogue.standard_monthly.clone(),
+        catalogue.standard_annual.clone(),
+    )
+    .unwrap()
+    .with_founding_prices(
+        catalogue.founding_monthly.clone(),
+        catalogue.founding_annual.clone(),
+    )
+    .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let period_start = now.saturating_sub(3_600);
+    let period_end = now + 2_592_000;
+    let invoice_id = format!("in_coverage_{fixture}");
+    let invoice = serde_json::json!({
+        "id": invoice_id,
+        "customer": "cus_coverage_person",
+        "parent": {"type":"subscription_details", "subscription_details": {
+            "subscription":"sub_coverage_person",
+            "metadata": {
+                "sotto_allocation_reference": allocation_reference,
+                "personal_user_id": user_id,
+                "operation_id": operation_id
+            }
+        }},
+        "status":"paid", "currency":"gbp", "amount_paid":299, "amount_due":299,
+        "amount_remaining":0, "amount_overpaid":0, "amount_paid_off_stripe":0,
+        "livemode":false, "metadata":{"sotto_allocation_reference":allocation_reference},
+        "lines":{"data":[{
+            "id":"il_coverage_person", "quantity":1, "livemode":false,
+            "parent":{"type":"subscription_item_details", "subscription_item_details": {
+                "subscription":"sub_coverage_person", "subscription_item":"si_coverage_person"
+            }},
+            "pricing":{"type":"price_details", "price_details":{"price":"price_coverage_month"}},
+            "metadata":{"sotto_allocation_reference":allocation_reference},
+            "period":{"start":period_start,"end":period_end}
+        }]}
+    });
+    let line = invoice["lines"]["data"][0].clone();
+    let payment = serde_json::json!({
+        "id":"inpay_coverage_person", "object":"invoice_payment", "invoice":invoice_id,
+        "status":"paid", "amount_paid":299, "amount_requested":299, "currency":"gbp",
+        "livemode":false,
+        "payment":{"type":"payment_intent", "payment_intent":"pi_coverage_person"}
+    });
+    let listed_invoice = invoice.clone();
+    let mut malformed_invoice = invoice.clone();
+    malformed_invoice
+        .as_object_mut()
+        .expect("invoice object")
+        .remove("id");
+    let (origin, stripe_task) = stripe_mock_server(HashMap::from([
+        (
+            "/v1/account".into(),
+            serde_json::json!({"id":"acct_coverage_test","livemode":false}),
+        ),
+        (
+            "/v1/subscriptions/sub_coverage_person".into(),
+            serde_json::json!({"id":"sub_coverage_person","customer":"cus_coverage_person","status":"active","livemode":false}),
+        ),
+        (
+            "/v1/invoices".into(),
+            serde_json::json!({"object":"list","data":[listed_invoice],"has_more":false}),
+        ),
+        (format!("/v1/invoices/{invoice_id}"), invoice.clone()),
+        (
+            format!("/v1/invoices/in_coverage_auth_{fixture}"),
+            serde_json::json!({"_http_status":401,"error":{"message":"invalid api key"}}),
+        ),
+        (
+            format!("/v1/invoices/in_coverage_malformed_{fixture}"),
+            malformed_invoice,
+        ),
+        (
+            format!("/v1/invoices/{invoice_id}/lines"),
+            serde_json::json!({"object":"list","data":[line],"has_more":false}),
+        ),
+        (
+            "/v1/invoice_payments".into(),
+            serde_json::json!({"object":"list","data":[payment],"has_more":false}),
+        ),
+        (
+            "/v1/credit_notes".into(),
+            serde_json::json!({"object":"list","data":[],"has_more":false}),
+        ),
+        (
+            "/v1/refunds".into(),
+            serde_json::json!({"object":"list","data":[],"has_more":false}),
+        ),
+        (
+            "/v1/disputes".into(),
+            serde_json::json!({"object":"list","data":[],"has_more":false}),
+        ),
+    ]))
+    .await;
+    let stripe = StripeReadClient::for_test(
+        "sk_test_coverage",
+        &coverage,
+        origin,
+        StripeReadLimits::default(),
+    )
+    .unwrap();
+    let provider = Arc::new(TestProvider {
+        observation: SubscriptionObservation::Missing,
+        personal_period_end: Some(period_end),
+    });
+    let billing = BillingState::with_provider_and_cloud_sales(
+        provider,
+        WEBHOOK_SECRET.into(),
+        "https://app.sotto.test".into(),
+        false,
+    )
+    .with_price_catalogue(catalogue)
+    .with_personal_coverage(coverage.clone(), stripe.clone(), true);
+    let app = app_with_billing_mode(
+        pool.clone(),
+        Some(billing),
+        sotto_server::config::DeploymentMode::Cloud,
+    );
+
+    let invoice_event = serde_json::json!({
+        "id":format!("evt_coverage_invoice_{fixture}"), "created":now + 5,
+        "api_version":STRIPE_API_VERSION, "type":"invoice.paid", "livemode":false,
+        "data":{"object":invoice}
+    })
+    .to_string();
+
+    // Stripe can deliver invoice.paid before the Checkout completion has linked the local row.
+    // The failure occurs before any webhook/provider receipt or financial write is committed.
+    assert_eq!(
+        post_webhook(
+            &app,
+            &invoice_event,
+            Some(&stripe_signature(&invoice_event))
+        )
+        .await,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let receipt_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM stripe_webhook_events WHERE event_id = $1")
+            .bind(format!("evt_coverage_invoice_{fixture}"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(receipt_count, 0);
+
+    let checkout_event = serde_json::json!({
+        "id":format!("evt_coverage_checkout_{fixture}"), "created":now,
+        "api_version":STRIPE_API_VERSION, "type":"checkout.session.completed", "livemode":false,
+        "data":{"object":{
+            "client_reference_id":format!("personal:{operation_id}"), "payment_status":"paid",
+            "customer":"cus_coverage_person", "subscription":"sub_coverage_person",
+            "payment_intent":"pi_coverage_person"
+        }}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(
+            &app,
+            &checkout_event,
+            Some(&stripe_signature(&checkout_event))
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    // A Stripe credential failure is operational, not permanent invoice evidence. Keep the
+    // webhook unprocessed so Stripe retries after the key or permissions are repaired.
+    let auth_invoice_id = format!("in_coverage_auth_{fixture}");
+    let mut auth_invoice = invoice.clone();
+    auth_invoice["id"] = serde_json::json!(auth_invoice_id);
+    let auth_event_id = format!("evt_coverage_auth_failure_{fixture}");
+    let auth_event = serde_json::json!({
+        "id":auth_event_id, "created":now + 1,
+        "api_version":STRIPE_API_VERSION, "type":"invoice.paid", "livemode":false,
+        "data":{"object":auth_invoice}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(&app, &auth_event, Some(&stripe_signature(&auth_event))).await,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let auth_receipt_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM stripe_webhook_events WHERE event_id = $1")
+            .bind(&auth_event_id)
+            .fetch_one(&pool)
+            .await
+            .expect("authentication failure must not be receipted");
+    assert_eq!(auth_receipt_count, 0);
+
+    // A Stripe invoice that cannot be decoded is a permanent evidence gap, unlike a
+    // credential failure. Acknowledge the billing event but leave Cloud coverage untouched.
+    let malformed_invoice_id = format!("in_coverage_malformed_{fixture}");
+    let mut malformed_event_invoice = invoice.clone();
+    malformed_event_invoice["id"] = serde_json::json!(malformed_invoice_id);
+    let malformed_event_id = format!("evt_coverage_malformed_invoice_{fixture}");
+    let malformed_event = serde_json::json!({
+        "id":malformed_event_id, "created":now + 2,
+        "api_version":STRIPE_API_VERSION, "type":"invoice.paid", "livemode":false,
+        "data":{"object":malformed_event_invoice}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(
+            &app,
+            &malformed_event,
+            Some(&stripe_signature(&malformed_event))
+        )
+        .await,
+        StatusCode::OK
+    );
+    let malformed_receipt: (i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(processed_at) FROM stripe_webhook_events WHERE event_id = $1",
+    )
+    .bind(&malformed_event_id)
+    .fetch_one(&pool)
+    .await
+    .expect("malformed invoice receipt");
+    assert_eq!(malformed_receipt, (1, 1));
+    let malformed_coverage_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_provider_event_receipts WHERE event_id = $1",
+    )
+    .bind(&malformed_event_id)
+    .fetch_one(&pool)
+    .await
+    .expect("no coverage receipt for malformed Stripe evidence");
+    assert_eq!(malformed_coverage_rows, 0);
+
+    let (eligibility_status, eligibility) = get_eligibility(&app, &token).await;
+    assert_eq!(eligibility_status, StatusCode::OK);
+    assert_eq!(eligibility["state"], "unavailable");
+    let missing_binding_event_id = format!("evt_coverage_missing_binding_{fixture}");
+    let mut invoice_without_binding = invoice.clone();
+    invoice_without_binding
+        .as_object_mut()
+        .expect("invoice object")
+        .remove("metadata");
+    invoice_without_binding["parent"]["subscription_details"]
+        .as_object_mut()
+        .expect("subscription details")
+        .remove("metadata");
+    invoice_without_binding["lines"]["data"][0]
+        .as_object_mut()
+        .expect("invoice line")
+        .remove("metadata");
+    let missing_binding_event = serde_json::json!({
+        "id":missing_binding_event_id, "created":now + 3,
+        "api_version":STRIPE_API_VERSION, "type":"invoice.paid", "livemode":false,
+        "data":{"object":invoice_without_binding}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(
+            &app,
+            &missing_binding_event,
+            Some(&stripe_signature(&missing_binding_event))
+        )
+        .await,
+        StatusCode::OK
+    );
+    let missing_binding_receipt: (i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(processed_at) FROM stripe_webhook_events WHERE event_id = $1",
+    )
+    .bind(missing_binding_event_id)
+    .fetch_one(&pool)
+    .await
+    .expect("missing-binding webhook receipt count");
+    assert_eq!(missing_binding_receipt.0, 1);
+    assert_eq!(missing_binding_receipt.1, 1);
+    let paid_through_after_missing_binding: i64 = sqlx::query_scalar(
+        "SELECT paid_through_epoch FROM billing_personal_accounts WHERE user_id = $1",
+    )
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("billing update despite missing coverage binding");
+    assert_eq!(paid_through_after_missing_binding, period_end);
+
+    // A fully credited invoice cannot prove Cloud coverage, but its signed paid event still
+    // advances billing and is acknowledged so Stripe does not retry a permanent evidence gap.
+    let credited_event_id = format!("evt_coverage_credited_invoice_{fixture}");
+    let mut credited_invoice = invoice.clone();
+    credited_invoice["amount_paid"] = serde_json::json!(0);
+    credited_invoice["amount_due"] = serde_json::json!(0);
+    let credited_event = serde_json::json!({
+        "id":credited_event_id, "created":now + 4,
+        "api_version":STRIPE_API_VERSION, "type":"invoice.paid", "livemode":false,
+        "data":{"object":credited_invoice}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(
+            &app,
+            &credited_event,
+            Some(&stripe_signature(&credited_event))
+        )
+        .await,
+        StatusCode::OK
+    );
+    let credited_receipt: (i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(processed_at) FROM stripe_webhook_events WHERE event_id = $1",
+    )
+    .bind(&credited_event_id)
+    .fetch_one(&pool)
+    .await
+    .expect("credited invoice receipt");
+    assert_eq!(credited_receipt.0, 1);
+    assert_eq!(credited_receipt.1, 1);
+    let credited_coverage_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_provider_event_receipts WHERE event_id = $1",
+    )
+    .bind(&credited_event_id)
+    .fetch_one(&pool)
+    .await
+    .expect("no coverage receipt for unsupported settlement");
+    assert_eq!(credited_coverage_rows, 0);
+    let paid_through_after_credit: i64 = sqlx::query_scalar(
+        "SELECT paid_through_epoch FROM billing_personal_accounts WHERE user_id = $1",
+    )
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("billing update despite unsupported coverage settlement");
+    assert_eq!(paid_through_after_credit, period_end);
+
+    assert_eq!(
+        post_webhook(
+            &app,
+            &invoice_event,
+            Some(&stripe_signature(&invoice_event))
+        )
+        .await,
+        StatusCode::OK
+    );
+    let (queued_status, queued_view) = get_eligibility(&app, &token).await;
+    assert_eq!(queued_status, StatusCode::OK);
+    assert_eq!(queued_view["state"], "unavailable");
+
+    let provider_rows: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM cloud_provider_event_receipts WHERE event_id = $1), \
+                (SELECT count(*) FROM cloud_provider_allocations WHERE external_allocation_reference = $2), \
+                (SELECT count(*) FROM cloud_provider_refresh_jobs WHERE event_id = $1)",
+    )
+    .bind(format!("evt_coverage_invoice_{fixture}"))
+    .bind(&allocation_reference)
+    .fetch_one(&pool)
+    .await
+    .expect("provider coverage intake rows");
+    assert_eq!(provider_rows, (1, 1, 1));
+    let stored_payment: String = sqlx::query_scalar(
+        "SELECT payment_reference FROM billing_personal_accounts WHERE user_id = $1",
+    )
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("paid invoice settlement");
+    assert_eq!(stored_payment, "pi_coverage_person");
+
+    let mut executor =
+        sotto_server::cloud_provider_stripe_personal_refresh::PersonalStripeRefreshExecutor::new(
+            pool.clone(),
+            stripe,
+            coverage,
+        );
+    let worker_outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        sotto_server::cloud_provider_refresh_worker::run_once(
+            &pool,
+            &format!("coverage-worker-{fixture}"),
+            &mut executor,
+        ),
+    )
+    .await
+    .expect("personal Stripe reads must not hold the only database connection")
+    .expect("personal coverage worker run");
+    assert_eq!(
+        worker_outcome,
+        sotto_server::cloud_provider_refresh_worker::RefreshWorkerOutcome::Completed
+    );
+    let (projected_status, projected_view) = get_eligibility(&app, &token).await;
+    assert_eq!(projected_status, StatusCode::OK);
+    assert_eq!(projected_view["state"], "paid");
+    assert_eq!(
+        sotto_server::cloud_action_policy::decide(
+            sotto_server::cloud_action_policy::ActionClass::SecretRead,
+            sotto_server::person_eligibility::EligibilityState::Paid,
+        ),
+        sotto_server::cloud_action_policy::ShadowDecision::Allowed
+    );
+
+    // A processed redelivery must be acknowledged from its durable receipt without depending
+    // on the current Stripe binding or making another provider read.
+    let replaced_reference = format!("alloc_replaced_{fixture}");
+    sqlx::query(
+        "UPDATE billing_personal_accounts SET allocation_reference = $2 WHERE user_id = $1",
+    )
+    .bind(&user_id)
+    .bind(replaced_reference)
+    .execute(&pool)
+    .await
+    .expect("replace personal binding after accepted invoice");
+    assert_eq!(
+        post_webhook(
+            &app,
+            &invoice_event,
+            Some(&stripe_signature(&invoice_event))
+        )
+        .await,
+        StatusCode::OK
+    );
+    sqlx::query(
+        "UPDATE billing_personal_accounts SET allocation_reference = $2, \
+         stripe_coverage_binding_required = FALSE WHERE user_id = $1",
+    )
+    .bind(&user_id)
+    .bind(&allocation_reference)
+    .execute(&pool)
+    .await
+    .expect("mark migrated personal account as legacy-bound");
+
+    // Accounts created before coverage binding was introduced cannot have the new reference in
+    // Stripe metadata. They still receive their billing update, without creating coverage work.
+    let mut legacy_invoice = invoice.clone();
+    legacy_invoice
+        .as_object_mut()
+        .expect("invoice object")
+        .remove("metadata");
+    legacy_invoice["parent"]["subscription_details"]["metadata"] = serde_json::json!({
+        "personal_user_id": user_id,
+        "operation_id": operation_id
+    });
+    legacy_invoice["lines"]["data"][0]
+        .as_object_mut()
+        .expect("invoice line")
+        .remove("metadata");
+    let legacy_event_id = format!("evt_coverage_legacy_invoice_{fixture}");
+    let legacy_invoice_event = serde_json::json!({
+        "id":legacy_event_id, "created":now + 6,
+        "api_version":STRIPE_API_VERSION, "type":"invoice.paid", "livemode":false,
+        "data":{"object":legacy_invoice}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(
+            &app,
+            &legacy_invoice_event,
+            Some(&stripe_signature(&legacy_invoice_event))
+        )
+        .await,
+        StatusCode::OK
+    );
+    let legacy_provider_work: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM cloud_provider_event_receipts WHERE event_id = $1), \
+                (SELECT count(*) FROM cloud_provider_refresh_jobs WHERE event_id = $1)",
+    )
+    .bind(&legacy_event_id)
+    .fetch_one(&pool)
+    .await
+    .expect("legacy invoice must not enqueue provider work");
+    assert_eq!(legacy_provider_work, (0, 0));
+    let legacy_receipt_processed: bool = sqlx::query_scalar(
+        "SELECT processed_at IS NOT NULL FROM stripe_webhook_events WHERE event_id = $1",
+    )
+    .bind(&legacy_event_id)
+    .fetch_one(&pool)
+    .await
+    .expect("legacy invoice webhook receipt");
+    assert!(legacy_receipt_processed);
+
+    // Remove the queue-owned and provider rows first; the beneficiary/source FKs deliberately
+    // prevent ordinary user deletion while evidence exists.
+    sqlx::query("DELETE FROM cloud_provider_invalidation_associations WHERE event_id = $1")
+        .bind(format!("evt_coverage_invoice_{fixture}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_provider_event_receipts WHERE event_id = $1")
+        .bind(format!("evt_coverage_invoice_{fixture}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_provider_allocations WHERE external_allocation_reference = $1")
+        .bind(&allocation_reference)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_coverage_sources WHERE beneficiary_id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE cloud_coverage_coordinators SET current_attempt_id = NULL WHERE beneficiary_id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    for table in [
+        "cloud_coverage_collection_attempts",
+        "cloud_coverage_coordinators",
+    ] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE beneficiary_id = $1"))
+            .bind(&user_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query("DELETE FROM cloud_provider_payers WHERE payer_kind = 'personal' AND provider_customer_id = 'cus_coverage_person'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM stripe_subscription_watermarks WHERE event_id = ANY($1)")
+        .bind(vec![
+            format!("evt_coverage_invoice_{fixture}"),
+            format!("evt_coverage_checkout_{fixture}"),
+            format!("evt_coverage_legacy_invoice_{fixture}"),
+        ])
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM stripe_webhook_events WHERE event_id = ANY($1)")
+        .bind(vec![
+            format!("evt_coverage_invoice_{fixture}"),
+            format!("evt_coverage_checkout_{fixture}"),
+            format!("evt_coverage_legacy_invoice_{fixture}"),
+        ])
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "DELETE FROM billing_personal_events WHERE operation_id IN \
+         (SELECT operation_id FROM billing_operations WHERE actor_user_id = $1)",
+    )
+    .bind(&user_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM billing_personal_accounts WHERE user_id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM billing_operations WHERE actor_user_id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_coverage_heads WHERE beneficiary_id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_coverage_revision_facts WHERE beneficiary_id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_coverage_revisions WHERE beneficiary_id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    stripe_task.abort();
+}
+
+#[tokio::test]
+async fn signed_failed_renewal_is_persisted_before_the_repair_scan_window() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let fixture = Uuid::new_v4().simple().to_string();
+    let user_id = format!("billing-renewal-user-{fixture}");
+    let account_id = format!("acct_renewal_{fixture}");
+    let customer_id = format!("cus_renewal_{fixture}");
+    let subscription_id = format!("sub_renewal_{fixture}");
+    let allocation_reference = format!("alloc_renewal_{fixture}");
+    let allocation_id = format!("allocation_renewal_{fixture}");
+    let payer_id = format!("payer_renewal_{fixture}");
+    let source_id = format!("source_renewal_{fixture}");
+    let event_id = format!("evt_renewal_{fixture}");
+    let update_event_id = format!("evt_zz_subscription_updated_{fixture}");
+    let invoice_id = format!("in_failed_{fixture}");
+    seed_user(&pool, &user_id).await;
+    let operation_id =
+        seed_personal_account(&pool, &user_id, &format!("renewal-failure-{fixture}")).await;
+    let paid_through = 172_800;
+    sqlx::query(
+        "UPDATE billing_personal_accounts SET state='active', stripe_customer_id=$2, \
+           stripe_subscription_id=$3, paid_through_epoch=$4, paid_through_date=$5 \
+         WHERE user_id=$1",
+    )
+    .bind(&user_id)
+    .bind(&customer_id)
+    .bind(&subscription_id)
+    .bind(paid_through)
+    .bind(
+        FoundingDate::from_unix_seconds(paid_through)
+            .unwrap()
+            .to_string(),
+    )
+    .execute(&pool)
+    .await
+    .expect("activate the personal renewal notice fixture");
+
+    let coverage = StripeCoverageConfig::new(
+        &account_id,
+        ProviderEnvironment::Test,
+        "price_renewal_month",
+        "price_renewal_year",
+    )
+    .unwrap();
+    let context = ProviderContext::new("stripe", &account_id, ProviderEnvironment::Test).unwrap();
+    let allocation = VerifiedAllocation::new(
+        &allocation_id,
+        &payer_id,
+        &customer_id,
+        ProviderPayerKind::Personal,
+        &user_id,
+        &subscription_id,
+        "si_renewal",
+        &allocation_reference,
+        &source_id,
+        0,
+        None,
+        AllocationState::Active,
+        format!("stripe:renewal-owner:{fixture}"),
+    )
+    .unwrap();
+    let mut register = pool.begin().await.expect("begin allocation registration");
+    register_verified_allocation(&mut register, &context, &allocation)
+        .await
+        .expect("register the personal allocation");
+    register
+        .commit()
+        .await
+        .expect("commit allocation registration");
+
+    let paid_invoice = serde_json::json!({
+        "id":format!("in_paid_{fixture}"), "customer":customer_id,
+        "parent":{"type":"subscription_details", "subscription_details":{"subscription":subscription_id}},
+        "status":"paid", "currency":"gbp", "amount_paid":299, "amount_due":299,
+        "amount_remaining":0, "amount_overpaid":0, "amount_paid_off_stripe":0, "livemode":false,
+        "metadata":{"sotto_allocation_reference":allocation_reference}
+    });
+    let open_invoice = serde_json::json!({
+        "id":invoice_id, "customer":customer_id,
+        "parent":{"type":"subscription_details", "subscription_details":{"subscription":subscription_id}},
+        "status":"open", "currency":"gbp", "amount_paid":0, "amount_due":299,
+        "amount_remaining":299, "amount_overpaid":0, "amount_paid_off_stripe":0, "livemode":false,
+        "metadata":{"sotto_allocation_reference":allocation_reference}
+    });
+    let paid_line = serde_json::json!({
+        "id":format!("il_paid_{fixture}"), "quantity":1, "livemode":false,
+        "parent":{"type":"subscription_item_details", "subscription_item_details":{
+            "subscription":subscription_id, "subscription_item":"si_renewal", "proration":false
+        }},
+        "pricing":{"type":"price_details", "price_details":{"price":"price_renewal_month"}},
+        "period":{"start":86_400, "end":172_800}
+    });
+    let failed_line = serde_json::json!({
+        "id":format!("il_failed_{fixture}"), "invoice":invoice_id, "quantity":1, "livemode":false,
+        "parent":{"type":"subscription_item_details", "subscription_item_details":{
+            "subscription":subscription_id, "subscription_item":"si_renewal", "proration":false
+        }},
+        "pricing":{"type":"price_details", "price_details":{"price":"price_renewal_month"}},
+        "period":{"start":172_800, "end":259_200}
+    });
+    let event_payload = serde_json::json!({
+        "id":event_id, "created":259_200, "api_version":STRIPE_API_VERSION,
+        "type":"invoice.payment_failed", "livemode":false,
+        "data":{"object":{
+            "object":"invoice", "id":invoice_id, "customer":customer_id,
+            "parent":{"type":"subscription_details", "subscription_details":{"subscription":subscription_id}},
+            "status":"open", "billing_reason":"subscription_cycle", "collection_method":"charge_automatically",
+            "currency":"gbp", "amount_due":299, "amount_remaining":299, "amount_paid":0,
+            "amount_overpaid":0, "amount_paid_off_stripe":0, "livemode":false,
+            "metadata":{"sotto_allocation_reference":allocation_reference},
+            "lines":{"object":"list", "has_more":false, "data":[failed_line]}
+        }}
+    })
+    .to_string();
+    let paid_id = paid_invoice["id"].as_str().unwrap().to_owned();
+    let listed_paid = paid_invoice.clone();
+    let mut paid_detail = paid_invoice.clone();
+    paid_detail["lines"] =
+        serde_json::json!({"object":"list", "data":[paid_line], "has_more":false});
+    let (origin, stripe_task) = stripe_mock_server(HashMap::from([
+        ("/v1/account".into(), serde_json::json!({"id":account_id, "object":"account", "livemode":false})),
+        (format!("/v1/subscriptions/{subscription_id}"), serde_json::json!({"id":subscription_id, "customer":customer_id, "status":"active", "livemode":false})),
+        ("/v1/invoices".into(), serde_json::json!({"object":"list", "data":[listed_paid, open_invoice], "has_more":false})),
+        (format!("/v1/invoices/{paid_id}"), paid_detail),
+        (format!("/v1/invoices/{paid_id}/lines"), serde_json::json!({"object":"list", "data":[paid_line], "has_more":false})),
+        ("/v1/invoice_payments".into(), serde_json::json!({"object":"list", "data":[{
+            "id":format!("inpay_{fixture}"), "invoice":paid_id, "status":"paid", "amount_paid":299,
+            "amount_requested":299, "currency":"gbp", "livemode":false,
+            "payment":{"type":"payment_intent", "payment_intent":format!("pi_{fixture}")}
+        }], "has_more":false})),
+        ("/v1/credit_notes".into(), serde_json::json!({"object":"list", "data":[], "has_more":false})),
+        ("/v1/refunds".into(), serde_json::json!({"object":"list", "data":[], "has_more":false})),
+        ("/v1/disputes".into(), serde_json::json!({"object":"list", "data":[], "has_more":false})),
+    ])).await;
+    let stripe = StripeReadClient::for_test(
+        "sk_test_renewal",
+        &coverage,
+        origin,
+        StripeReadLimits::default(),
+    )
+    .unwrap();
+    let provider = Arc::new(TestProvider {
+        observation: SubscriptionObservation::Missing,
+        personal_period_end: None,
+    });
+    let billing = BillingState::with_provider_and_cloud_sales(
+        provider,
+        WEBHOOK_SECRET.into(),
+        "https://app.sotto.test".into(),
+        false,
+    )
+    .with_personal_coverage(coverage, stripe, true);
+    let app = app_with_billing_mode(
+        pool.clone(),
+        Some(billing),
+        sotto_server::config::DeploymentMode::Cloud,
+    );
+
+    // Subscription state owns the watermark even when it arrives before the payment failure.
+    // Use the same Stripe timestamp and a lexically higher event id to pin the delivery order
+    // that previously caused the failure evidence and customer notice to be dropped.
+    let subscription_update = serde_json::json!({
+        "id": update_event_id,
+        "created": 259_200,
+        "api_version": STRIPE_API_VERSION,
+        "type": "customer.subscription.updated",
+        "livemode": false,
+        "data": {"object": {
+            "object": "subscription",
+            "id": subscription_id,
+            "status": "past_due",
+            "cancel_at_period_end": false,
+            "metadata": {"personal_user_id": user_id, "operation_id": operation_id}
+        }}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(
+            &app,
+            &subscription_update,
+            Some(&stripe_signature(&subscription_update))
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    assert_eq!(
+        post_webhook(
+            &app,
+            &event_payload,
+            Some(&stripe_signature(&event_payload))
+        )
+        .await,
+        StatusCode::OK
+    );
+    let accepted: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_provider_stripe_renewal_failures WHERE event_id = $1",
+    )
+    .bind(&event_id)
+    .fetch_one(&pool)
+    .await
+    .expect("query directly accepted failure evidence");
+    assert_eq!(accepted, 1);
+    let failure_notice_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_notice_outbox WHERE recipient_user_id=$1 AND kind='failed_renewal'",
+    )
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("query the notice committed for the failure event");
+    assert_eq!(failure_notice_count, 1);
+    let watermark_event_id: String = sqlx::query_scalar(
+        "SELECT event_id FROM stripe_subscription_watermarks WHERE subscription_id=$1",
+    )
+    .bind(&subscription_id)
+    .fetch_one(&pool)
+    .await
+    .expect("query the subscription state watermark");
+    assert_eq!(watermark_event_id, update_event_id);
+    let processed: bool = sqlx::query_scalar(
+        "SELECT processed_at IS NOT NULL FROM stripe_webhook_events WHERE event_id = $1",
+    )
+    .bind(&event_id)
+    .fetch_one(&pool)
+    .await
+    .expect("query processed failure webhook");
+    assert!(processed);
+    assert_eq!(
+        post_webhook(
+            &app,
+            &event_payload,
+            Some(&stripe_signature(&event_payload))
+        )
+        .await,
+        StatusCode::OK,
+        "a duplicate signed failure is acknowledged as a harmless replay"
+    );
+    let replayed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_provider_stripe_renewal_failures WHERE event_id = $1",
+    )
+    .bind(&event_id)
+    .fetch_one(&pool)
+    .await
+    .expect("query replayed failure evidence");
+    assert_eq!(replayed, 1);
+
+    sqlx::query("DELETE FROM cloud_provider_stripe_renewal_failures WHERE event_id = $1")
+        .bind(&event_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_provider_invalidation_associations WHERE event_id = $1")
+        .bind(&event_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_provider_event_receipts WHERE event_id = $1")
+        .bind(&event_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM stripe_subscription_watermarks WHERE subscription_id = $1")
+        .bind(&subscription_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM stripe_webhook_events WHERE event_id = $1")
+        .bind(&event_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM stripe_webhook_events WHERE event_id = $1")
+        .bind(&update_event_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_notice_outbox WHERE recipient_user_id=$1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM billing_personal_accounts WHERE user_id=$1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM billing_operations WHERE operation_id=$1")
+        .bind(&operation_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_provider_allocations WHERE allocation_id = $1")
+        .bind(&allocation_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_coverage_sources WHERE source_id = $1")
+        .bind(&source_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_provider_payers WHERE payer_id = $1")
+        .bind(&payer_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_coverage_coordinators WHERE beneficiary_id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    for table in [
+        "cloud_coverage_heads",
+        "cloud_coverage_revision_facts",
+        "cloud_coverage_revisions",
+    ] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE beneficiary_id = $1"))
+            .bind(&user_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    stripe_task.abort();
+}
+
+#[tokio::test]
+async fn delayed_personal_checkout_payment_honours_timely_founding_reservation() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let fixture = Uuid::new_v4().simple().to_string();
+    let user_id = format!("billing-user-delayed-founding-{fixture}");
+    seed_user(&pool, &user_id).await;
+    let operation_id =
+        seed_personal_account(&pool, &user_id, &format!("delayed-founding-{fixture}")).await;
+    let checkout_created_at = 1_800_000_000;
+    let quote_expires_at = checkout_created_at + 1_800;
+    let checkout_deadline = quote_expires_at + 1_800;
+    sqlx::query(
+        "UPDATE billing_personal_accounts SET offer = 'founding_monthly', pending_expires_at_epoch = $2 \
+         WHERE operation_id = $1",
+    )
+    .bind(&operation_id)
+    .bind(checkout_deadline)
+    .execute(&pool)
+    .await
+    .expect("set founding offer");
+    sqlx::query(
+        "UPDATE billing_operations SET offer = 'founding_monthly', quote_expires_at_epoch = $2 \
+         WHERE operation_id = $1",
+    )
+    .bind(&operation_id)
+    .bind(quote_expires_at)
+    .execute(&pool)
+    .await
+    .expect("set founding quote");
+    let mut reservation_tx = pool.begin().await.expect("begin founding reservation");
+    assert!(matches!(
+        reserve_with_payer_kind_until(
+            &mut reservation_tx,
+            &format!("founding:{operation_id}"),
+            &operation_id,
+            &user_id,
+            FoundingPayerKind::Personal,
+            &user_id,
+            FoundingOffer::Monthly,
+            1,
+            quote_expires_at,
+            checkout_deadline,
+            checkout_created_at,
+        )
+        .await
+        .expect("reserve founding place"),
+        ReservationOutcome::Created(_)
+    ));
+    reservation_tx.commit().await.expect("commit reservation");
+
+    let app = app_with_provider(
+        pool.clone(),
+        Arc::new(TestProvider {
+            observation: SubscriptionObservation::Missing,
+            personal_period_end: Some(1_900_000_000),
+        }),
+    );
+    let checkout_completed_at = checkout_created_at + 1_700;
+    let completed = serde_json::json!({
+        "id": format!("evt_delayed_founding_checkout_completed_{fixture}"),
+        "created": checkout_completed_at,
+        "api_version": STRIPE_API_VERSION,
+        "type": "checkout.session.completed",
+        "data": { "object": {
+            "id": "cs_delayed_founding",
+            "client_reference_id": format!("personal:{operation_id}"),
+            "payment_status": "unpaid",
+            "customer": "cus_delayed_founding",
+            "subscription": "sub_delayed_founding",
+            "payment_intent": "pi_delayed_founding"
+        }}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(&app, &completed, Some(&stripe_signature(&completed))).await,
+        StatusCode::OK
+    );
+    let recorded_completion: Option<i64> = sqlx::query_scalar(
+        "SELECT checkout_completed_by_epoch FROM billing_founding_reservations WHERE operation_id = $1",
+    )
+    .bind(&operation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("record Checkout completion timestamp");
+    assert_eq!(recorded_completion, Some(checkout_completed_at));
+
+    let paid_at = checkout_completed_at + 5 * 24 * 60 * 60;
+    let succeeded = serde_json::json!({
+        "id": format!("evt_delayed_founding_payment_succeeded_{fixture}"),
+        "created": paid_at,
+        "api_version": STRIPE_API_VERSION,
+        "type": "checkout.session.async_payment_succeeded",
+        "data": { "object": {
+            "id": "cs_delayed_founding",
+            "client_reference_id": format!("personal:{operation_id}"),
+            "payment_status": "paid",
+            "status": "complete",
+            "expires_at": checkout_deadline,
+            "customer": "cus_delayed_founding",
+            "subscription": "sub_delayed_founding",
+            "payment_intent": "pi_delayed_founding"
+        }}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(&app, &succeeded, Some(&stripe_signature(&succeeded))).await,
+        StatusCode::OK
+    );
+    let (account_state, reservation_state): (String, String) = sqlx::query_as(
+        "SELECT a.state, r.status FROM billing_personal_accounts a \
+         JOIN billing_founding_reservations r ON r.operation_id = a.operation_id \
+         WHERE a.operation_id = $1",
+    )
+    .bind(&operation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read delayed Checkout settlement");
+    assert_eq!(account_state, "active");
+    assert_eq!(reservation_state, "confirmed");
+
+    sqlx::query("DELETE FROM billing_founding_schedule_jobs WHERE beneficiary_id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("clean founding schedule job");
+    sqlx::query("DELETE FROM billing_founding_awards WHERE beneficiary_id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("clean founding award");
+    sqlx::query("DELETE FROM billing_founding_reservations WHERE operation_id = $1")
+        .bind(&operation_id)
+        .execute(&pool)
+        .await
+        .expect("clean founding reservation");
+    sqlx::query("DELETE FROM billing_personal_accounts WHERE operation_id = $1")
+        .bind(&operation_id)
+        .execute(&pool)
+        .await
+        .expect("clean personal account");
+    sqlx::query("DELETE FROM billing_personal_events WHERE operation_id = $1")
+        .bind(&operation_id)
+        .execute(&pool)
+        .await
+        .expect("clean personal billing events");
+    sqlx::query("DELETE FROM billing_operations WHERE operation_id = $1")
+        .bind(&operation_id)
+        .execute(&pool)
+        .await
+        .expect("clean billing operation");
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("clean delayed founding user");
 }
 
 #[tokio::test]

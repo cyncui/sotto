@@ -557,6 +557,29 @@ pub async fn record_verified_event(
     }
 }
 
+/// Register the trusted payer, allocation and source binding for a verified provider event.
+///
+/// The caller owns the transaction and should record the event receipt first, then call this and
+/// accept the corresponding invalidation before committing. Reconciliation preparation uses the
+/// same idempotent registration path.
+pub async fn register_verified_allocation(
+    tx: &mut Transaction<'_, Postgres>,
+    context: &ProviderContext,
+    allocation: &VerifiedAllocation,
+) -> Result<(), ProviderAdapterError> {
+    context.validate()?;
+    allocation.validate()?;
+    ensure_payer(tx, context, allocation).await?;
+    ensure_allocation(tx, context, allocation).await?;
+    register_source(
+        tx,
+        &scoped_identity("provider-source-v1", &[&allocation.allocation_id]),
+        &source_binding(context, allocation),
+    )
+    .await?;
+    Ok(())
+}
+
 /// Accept one verified provider change and advance the beneficiary fence exactly once.
 ///
 /// The event receipt is locked before the coordinator, matching preparation and completion's
@@ -593,19 +616,6 @@ pub async fn accept_provider_invalidation(
     if status == "rejected" {
         return Err(ProviderAdapterError::EventRejected);
     }
-    if status == "applied"
-        && (receipt
-            .try_get::<Option<String>, _>("allocation_id")?
-            .as_deref()
-            != Some(allocation.allocation_id.as_str())
-            || receipt
-                .try_get::<Option<String>, _>("coverage_source_id")?
-                .as_deref()
-                != Some(allocation.source_id.as_str()))
-    {
-        return Err(ProviderAdapterError::AllocationConflict);
-    }
-
     let source = sqlx::query(
         "SELECT beneficiary_id, provider_namespace, external_allocation_reference, \
                 ownership_evidence_reference \
@@ -643,12 +653,13 @@ pub async fn accept_provider_invalidation(
                 coverage_source_id, accepted_generation \
          FROM cloud_provider_invalidation_associations \
          WHERE provider_namespace = $1 AND provider_account_id = $2 \
-           AND provider_environment = $3 AND event_id = $4",
+           AND provider_environment = $3 AND event_id = $4 AND beneficiary_id = $5",
     )
     .bind(&context.namespace)
     .bind(&context.account_id)
     .bind(context.environment.as_str())
     .bind(&event.event_id)
+    .bind(&allocation.beneficiary_id)
     .fetch_optional(&mut **tx)
     .await?;
     if let Some(existing) = existing {
@@ -662,10 +673,16 @@ pub async fn accept_provider_invalidation(
             return Err(ProviderAdapterError::InvalidationConflict);
         }
         let generation = existing.try_get("accepted_generation")?;
-        if ingest_enabled {
+        if status == "pending" {
+            ensure_event_scope(tx, context, event, &allocation.beneficiary_id).await?;
+        }
+        if ingest_enabled && status == "pending" {
             enqueue_refresh_job(tx, context, event, allocation).await?;
         }
         return Ok(InvalidationDisposition::AlreadyAccepted { generation });
+    }
+    if status == "applied" {
+        return Err(ProviderAdapterError::EventNotPending);
     }
 
     let next_generation = generation
@@ -678,7 +695,7 @@ pub async fn accept_provider_invalidation(
           provider_created_at, normalized_payload_hash, beneficiary_id, allocation_id, \
           coverage_source_id, accepted_generation) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
-         ON CONFLICT (provider_namespace, provider_account_id, provider_environment, event_id) \
+         ON CONFLICT (provider_namespace, provider_account_id, provider_environment, event_id, beneficiary_id) \
          DO NOTHING",
     )
     .bind(&context.namespace)
@@ -706,12 +723,13 @@ pub async fn accept_provider_invalidation(
                     coverage_source_id, accepted_generation \
              FROM cloud_provider_invalidation_associations \
              WHERE provider_namespace = $1 AND provider_account_id = $2 \
-               AND provider_environment = $3 AND event_id = $4",
+               AND provider_environment = $3 AND event_id = $4 AND beneficiary_id = $5",
         )
         .bind(&context.namespace)
         .bind(&context.account_id)
         .bind(context.environment.as_str())
         .bind(&event.event_id)
+        .bind(&allocation.beneficiary_id)
         .fetch_optional(&mut **tx)
         .await?
         .ok_or(ProviderAdapterError::InvalidationConflict)?;
@@ -725,7 +743,10 @@ pub async fn accept_provider_invalidation(
             return Err(ProviderAdapterError::InvalidationConflict);
         }
         let generation = existing.try_get("accepted_generation")?;
-        if ingest_enabled {
+        if status == "pending" {
+            ensure_event_scope(tx, context, event, &allocation.beneficiary_id).await?;
+        }
+        if ingest_enabled && status == "pending" {
             enqueue_refresh_job(tx, context, event, allocation).await?;
         }
         return Ok(InvalidationDisposition::AlreadyAccepted { generation });
@@ -742,12 +763,34 @@ pub async fn accept_provider_invalidation(
     if updated.rows_affected() != 1 {
         return Err(ProviderAdapterError::InvalidationConflict);
     }
+    ensure_event_scope(tx, context, event, &allocation.beneficiary_id).await?;
     if ingest_enabled {
         enqueue_refresh_job(tx, context, event, allocation).await?;
     }
     Ok(InvalidationDisposition::Accepted {
         generation: next_generation,
     })
+}
+
+async fn ensure_event_scope(
+    tx: &mut Transaction<'_, Postgres>,
+    context: &ProviderContext,
+    event: &VerifiedProviderEvent,
+    beneficiary_id: &str,
+) -> Result<(), ProviderAdapterError> {
+    sqlx::query(
+        "INSERT INTO cloud_provider_event_scopes \
+         (provider_namespace, provider_account_id, provider_environment, event_id, beneficiary_id) \
+         VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
+    )
+    .bind(&context.namespace)
+    .bind(&context.account_id)
+    .bind(context.environment.as_str())
+    .bind(&event.event_id)
+    .bind(beneficiary_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 async fn enqueue_refresh_job(
@@ -1014,8 +1057,7 @@ pub async fn prepare_verified_event(
     validate_event_allocation(event, allocation)?;
     let receipt = sqlx::query(
         "SELECT event_type, provider_created_at, subscription_id, allocation_reference, \
-                provider_object_id, normalized_payload_hash, status, collection_beneficiary_id, \
-                collection_attempt_id, collection_run_id \
+                provider_object_id, normalized_payload_hash, status \
          FROM cloud_provider_event_receipts \
          WHERE provider_namespace = $1 AND provider_account_id = $2 \
            AND provider_environment = $3 AND event_id = $4 FOR UPDATE",
@@ -1032,6 +1074,24 @@ pub async fn prepare_verified_event(
     if status != "pending" {
         return Err(ProviderAdapterError::EventNotPending);
     }
+    ensure_event_scope(tx, context, event, &allocation.beneficiary_id).await?;
+    let scope = sqlx::query(
+        "SELECT status \
+         FROM cloud_provider_event_scopes \
+         WHERE provider_namespace = $1 AND provider_account_id = $2 \
+           AND provider_environment = $3 AND event_id = $4 AND beneficiary_id = $5 \
+         FOR UPDATE",
+    )
+    .bind(&context.namespace)
+    .bind(&context.account_id)
+    .bind(context.environment.as_str())
+    .bind(&event.event_id)
+    .bind(&allocation.beneficiary_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if scope.try_get::<String, _>("status")? != "pending" {
+        return Err(ProviderAdapterError::EventNotPending);
+    }
 
     let attempt_id = scoped_identity(
         "provider-collection-v1",
@@ -1040,6 +1100,7 @@ pub async fn prepare_verified_event(
             &context.account_id,
             context.environment.as_str(),
             &event.event_id,
+            &allocation.beneficiary_id,
             run_id,
         ],
     );
@@ -1064,10 +1125,10 @@ pub async fn prepare_verified_event(
     }
     validate_provider_bindings(tx, context, &ticket.source_bindings).await?;
     let updated = sqlx::query(
-        "UPDATE cloud_provider_event_receipts SET collection_beneficiary_id = $5, \
-                collection_attempt_id = $6, collection_run_id = $7 \
+        "UPDATE cloud_provider_event_scopes SET collection_attempt_id = $6, collection_run_id = $7 \
          WHERE provider_namespace = $1 AND provider_account_id = $2 \
-           AND provider_environment = $3 AND event_id = $4 AND status = 'pending'",
+           AND provider_environment = $3 AND event_id = $4 AND beneficiary_id = $5 \
+           AND status = 'pending'",
     )
     .bind(&context.namespace)
     .bind(&context.account_id)
@@ -1109,8 +1170,7 @@ pub async fn complete_verified_event(
     }
     let receipt = sqlx::query(
         "SELECT event_type, provider_created_at, subscription_id, allocation_reference, \
-                provider_object_id, normalized_payload_hash, status, collection_beneficiary_id, \
-                collection_attempt_id, collection_run_id \
+                provider_object_id, normalized_payload_hash, status \
          FROM cloud_provider_event_receipts \
          WHERE provider_namespace = $1 AND provider_account_id = $2 \
            AND provider_environment = $3 AND event_id = $4 FOR UPDATE",
@@ -1127,13 +1187,29 @@ pub async fn complete_verified_event(
     if status != "pending" {
         return Err(ProviderAdapterError::EventNotPending);
     }
-    let stored_beneficiary: Option<String> = receipt.try_get("collection_beneficiary_id")?;
-    let stored_attempt: Option<String> = receipt.try_get("collection_attempt_id")?;
-    let stored_run: Option<String> = receipt.try_get("collection_run_id")?;
-    if stored_beneficiary.as_deref() != Some(allocation.beneficiary_id.as_str())
+    if preparation.ticket.attempt_id != preparation.attempt_id {
+        return Err(ProviderAdapterError::CollectionSuperseded);
+    }
+    let scope = sqlx::query(
+        "SELECT status, collection_attempt_id, collection_run_id \
+         FROM cloud_provider_event_scopes \
+         WHERE provider_namespace = $1 AND provider_account_id = $2 \
+           AND provider_environment = $3 AND event_id = $4 AND beneficiary_id = $5 \
+         FOR UPDATE",
+    )
+    .bind(&context.namespace)
+    .bind(&context.account_id)
+    .bind(context.environment.as_str())
+    .bind(&event.event_id)
+    .bind(&allocation.beneficiary_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(ProviderAdapterError::CollectionSuperseded)?;
+    let stored_attempt: Option<String> = scope.try_get("collection_attempt_id")?;
+    let stored_run: Option<String> = scope.try_get("collection_run_id")?;
+    if scope.try_get::<String, _>("status")? != "pending"
         || stored_attempt.as_deref() != Some(preparation.attempt_id.as_str())
         || stored_run.as_deref() != Some(preparation.run_id.as_str())
-        || preparation.ticket.attempt_id != preparation.attempt_id
     {
         return Err(ProviderAdapterError::CollectionSuperseded);
     }
@@ -1155,8 +1231,25 @@ pub async fn complete_verified_event(
         other => ProviderAdapterError::Reconciliation(other),
     })?;
     let updated = sqlx::query(
-        "UPDATE cloud_provider_event_receipts SET status = 'applied', processed_at = now(), \
-                allocation_id = $5, coverage_source_id = $6, projection_revision = $7 \
+        "UPDATE cloud_provider_event_scopes SET status = 'applied', processed_at = now(), \
+                projection_revision = $6 \
+         WHERE provider_namespace = $1 AND provider_account_id = $2 \
+           AND provider_environment = $3 AND event_id = $4 AND beneficiary_id = $5 \
+           AND status = 'pending'",
+    )
+    .bind(&context.namespace)
+    .bind(&context.account_id)
+    .bind(context.environment.as_str())
+    .bind(&event.event_id)
+    .bind(&allocation.beneficiary_id)
+    .bind(completed.revision)
+    .execute(&mut **tx)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(ProviderAdapterError::CollectionSuperseded);
+    }
+    let pending_scopes: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_provider_event_scopes \
          WHERE provider_namespace = $1 AND provider_account_id = $2 \
            AND provider_environment = $3 AND event_id = $4 AND status = 'pending'",
     )
@@ -1164,13 +1257,27 @@ pub async fn complete_verified_event(
     .bind(&context.account_id)
     .bind(context.environment.as_str())
     .bind(&event.event_id)
-    .bind(&allocation.allocation_id)
-    .bind(&allocation.source_id)
-    .bind(completed.revision)
-    .execute(&mut **tx)
+    .fetch_one(&mut **tx)
     .await?;
-    if updated.rows_affected() != 1 {
-        return Err(ProviderAdapterError::EventNotPending);
+    if pending_scopes == 0 {
+        let global = sqlx::query(
+            "UPDATE cloud_provider_event_receipts SET status = 'applied', processed_at = now(), \
+                    allocation_id = $5, coverage_source_id = $6, projection_revision = $7 \
+             WHERE provider_namespace = $1 AND provider_account_id = $2 \
+               AND provider_environment = $3 AND event_id = $4 AND status = 'pending'",
+        )
+        .bind(&context.namespace)
+        .bind(&context.account_id)
+        .bind(context.environment.as_str())
+        .bind(&event.event_id)
+        .bind(&allocation.allocation_id)
+        .bind(&allocation.source_id)
+        .bind(completed.revision)
+        .execute(&mut **tx)
+        .await?;
+        if global.rows_affected() != 1 {
+            return Err(ProviderAdapterError::EventNotPending);
+        }
     }
     Ok(ApplyReceipt {
         event_id: event.event_id.clone(),
@@ -1215,39 +1322,81 @@ pub async fn replay_verified_event(
     .await?
     .ok_or(ProviderAdapterError::EventMissing)?;
     verify_stored_event(&receipt, event)?;
-    let status: String = receipt.try_get("status")?;
-    if status != "applied" {
-        return Err(ProviderAdapterError::EventNotPending);
-    }
-    let allocation_id: String = receipt.try_get("allocation_id")?;
-    let source_id: String = receipt.try_get("coverage_source_id")?;
-    let revision: i64 = receipt.try_get("projection_revision")?;
-    let beneficiary_id: Option<String> = receipt.try_get("collection_beneficiary_id")?;
-    let attempt_id: Option<String> = receipt.try_get("collection_attempt_id")?;
-    if allocation_id != allocation.allocation_id
-        || source_id != allocation.source_id
-        || beneficiary_id
-            .as_deref()
-            .is_some_and(|beneficiary| beneficiary != allocation.beneficiary_id)
-    {
-        return Err(ProviderAdapterError::AllocationConflict);
-    }
-    let (beneficiary_id, attempt_id) = match (beneficiary_id, attempt_id) {
-        (None, None) => {
-            // Migration 0027 can only associate an applied legacy receipt when its completed
-            // attempt still exists. Preserve terminal idempotency for older rows without
-            // inventing a ticket.
-            return Ok(ApplyReceipt {
-                event_id: event.event_id.clone(),
+    let scope = sqlx::query(
+        "SELECT status, projection_revision, collection_attempt_id \
+         FROM cloud_provider_event_scopes \
+         WHERE provider_namespace = $1 AND provider_account_id = $2 \
+           AND provider_environment = $3 AND event_id = $4 AND beneficiary_id = $5",
+    )
+    .bind(&context.namespace)
+    .bind(&context.account_id)
+    .bind(context.environment.as_str())
+    .bind(&event.event_id)
+    .bind(&allocation.beneficiary_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let (beneficiary_id, attempt_id, revision, allocation_id, source_id) =
+        if let Some(scope) = scope {
+            if scope.try_get::<String, _>("status")? != "applied" {
+                return Err(ProviderAdapterError::EventNotPending);
+            }
+            let revision: i64 = scope.try_get("projection_revision")?;
+            let attempt_id: Option<String> = scope.try_get("collection_attempt_id")?;
+            let Some(attempt_id) = attempt_id else {
+                return Ok(ApplyReceipt {
+                    event_id: event.event_id.clone(),
+                    allocation_id: allocation.allocation_id.clone(),
+                    source_id: allocation.source_id.clone(),
+                    revision,
+                    outcome: ApplyDisposition::AlreadyApplied,
+                });
+            };
+            (
+                allocation.beneficiary_id.clone(),
+                attempt_id,
+                revision,
+                allocation.allocation_id.clone(),
+                allocation.source_id.clone(),
+            )
+        } else {
+            let status: String = receipt.try_get("status")?;
+            if status != "applied" {
+                return Err(ProviderAdapterError::EventNotPending);
+            }
+            let allocation_id: String = receipt.try_get("allocation_id")?;
+            let source_id: String = receipt.try_get("coverage_source_id")?;
+            let revision: i64 = receipt.try_get("projection_revision")?;
+            let beneficiary_id: Option<String> = receipt.try_get("collection_beneficiary_id")?;
+            let attempt_id: Option<String> = receipt.try_get("collection_attempt_id")?;
+            if allocation_id != allocation.allocation_id
+                || source_id != allocation.source_id
+                || beneficiary_id
+                    .as_deref()
+                    .is_some_and(|beneficiary| beneficiary != allocation.beneficiary_id)
+            {
+                return Err(ProviderAdapterError::AllocationConflict);
+            }
+            let (beneficiary_id, attempt_id) = match (beneficiary_id, attempt_id) {
+                (None, None) => {
+                    return Ok(ApplyReceipt {
+                        event_id: event.event_id.clone(),
+                        allocation_id,
+                        source_id,
+                        revision,
+                        outcome: ApplyDisposition::AlreadyApplied,
+                    });
+                }
+                (Some(beneficiary_id), Some(attempt_id)) => (beneficiary_id, attempt_id),
+                _ => return Err(ProviderAdapterError::EventConflict),
+            };
+            (
+                beneficiary_id,
+                attempt_id,
+                revision,
                 allocation_id,
                 source_id,
-                revision,
-                outcome: ApplyDisposition::AlreadyApplied,
-            });
-        }
-        (Some(beneficiary_id), Some(attempt_id)) => (beneficiary_id, attempt_id),
-        _ => return Err(ProviderAdapterError::EventConflict),
-    };
+            )
+        };
     ensure_payer(tx, context, allocation).await?;
     ensure_allocation(tx, context, allocation).await?;
     let ticket = begin_collection(tx, &beneficiary_id, &attempt_id).await?;

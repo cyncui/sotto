@@ -14,9 +14,15 @@ use crate::billing_catalogue::{BillingInterval, BillingOffer};
 
 pub const FOUNDING_CAPACITY: i64 = 100;
 pub const RESERVATION_SECONDS: i64 = 30 * 60;
+/// Keep a timely Checkout or scheduled sponsored place through the accepted 14-day settlement
+/// recovery window before treating a late payment as refundable.
+pub const SETTLEMENT_RECOVERY_SECONDS: i64 = 14 * 24 * 60 * 60;
 /// A Checkout Session is created after the quote, so its expiry may be one quote window beyond
 /// the reservation window while still satisfying Stripe's minimum lifetime.
 pub const MAX_RESERVATION_SECONDS: i64 = RESERVATION_SECONDS * 2;
+/// Sponsored scheduled additions can be charged at the next annual renewal plus the recovery
+/// window (at most one leap-year annual term plus 14 days).
+pub const MAX_CAPACITY_HOLD_SECONDS: i64 = 400 * 24 * 60 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FoundingCapacityStatus {
@@ -54,6 +60,13 @@ impl FoundingOffer {
         }
     }
 
+    pub const fn standard_billing_offer(self) -> BillingOffer {
+        match self {
+            Self::Monthly => BillingOffer::StandardMonthly,
+            Self::Annual => BillingOffer::StandardAnnual,
+        }
+    }
+
     pub const fn interval(self) -> BillingInterval {
         match self {
             Self::Monthly => BillingInterval::Month,
@@ -70,6 +83,21 @@ impl FoundingOffer {
             BillingOffer::FoundingMonthly => Some(Self::Monthly),
             BillingOffer::FoundingAnnual => Some(Self::Annual),
             BillingOffer::StandardMonthly | BillingOffer::StandardAnnual => None,
+        }
+    }
+
+    pub const fn for_billing_offer_interval(offer: BillingOffer) -> Self {
+        match offer {
+            BillingOffer::StandardMonthly | BillingOffer::FoundingMonthly => Self::Monthly,
+            BillingOffer::StandardAnnual | BillingOffer::FoundingAnnual => Self::Annual,
+        }
+    }
+
+    /// Number of billing periods covered by the founding price for this interval.
+    pub const fn founding_terms(self) -> i32 {
+        match self {
+            Self::Monthly => 12,
+            Self::Annual => 1,
         }
     }
 }
@@ -187,6 +215,19 @@ impl FoundingDate {
             ..target
         }
     }
+
+    pub fn anchored_term_end_epoch(
+        start_epoch: i64,
+        offer: FoundingOffer,
+        terms: i32,
+    ) -> Result<i64, CalendarError> {
+        if start_epoch < 0 || terms <= 0 {
+            return Err(CalendarError::InvalidDate);
+        }
+        let start = Self::from_unix_seconds(start_epoch)?;
+        let time_of_day = start_epoch.rem_euclid(86_400);
+        Ok(start.anchored_term_end(offer, terms).to_unix_seconds() + time_of_day)
+    }
 }
 
 impl fmt::Display for FoundingDate {
@@ -230,6 +271,8 @@ pub struct FoundingAward {
     pub cohort_ordinal: i64,
     pub original_start: FoundingDate,
     pub original_end: FoundingDate,
+    pub original_start_epoch: Option<i64>,
+    pub original_end_epoch: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -242,6 +285,7 @@ pub struct FoundingReservation {
     pub offer: FoundingOffer,
     pub quote_version: i64,
     pub quote_expires_at_epoch: i64,
+    pub reservation_expires_at_epoch: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -324,6 +368,36 @@ pub async fn reserve_with_payer_kind(
     quote_expires_at_epoch: i64,
     now_epoch: i64,
 ) -> Result<ReservationOutcome, FoundingAllocatorError> {
+    reserve_with_payer_kind_until(
+        tx,
+        reservation_id,
+        operation_id,
+        beneficiary_id,
+        payer_kind,
+        payer_id,
+        offer,
+        quote_version,
+        quote_expires_at_epoch,
+        quote_expires_at_epoch,
+        now_epoch,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn reserve_with_payer_kind_until(
+    tx: &mut Transaction<'_, Postgres>,
+    reservation_id: &str,
+    operation_id: &str,
+    beneficiary_id: &str,
+    payer_kind: FoundingPayerKind,
+    payer_id: &str,
+    offer: FoundingOffer,
+    quote_version: i64,
+    quote_expires_at_epoch: i64,
+    reservation_expires_at_epoch: i64,
+    now_epoch: i64,
+) -> Result<ReservationOutcome, FoundingAllocatorError> {
     validate_identity(reservation_id, "reservation_id")?;
     validate_identity(operation_id, "operation_id")?;
     validate_identity(beneficiary_id, "beneficiary_id")?;
@@ -340,6 +414,7 @@ pub async fn reserve_with_payer_kind(
             && existing.offer == offer
             && existing.quote_version == quote_version
             && existing.quote_expires_at_epoch == quote_expires_at_epoch
+            && existing.reservation_expires_at_epoch == reservation_expires_at_epoch
         {
             return Ok(ReservationOutcome::AlreadyExists(existing));
         }
@@ -354,6 +429,14 @@ pub async fn reserve_with_payer_kind(
     if quote_expires_at_epoch > latest_allowed_expiry {
         return Err(FoundingAllocatorError::InvalidField("quote_expiry"));
     }
+    let latest_capacity_hold = now_epoch
+        .checked_add(MAX_CAPACITY_HOLD_SECONDS)
+        .ok_or(FoundingAllocatorError::InvalidField("now_epoch"))?;
+    if reservation_expires_at_epoch < quote_expires_at_epoch
+        || reservation_expires_at_epoch > latest_capacity_hold
+    {
+        return Err(FoundingAllocatorError::InvalidField("reservation_expiry"));
+    }
     if load_award_by_beneficiary(tx, beneficiary_id)
         .await?
         .is_some()
@@ -362,7 +445,7 @@ pub async fn reserve_with_payer_kind(
     }
     let active_reservation: Option<String> = sqlx::query_scalar(
         "SELECT reservation_id FROM billing_founding_reservations \
-         WHERE beneficiary_id = $1 AND status = 'reserved' AND quote_expires_at_epoch > $2 \
+         WHERE beneficiary_id = $1 AND status = 'reserved' AND reservation_expires_at_epoch > $2 \
          FOR UPDATE",
     )
     .bind(beneficiary_id)
@@ -380,7 +463,7 @@ pub async fn reserve_with_payer_kind(
     sqlx::query(
         "INSERT INTO billing_founding_reservations \
          (reservation_id, operation_id, beneficiary_id, payer_kind, payer_id, offer, quote_version, \
-          quote_expires_at_epoch) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+          quote_expires_at_epoch, reservation_expires_at_epoch) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
     )
     .bind(reservation_id)
     .bind(operation_id)
@@ -390,6 +473,7 @@ pub async fn reserve_with_payer_kind(
     .bind(offer.as_str())
     .bind(quote_version)
     .bind(quote_expires_at_epoch)
+    .bind(reservation_expires_at_epoch)
     .execute(&mut **tx)
     .await?;
     Ok(ReservationOutcome::Created(FoundingReservation {
@@ -401,7 +485,170 @@ pub async fn reserve_with_payer_kind(
         offer,
         quote_version,
         quote_expires_at_epoch,
+        reservation_expires_at_epoch,
     }))
+}
+
+/// Keep a founding place reserved when a verified Checkout Session completed before its
+/// reservation deadline but Stripe is still processing a delayed payment method. The original
+/// deadline remains the eligibility boundary; only the resulting payment-processing window is
+/// extended, and it is bounded by the existing settlement-recovery period.
+pub async fn record_pending_checkout_completion(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: &str,
+    checkout_completed_by_epoch: i64,
+    now_epoch: i64,
+) -> Result<bool, FoundingAllocatorError> {
+    validate_identity(operation_id, "operation_id")?;
+    if checkout_completed_by_epoch <= 0 {
+        return Err(FoundingAllocatorError::InvalidField(
+            "checkout_completed_by_epoch",
+        ));
+    }
+    if now_epoch <= 0 {
+        return Err(FoundingAllocatorError::InvalidField("now_epoch"));
+    }
+
+    lock_capacity(tx).await?;
+    let row = sqlx::query(
+        "SELECT status, reservation_expires_at_epoch, checkout_completed_by_epoch \
+         FROM billing_founding_reservations WHERE operation_id = $1 FOR UPDATE",
+    )
+    .bind(operation_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(row) = row else {
+        // Standard-price checkouts do not have a founding reservation.
+        return Ok(false);
+    };
+
+    let status: String = row.try_get("status")?;
+    let completed_at: Option<i64> = row.try_get("checkout_completed_by_epoch")?;
+    if let Some(completed_at) = completed_at {
+        // An async-payment event can arrive first and only proves completion happened before
+        // the Checkout Session expired. The later completed event carries the actual timestamp,
+        // which may be earlier than that stored upper bound.
+        if checkout_completed_by_epoch > completed_at {
+            return Err(FoundingAllocatorError::ConfirmationConflict);
+        }
+        return Ok(true);
+    }
+    if status != "reserved" {
+        return Ok(false);
+    }
+
+    let reservation_expires_at_epoch: i64 = row.try_get("reservation_expires_at_epoch")?;
+    if checkout_completed_by_epoch >= reservation_expires_at_epoch {
+        return Ok(false);
+    }
+    if reservation_expires_at_epoch <= now_epoch && available_places(tx, now_epoch).await? <= 0 {
+        // A delayed webhook must not reclaim a place another checkout reserved after this one
+        // expired. Capacity is serialised by the shared ledger lock held above.
+        return Ok(false);
+    }
+    let settlement_deadline = checkout_completed_by_epoch
+        .checked_add(SETTLEMENT_RECOVERY_SECONDS)
+        .ok_or(FoundingAllocatorError::InvalidField(
+            "checkout_completed_by_epoch",
+        ))?;
+    sqlx::query(
+        "UPDATE billing_founding_reservations \
+         SET checkout_completed_by_epoch = $2, \
+             reservation_expires_at_epoch = GREATEST(reservation_expires_at_epoch, $3), \
+             updated_at = now() \
+         WHERE operation_id = $1 AND status = 'reserved' \
+           AND checkout_completed_by_epoch IS NULL",
+    )
+    .bind(operation_id)
+    .bind(checkout_completed_by_epoch)
+    .bind(settlement_deadline)
+    .execute(&mut **tx)
+    .await?;
+    Ok(true)
+}
+
+/// Apply the same bounded hold when Stripe delivers the successful delayed-payment event before
+/// the separate Checkout-completed event. A completed Session cannot be paid after its own expiry,
+/// so its provider-reported expiry must match the reservation's original checkout deadline.
+pub async fn record_async_payment_checkout_completion(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: &str,
+    session_expires_at_epoch: i64,
+    session_is_complete: bool,
+    now_epoch: i64,
+) -> Result<bool, FoundingAllocatorError> {
+    validate_identity(operation_id, "operation_id")?;
+    if session_expires_at_epoch <= 1 {
+        return Err(FoundingAllocatorError::InvalidField(
+            "session_expires_at_epoch",
+        ));
+    }
+    if !session_is_complete {
+        return Ok(false);
+    }
+    if now_epoch <= 0 {
+        return Err(FoundingAllocatorError::InvalidField("now_epoch"));
+    }
+
+    lock_capacity(tx).await?;
+    let row = sqlx::query(
+        "SELECT status, quote_expires_at_epoch, reservation_expires_at_epoch, checkout_completed_by_epoch \
+         FROM billing_founding_reservations WHERE operation_id = $1 FOR UPDATE",
+    )
+    .bind(operation_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(row) = row else {
+        return Ok(false);
+    };
+    let status: String = row.try_get("status")?;
+    let quote_expires_at_epoch: i64 = row.try_get("quote_expires_at_epoch")?;
+    let expected_session_expiry = quote_expires_at_epoch
+        .checked_add(RESERVATION_SECONDS)
+        .ok_or(FoundingAllocatorError::InvalidField(
+            "session_expires_at_epoch",
+        ))?;
+    if expected_session_expiry != session_expires_at_epoch {
+        return Ok(false);
+    }
+    if row
+        .try_get::<Option<i64>, _>("checkout_completed_by_epoch")?
+        .is_some()
+    {
+        return Ok(true);
+    }
+    let reservation_expires_at_epoch: i64 = row.try_get("reservation_expires_at_epoch")?;
+    if status != "reserved" || reservation_expires_at_epoch != session_expires_at_epoch {
+        return Ok(false);
+    }
+    if reservation_expires_at_epoch <= now_epoch && available_places(tx, now_epoch).await? <= 0 {
+        // This event can arrive after the Checkout deadline. Recover its timely completion only
+        // while a founding place remains unclaimed at delivery time.
+        return Ok(false);
+    }
+
+    let completion_upper_bound = session_expires_at_epoch - 1;
+    let settlement_deadline = completion_upper_bound
+        .checked_add(SETTLEMENT_RECOVERY_SECONDS)
+        .ok_or(FoundingAllocatorError::InvalidField(
+            "session_expires_at_epoch",
+        ))?;
+    sqlx::query(
+        "UPDATE billing_founding_reservations \
+         SET checkout_completed_by_epoch = $2, \
+             reservation_expires_at_epoch = GREATEST(reservation_expires_at_epoch, $3), \
+             updated_at = now() \
+         WHERE operation_id = $1 AND status = 'reserved' \
+           AND checkout_completed_by_epoch IS NULL \
+           AND reservation_expires_at_epoch = $4",
+    )
+    .bind(operation_id)
+    .bind(completion_upper_bound)
+    .bind(settlement_deadline)
+    .bind(session_expires_at_epoch)
+    .execute(&mut **tx)
+    .await?;
+    Ok(true)
 }
 
 pub async fn confirm_payment(
@@ -411,12 +658,36 @@ pub async fn confirm_payment(
     paid_on: FoundingDate,
     now_epoch: i64,
 ) -> Result<ConfirmationOutcome, FoundingAllocatorError> {
+    confirm_payment_with_period_start(
+        tx,
+        reservation_id,
+        payment_reference,
+        paid_on,
+        paid_on.to_unix_seconds(),
+        now_epoch,
+    )
+    .await
+}
+
+pub async fn confirm_payment_with_period_start(
+    tx: &mut Transaction<'_, Postgres>,
+    reservation_id: &str,
+    payment_reference: &str,
+    paid_on: FoundingDate,
+    period_start_epoch: i64,
+    now_epoch: i64,
+) -> Result<ConfirmationOutcome, FoundingAllocatorError> {
     validate_identity(reservation_id, "reservation_id")?;
     validate_identity(payment_reference, "payment_reference")?;
+    if period_start_epoch < 0
+        || FoundingDate::from_unix_seconds(period_start_epoch).ok() != Some(paid_on)
+    {
+        return Err(FoundingAllocatorError::InvalidField("period_start"));
+    }
     lock_capacity(tx).await?;
     let row = sqlx::query(
         "SELECT reservation_id, operation_id, beneficiary_id, payer_kind, payer_id, offer, quote_version, \
-         quote_expires_at_epoch, status, award_id, payment_reference \
+         quote_expires_at_epoch, reservation_expires_at_epoch, status, award_id, payment_reference \
          FROM billing_founding_reservations WHERE reservation_id = $1 FOR UPDATE",
     )
     .bind(reservation_id)
@@ -444,6 +715,26 @@ pub async fn confirm_payment(
         if stored_payment != payment_reference {
             return Err(FoundingAllocatorError::ConfirmationConflict);
         }
+        return Ok(ConfirmationOutcome::RefundRequired);
+    }
+    if status == "released" {
+        let duplicate_payment: Option<String> = sqlx::query_scalar(
+            "SELECT reservation_id FROM billing_founding_reservations WHERE payment_reference = $1",
+        )
+        .bind(payment_reference)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if duplicate_payment.is_some() {
+            return Err(FoundingAllocatorError::PaymentConflict);
+        }
+        sqlx::query(
+            "UPDATE billing_founding_reservations SET status = 'refund_required', \
+             payment_reference = $2, updated_at = now() WHERE reservation_id = $1 AND status = 'released'",
+        )
+        .bind(reservation_id)
+        .bind(payment_reference)
+        .execute(&mut **tx)
+        .await?;
         return Ok(ConfirmationOutcome::RefundRequired);
     }
     if status != "reserved" {
@@ -479,15 +770,14 @@ pub async fn confirm_payment(
     let awarded: i64 = sqlx::query_scalar("SELECT count(*) FROM billing_founding_awards")
         .fetch_one(&mut **tx)
         .await?;
-    let reservation_expires_at_epoch: i64 = row.try_get("quote_expires_at_epoch")?;
+    let reservation_expires_at_epoch: i64 = row.try_get("reservation_expires_at_epoch")?;
     let remaining = available_places(tx, now_epoch).await?;
     let reservation_is_live = reservation_expires_at_epoch > now_epoch;
-    // An expired reservation is no longer included in available_places. If all places have
-    // since been awarded, or the last place is held by another live reservation, a late payment
-    // must be refunded rather than taking a place that was already promised to someone else.
+    // Once a reservation expires, its founding offer is no longer honoured. Even if capacity
+    // happens to remain, accepting the late payment would make a short-lived quote reusable.
     // A live reservation being confirmed itself is included in `remaining`, so zero is valid for
     // that path.
-    if awarded >= FOUNDING_CAPACITY || remaining < 0 || (!reservation_is_live && remaining == 0) {
+    if awarded >= FOUNDING_CAPACITY || remaining < 0 || !reservation_is_live {
         sqlx::query(
             "UPDATE billing_founding_reservations SET status = 'refund_required', \
              payment_reference = $2, updated_at = now() \
@@ -509,11 +799,16 @@ pub async fn confirm_payment(
         return Err(FoundingAllocatorError::CorruptState);
     }
     let award_id = format!("founding:{}", Uuid::new_v4());
-    let end = paid_on.anchored_term_end(offer, 1);
+    let end_epoch =
+        FoundingDate::anchored_term_end_epoch(period_start_epoch, offer, offer.founding_terms())
+            .map_err(|_| FoundingAllocatorError::InvalidField("period_start"))?;
+    let end = FoundingDate::from_unix_seconds(end_epoch)
+        .map_err(|_| FoundingAllocatorError::CorruptState)?;
     sqlx::query(
         "INSERT INTO billing_founding_awards \
-         (award_id, beneficiary_id, payer_kind, payer_id, offer, cohort_ordinal, original_start_date, original_end_date) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+         (award_id, beneficiary_id, payer_kind, payer_id, offer, cohort_ordinal, original_start_date, \
+          original_end_date, original_start_epoch, original_end_epoch) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
     )
     .bind(&award_id)
     .bind(&beneficiary_id)
@@ -523,6 +818,8 @@ pub async fn confirm_payment(
     .bind(ordinal)
     .bind(paid_on.to_string())
     .bind(end.to_string())
+    .bind(period_start_epoch)
+    .bind(end_epoch)
     .execute(&mut **tx)
     .await?;
     sqlx::query(
@@ -543,6 +840,8 @@ pub async fn confirm_payment(
         cohort_ordinal: ordinal,
         original_start: paid_on,
         original_end: end,
+        original_start_epoch: Some(period_start_epoch),
+        original_end_epoch: Some(end_epoch),
     };
     Ok(ConfirmationOutcome::Awarded(award))
 }
@@ -621,6 +920,55 @@ pub async fn quote_status(
     })
 }
 
+/// Select the canonical price for one named person from the shared founding capacity.
+///
+/// An unawarded person receives the founding price while a place is available. A permanent award
+/// prevents a later checkout from claiming a second founding term. Live reservations are not
+/// duplicated by a second quote for the same beneficiary.
+pub async fn select_offer(
+    tx: &mut Transaction<'_, Postgres>,
+    beneficiary_id: &str,
+    requested_interval: FoundingOffer,
+    operation_id: Option<&str>,
+    now_epoch: i64,
+) -> Result<BillingOffer, FoundingAllocatorError> {
+    validate_identity(beneficiary_id, "beneficiary_id")?;
+    lock_capacity(tx).await?;
+
+    if load_award_by_beneficiary(tx, beneficiary_id)
+        .await?
+        .is_some()
+    {
+        return Ok(requested_interval.standard_billing_offer());
+    }
+
+    let active_reservation: Option<(String, String)> = sqlx::query_as(
+        "SELECT operation_id, offer FROM billing_founding_reservations \
+         WHERE beneficiary_id = $1 AND status = 'reserved' \
+           AND reservation_expires_at_epoch > $2 FOR UPDATE",
+    )
+    .bind(beneficiary_id)
+    .bind(now_epoch)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some((reserved_operation_id, reserved_offer)) = active_reservation {
+        if operation_id == Some(reserved_operation_id.as_str()) {
+            let offer = parse_offer(&reserved_offer)?;
+            if offer != requested_interval {
+                return Err(FoundingAllocatorError::ReservationConflict);
+            }
+            return Ok(offer.billing_offer());
+        }
+        return Ok(requested_interval.standard_billing_offer());
+    }
+
+    if available_places(tx, now_epoch).await? > 0 {
+        Ok(requested_interval.billing_offer())
+    } else {
+        Ok(requested_interval.standard_billing_offer())
+    }
+}
+
 pub async fn load_capacity_status(
     tx: &mut Transaction<'_, Postgres>,
     now_epoch: i64,
@@ -631,7 +979,7 @@ pub async fn load_capacity_status(
         .await?;
     let active_reservations: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM billing_founding_reservations \
-         WHERE status = 'reserved' AND quote_expires_at_epoch > $1",
+         WHERE status = 'reserved' AND reservation_expires_at_epoch > $1",
     )
     .bind(now_epoch)
     .fetch_one(&mut **tx)
@@ -643,13 +991,33 @@ pub async fn load_capacity_status(
     })
 }
 
+/// Release an unused reservation after a definitive checkout failure or expiry.
+///
+/// Confirmed and refund-required records are immutable. Releasing an absent or already-released
+/// reservation is harmless so provider failure cleanup can be retried transactionally.
+pub async fn release_reservation(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: &str,
+) -> Result<(), FoundingAllocatorError> {
+    validate_identity(operation_id, "operation_id")?;
+    lock_capacity(tx).await?;
+    sqlx::query(
+        "UPDATE billing_founding_reservations SET status = 'released', updated_at = now() \
+         WHERE operation_id = $1 AND status = 'reserved'",
+    )
+    .bind(operation_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 pub async fn load_award(
     tx: &mut Transaction<'_, Postgres>,
     award_id: &str,
 ) -> Result<Option<FoundingAward>, FoundingAllocatorError> {
     let row = sqlx::query(
         "SELECT award_id, beneficiary_id, payer_kind, payer_id, offer, cohort_ordinal, original_start_date, \
-         original_end_date FROM billing_founding_awards WHERE award_id = $1",
+         original_end_date, original_start_epoch, original_end_epoch FROM billing_founding_awards WHERE award_id = $1",
     )
     .bind(award_id)
     .fetch_optional(&mut **tx)
@@ -657,7 +1025,12 @@ pub async fn load_award(
     row.map(award_from_row).transpose()
 }
 
-async fn lock_capacity(tx: &mut Transaction<'_, Postgres>) -> Result<(), FoundingAllocatorError> {
+/// Acquire the shared founding ledger lock before touching personal or sponsored billing rows.
+/// Checkout and webhook settlement paths take this first so they cannot deadlock while acquiring
+/// the ledger alongside account, operation, or subscription locks.
+pub async fn lock_capacity(
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<(), FoundingAllocatorError> {
     sqlx::query(
         "SELECT singleton FROM billing_founding_capacity WHERE singleton = TRUE FOR UPDATE",
     )
@@ -675,7 +1048,7 @@ async fn available_places(
         .await?;
     let reserved: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM billing_founding_reservations \
-         WHERE status = 'reserved' AND quote_expires_at_epoch > $1",
+         WHERE status = 'reserved' AND reservation_expires_at_epoch > $1",
     )
     .bind(now_epoch)
     .fetch_one(&mut **tx)
@@ -689,7 +1062,8 @@ async fn load_reservation_by_operation(
 ) -> Result<Option<FoundingReservation>, FoundingAllocatorError> {
     let row = sqlx::query(
         "SELECT reservation_id, operation_id, beneficiary_id, payer_kind, payer_id, offer, quote_version, \
-         quote_expires_at_epoch FROM billing_founding_reservations WHERE operation_id = $1 FOR UPDATE",
+         quote_expires_at_epoch, reservation_expires_at_epoch \
+         FROM billing_founding_reservations WHERE operation_id = $1 FOR UPDATE",
     )
     .bind(operation_id)
     .fetch_optional(&mut **tx)
@@ -703,7 +1077,7 @@ async fn load_award_by_beneficiary(
 ) -> Result<Option<FoundingAward>, FoundingAllocatorError> {
     let row = sqlx::query(
         "SELECT award_id, beneficiary_id, payer_kind, payer_id, offer, cohort_ordinal, original_start_date, \
-         original_end_date FROM billing_founding_awards WHERE beneficiary_id = $1",
+         original_end_date, original_start_epoch, original_end_epoch FROM billing_founding_awards WHERE beneficiary_id = $1",
     )
     .bind(beneficiary_id)
     .fetch_optional(&mut **tx)
@@ -723,6 +1097,7 @@ fn reservation_from_row(
         offer: parse_offer(&row.try_get::<String, _>("offer")?)?,
         quote_version: row.try_get("quote_version")?,
         quote_expires_at_epoch: row.try_get("quote_expires_at_epoch")?,
+        reservation_expires_at_epoch: row.try_get("reservation_expires_at_epoch")?,
     })
 }
 
@@ -738,6 +1113,8 @@ fn award_from_row(row: sqlx::postgres::PgRow) -> Result<FoundingAward, FoundingA
             .map_err(|_| FoundingAllocatorError::CorruptState)?,
         original_end: FoundingDate::parse(&row.try_get::<String, _>("original_end_date")?)
             .map_err(|_| FoundingAllocatorError::CorruptState)?,
+        original_start_epoch: row.try_get("original_start_epoch")?,
+        original_end_epoch: row.try_get("original_end_epoch")?,
     })
 }
 
@@ -823,5 +1200,41 @@ mod tests {
             FoundingOffer::from_billing_offer(BillingOffer::StandardMonthly),
             None
         );
+    }
+
+    #[test]
+    fn founding_price_period_matches_the_advertised_duration() {
+        let monthly_start = FoundingDate::new(2026, 1, 31).unwrap();
+        assert_eq!(
+            monthly_start
+                .anchored_term_end(
+                    FoundingOffer::Monthly,
+                    FoundingOffer::Monthly.founding_terms()
+                )
+                .to_string(),
+            "2027-01-31"
+        );
+
+        let annual_start = FoundingDate::new(2024, 2, 29).unwrap();
+        assert_eq!(
+            annual_start
+                .anchored_term_end(
+                    FoundingOffer::Annual,
+                    FoundingOffer::Annual.founding_terms()
+                )
+                .to_string(),
+            "2025-02-28"
+        );
+    }
+
+    #[test]
+    fn founding_boundary_keeps_the_verified_subscription_time_anchor() {
+        let start = FoundingDate::new(2026, 1, 31).unwrap().to_unix_seconds() + 14 * 3_600 + 27;
+        let end = FoundingDate::anchored_term_end_epoch(start, FoundingOffer::Monthly, 12).unwrap();
+        assert_eq!(
+            end - end.rem_euclid(86_400),
+            FoundingDate::new(2027, 1, 31).unwrap().to_unix_seconds()
+        );
+        assert_eq!(end.rem_euclid(86_400), start.rem_euclid(86_400));
     }
 }

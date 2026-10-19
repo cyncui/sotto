@@ -216,6 +216,90 @@ fn limits() -> StripeReadLimits {
     }
 }
 
+#[tokio::test]
+async fn invoice_event_page_is_bounded_and_resumable() {
+    let mut responses = HashMap::new();
+    responses.insert("/v1/account".into(), vec![MockResponse::json(account())]);
+    responses.insert(
+        "/v1/events".into(),
+        vec![MockResponse::json(json!({
+            "object":"list", "has_more":true,
+            "data":[
+                {"id":"evt_paid","created":110,"type":"invoice.paid","livemode":false},
+                {"id":"evt_failed","created":120,"type":"invoice.payment_failed","livemode":false}
+            ]
+        }))],
+    );
+    let server = mock_server(responses).await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+
+    let page = client
+        .invoice_events_page(&mut session, 100, 200, Some("evt_previous"), 10)
+        .await
+        .unwrap();
+
+    assert_eq!(page.events.len(), 2);
+    assert_eq!(page.events[0].id, "evt_paid");
+    assert_eq!(page.events[1].event_type, "invoice.payment_failed");
+    assert!(page.has_more);
+    assert_eq!(page.next_cursor.as_deref(), Some("evt_failed"));
+    let calls = server.state.calls.lock().unwrap();
+    let request = calls
+        .iter()
+        .find(|call| call.path_and_query.starts_with("/v1/events?"))
+        .unwrap();
+    let url = Url::parse(&format!("http://localhost{}", request.path_and_query)).unwrap();
+    let query = url.query_pairs().collect::<Vec<_>>();
+    assert_eq!(
+        query
+            .iter()
+            .filter(|(key, value)| key == "types[]" && value == "invoice.paid")
+            .count(),
+        1
+    );
+    assert_eq!(
+        query
+            .iter()
+            .filter(|(key, value)| key == "types[]" && value == "invoice.payment_failed")
+            .count(),
+        1
+    );
+    assert!(query
+        .iter()
+        .any(|(key, value)| key == "created[gte]" && value == "100"));
+    assert!(query
+        .iter()
+        .any(|(key, value)| key == "created[lt]" && value == "200"));
+    assert!(query
+        .iter()
+        .any(|(key, value)| key == "starting_after" && value == "evt_previous"));
+}
+
+#[tokio::test]
+async fn invoice_event_page_rejects_events_outside_its_fixed_window() {
+    let mut responses = HashMap::new();
+    responses.insert("/v1/account".into(), vec![MockResponse::json(account())]);
+    responses.insert(
+        "/v1/events".into(),
+        vec![MockResponse::json(json!({
+            "object":"list", "has_more":false,
+            "data":[{"id":"evt_outside","created":200,"type":"invoice.paid","livemode":false}]
+        }))],
+    );
+    let server = mock_server(responses).await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+    assert!(matches!(
+        client
+            .invoice_events_page(&mut session, 100, 200, None, 10)
+            .await,
+        Err(StripeReadError::MalformedResponse("events.data.created"))
+    ));
+}
+
 fn personal_binding() -> StripeAllocationBinding {
     StripeAllocationBinding::new("alloc_1", "cus_1", "sub_1", "si_1", PayerKind::Personal).unwrap()
 }
@@ -226,7 +310,10 @@ fn paid_invoice() -> Value {
         "customer":"cus_1",
         "parent":{
             "type":"subscription_details",
-            "subscription_details":{"subscription":"sub_1"}
+            "subscription_details":{
+                "subscription":"sub_1",
+                "metadata":{"sotto_allocation_reference":"alloc_1"}
+            }
         },
         "status":"paid",
         "currency":"gbp",
@@ -236,7 +323,6 @@ fn paid_invoice() -> Value {
         "amount_overpaid":0,
         "amount_paid_off_stripe":0,
         "livemode":false,
-        "metadata":{"sotto_allocation_reference":"alloc_1"}
     })
 }
 
@@ -269,6 +355,7 @@ fn personal_line(id: &str) -> Value {
             "type":"price_details",
             "price_details":{"price":"price_month"}
         },
+        "metadata":{"sotto_allocation_reference":"alloc_1"},
         "period":{"start":1700000000,"end":1702592000}
     })
 }

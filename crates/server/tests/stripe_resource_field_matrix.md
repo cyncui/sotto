@@ -183,3 +183,20 @@ versioned semantic reference. It does not assign `failed_renewal_id`, produce a
 The candidate is provisional evidence. Pagination is complete only relative to the bounded read,
 not an atomic remote snapshot; publication, freshness, invalidation, missed-event repair and
 recovery eligibility remain later adapter responsibilities.
+
+## Sponsored renewal failure fan-out
+
+The sponsored failure path lists invoices with both the trusted subscription and customer IDs.
+It uses the embedded `lines.data` summaries to select only paid invoices with a subscription-item
+line whose item and price match the failed line and whose period ends exactly when the failed
+period starts. A truncated summary, or one without a `has_more` value, is completed from that
+invoice's line endpoint before it can be used to rule out a predecessor. Settlement and the allocation manifest are read
+only for matching predecessor invoices, under the same bounded Stripe session. Provider read,
+database and manifest-query failures remain retryable; a successfully read but malformed or
+contradictory invoice is durably rejected without storing partial beneficiary evidence.
+
+The final application takes the subscription lock and checks the durable processed webhook receipt
+for the exact paid invoice before recording a failed renewal. That prevents a delayed failure read
+from overriding a paid invoice that committed while Stripe history was being prepared. Sponsored
+failure and resolution writes are set-based for all affected allocations, and the notice bound
+allows the configured maximum of 128 beneficiaries plus 128 organisation administrators.
