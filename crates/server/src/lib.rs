@@ -25,6 +25,7 @@ pub mod auth;
 pub mod billing;
 pub mod billing_catalogue;
 pub mod billing_operations;
+pub mod billing_recovery_executor;
 #[doc(hidden)]
 pub mod billing_refunds;
 #[doc(hidden)]
@@ -129,6 +130,7 @@ pub mod server_info;
 pub mod share;
 #[doc(hidden)]
 pub mod sponsored_billing;
+pub mod sponsored_billing_recovery_executor;
 pub mod state;
 pub mod sync;
 pub mod telemetry;

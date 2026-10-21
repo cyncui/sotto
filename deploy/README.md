@@ -1272,6 +1272,155 @@ Stripe-hosted pages, and the webhook only assigns the org's tier.
 
 ## Operations
 
+The default-off `SOTTO_BILLING_RECOVERY_WORKER_ENABLED` retries interrupted personal Checkout
+creation from the stored offer, allocation, expiry and original Stripe idempotency key. It only
+creates or reopens the same Checkout session; payment and coverage still require the signed
+`invoice.paid` webhook. Retries stop before Stripe's documented idempotency-key pruning window, and
+ambiguous older operations are parked for review. The worker also checks Stripe's current status
+for locally expired pending personal accounts with a stored Checkout session id. For older rows
+that contain only the Checkout URL, it extracts the session id from the URL path; it also accepts
+`provider_operation_id` when that field actually contains a Checkout session id. Stripe's response
+must confirm the exact personal operation before the account is released, and the session must be
+expired and unpaid. This repairs missed or previously acknowledged expiry events; an open or
+completed session is never released by this check. This switch does not enable sales.
+
+The default-off `SOTTO_SPONSORED_BILLING_RECOVERY_WORKER_ENABLED` reconciles saved sponsored
+Checkout and shared-subscription schedule requests. It reuses the exact saved request and original
+Stripe idempotency key, and parks missing, changed or out-of-window evidence for review. Signed
+payment webhooks remain authoritative for activating sponsored seats. This switch requires Cloud
+mode and the hosted Stripe price catalogue, and it does not enable sponsored sales or refund
+processing. Older unresolved operations without saved request facts are parked by migration 0071;
+do not reconstruct a provider request manually.
+
+Signed Stripe expiry and paid webhooks can still close an operation while it is in `manual_review`.
+For an operation parked without a recorded Checkout session, first search Stripe for
+`client_reference_id=sponsored:<operation_id>`, subscription metadata
+`sponsored_operation_id=<operation_id>`, and related invoices and payments. Do not clear the seat
+or founding reservation if any provider object or payment may exist. If Stripe confirms that no
+Checkout session, subscription, invoice, or payment exists, record the incident and perform this
+guarded repair. The capacity row and operation query must each return exactly one row; the seat
+query may return zero or one pending seat; the reservation query may return zero or one reserved
+reservation. Roll back if another state or provider reference is present. The three updates must
+affect one operation and no more than one seat or reservation; otherwise roll back and investigate.
+
+```sql
+BEGIN;
+SELECT singleton FROM billing_founding_capacity WHERE singleton = TRUE FOR UPDATE;
+SELECT operation_id FROM billing_sponsored_operations
+ WHERE operation_id = '<operation_id>'
+   AND state = 'manual_review'
+   AND recovery_manual_review_required = TRUE
+   AND action = 'add'
+   AND provider_customer_id IS NULL
+   AND provider_subscription_id IS NULL
+   AND provider_checkout_session_id IS NULL
+   AND provider_payment_reference IS NULL
+   AND provider_item_id IS NULL
+   AND provider_operation_id IS NULL
+   AND provider_checkout_url IS NULL
+ FOR UPDATE;
+SELECT seat_id FROM billing_sponsored_seats
+ WHERE operation_id = '<operation_id>' AND state = 'pending'
+ FOR UPDATE;
+SELECT reservation_id FROM billing_founding_reservations
+ WHERE operation_id = '<operation_id>' AND status = 'reserved'
+ FOR UPDATE;
+UPDATE billing_founding_reservations
+   SET status = 'released', updated_at = now()
+ WHERE operation_id = '<operation_id>' AND status = 'reserved';
+UPDATE billing_sponsored_seats
+   SET state = 'canceled', updated_at = now()
+ WHERE operation_id = '<operation_id>' AND state = 'pending';
+UPDATE billing_sponsored_operations
+   SET state = 'failed', result_code = 'operator_confirmed_no_provider_object',
+       recovery_manual_review_required = FALSE,
+       recovery_last_error_code = 'operator_confirmed_no_provider_object',
+       recovery_lease_token = NULL, recovery_lease_until = NULL, updated_at = now()
+ WHERE operation_id = '<operation_id>'
+   AND state = 'manual_review'
+   AND recovery_manual_review_required = TRUE
+   AND action = 'add'
+   AND provider_customer_id IS NULL
+   AND provider_subscription_id IS NULL
+   AND provider_checkout_session_id IS NULL
+   AND provider_payment_reference IS NULL
+   AND provider_item_id IS NULL
+   AND provider_operation_id IS NULL
+   AND provider_checkout_url IS NULL
+ RETURNING operation_id;
+COMMIT;
+```
+
+Notify the organisation owner and beneficiary after commit. If the session, subscription, invoice,
+or payment cannot be ruled out, leave the operation and seat parked and escalate; do not create a
+replacement Checkout or rebuild the missing request.
+
+For a parked personal Checkout with no session id, do not clear the account because its local
+deadline elapsed. Check Stripe's event log and the customer's Checkout/subscription/payment history
+for the exact `client_reference_id` `personal:<operation_id>`. If a session exists, keep the account
+blocked and have an operator record its exact `cs_…` id on that operation so the recovery worker can
+verify its status. Bind it only when the row is still parked for this reason; require one returned
+row, then let the worker inspect Stripe before changing the account:
+
+```sql
+UPDATE billing_operations
+   SET provider_checkout_session_id = '<cs_session_id>',
+       reconciliation_next_attempt_at = now(), updated_at = now()
+ WHERE operation_id = '<operation_id>'
+   AND state = 'manual_review'
+   AND result_code = 'provider_idempotency_window_elapsed'
+   AND provider_checkout_session_id IS NULL
+   AND provider_operation_id IS NULL
+   AND provider_checkout_url IS NULL
+   AND EXISTS (SELECT 1 FROM billing_personal_accounts AS account
+                WHERE account.operation_id = billing_operations.operation_id
+                  AND account.state = 'pending'
+                  AND account.pending_expires_at_epoch <= extract(epoch FROM now())::bigint)
+ RETURNING operation_id;
+```
+
+If Stripe confirms that no session, payment, invoice or subscription exists,
+perform the following guarded repair in one database transaction. First record the operation id and
+Stripe review in the incident log. The first two `SELECT`s must each return exactly one row; if
+either returns no row or multiple rows, roll back and investigate. The `UPDATE`s must affect one
+operation and one account; otherwise roll back. Notify the customer after commit so they can retry.
+
+```sql
+BEGIN;
+SELECT singleton FROM billing_founding_capacity WHERE singleton = TRUE FOR UPDATE;
+SELECT operation_id FROM billing_operations
+ WHERE operation_id = '<operation_id>'
+   AND state = 'manual_review'
+   AND result_code = 'provider_idempotency_window_elapsed'
+   AND provider_checkout_session_id IS NULL
+   AND provider_operation_id IS NULL
+   AND provider_checkout_url IS NULL
+ FOR UPDATE;
+SELECT operation_id FROM billing_personal_accounts
+ WHERE operation_id = '<operation_id>'
+   AND state = 'pending'
+   AND pending_expires_at_epoch <= extract(epoch FROM now())::bigint
+ FOR UPDATE;
+UPDATE billing_founding_reservations SET status = 'released', updated_at = now()
+ WHERE operation_id = '<operation_id>' AND status = 'reserved';
+UPDATE billing_personal_accounts SET state = 'canceled', updated_at = now()
+ WHERE operation_id = '<operation_id>' AND state = 'pending';
+UPDATE billing_operations SET state = 'failed', result_code = 'operator_confirmed_no_session',
+       reconciliation_manual_review_required = FALSE,
+       reconciliation_last_error_code = 'operator_confirmed_no_session',
+       reconciliation_lease_token = NULL, reconciliation_lease_until = NULL, updated_at = now()
+ WHERE operation_id = '<operation_id>'
+   AND state = 'manual_review'
+   AND result_code = 'provider_idempotency_window_elapsed'
+   AND provider_checkout_session_id IS NULL
+   AND provider_operation_id IS NULL
+   AND provider_checkout_url IS NULL;
+COMMIT;
+```
+
+If a provider session or payment cannot be ruled out, leave the operation parked and escalate; do
+not create another Checkout or mark the account canceled.
+
 ```sh
 docker compose -f docker-compose.prod.yml logs -f server   # API logs
 docker compose -f docker-compose.prod.yml logs -f caddy    # access/TLS logs

@@ -273,6 +273,14 @@ async fn run() -> Result<()> {
         config.cloud_notice_dispatch_enabled
     );
     println!(
+        "Cloud billing recovery worker: {}",
+        config.billing_recovery_worker_enabled
+    );
+    println!(
+        "Sponsored billing recovery worker: {}",
+        config.sponsored_billing_recovery_worker_enabled
+    );
+    println!(
         "provider refresh: ingest={}, worker={}, reconciliation={}",
         config.provider_refresh_ingest_enabled,
         config.provider_refresh_worker_enabled,
@@ -336,6 +344,20 @@ async fn run() -> Result<()> {
     }
     if config.organisation_deletion_worker_enabled {
         sotto_server::org_deletion_worker::spawn(pool.clone(), worker_provider.clone());
+    }
+    if config.billing_recovery_worker_enabled {
+        let billing = state.billing.clone().ok_or_else(|| {
+            Error::Config("billing recovery worker requires configured Stripe billing".into())
+        })?;
+        sotto_server::billing_recovery_executor::spawn(pool.clone(), billing);
+    }
+    if config.sponsored_billing_recovery_worker_enabled {
+        let billing = state.billing.clone().ok_or_else(|| {
+            Error::Config(
+                "sponsored billing recovery worker requires configured Stripe billing".into(),
+            )
+        })?;
+        sotto_server::sponsored_billing_recovery_executor::spawn(pool.clone(), billing);
     }
     if config.cloud_retention_dry_run_enabled {
         sotto_server::cloud_retention_lifecycle::spawn(state.clone());

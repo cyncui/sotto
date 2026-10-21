@@ -81,6 +81,9 @@ const CLOUD_CONTACT_ENROLMENT_ENV: &str = "SOTTO_CLOUD_CONTACT_ENROLMENT_ENABLED
 const CLOUD_CONTACT_EMAIL_SEND_ENV: &str = "SOTTO_CLOUD_CONTACT_EMAIL_SEND_ENABLED";
 const CLOUD_CONTACT_EMAIL_FROM_ENV: &str = "SOTTO_CLOUD_CONTACT_EMAIL_FROM";
 const CLOUD_NOTICE_DISPATCH_ENV: &str = "SOTTO_CLOUD_NOTICE_DISPATCH_ENABLED";
+const BILLING_RECOVERY_WORKER_ENV: &str = "SOTTO_BILLING_RECOVERY_WORKER_ENABLED";
+const SPONSORED_BILLING_RECOVERY_WORKER_ENV: &str =
+    "SOTTO_SPONSORED_BILLING_RECOVERY_WORKER_ENABLED";
 const RESEND_WEBHOOK_SECRET_ENV: &str = "RESEND_WEBHOOK_SECRET";
 
 #[derive(Debug, Clone)]
@@ -149,6 +152,10 @@ pub struct Config {
     pub contact_verification: ContactVerificationConfig,
     /// Whether the separate lifecycle-notice dispatcher starts. Defaults off.
     pub cloud_notice_dispatch_enabled: bool,
+    /// Whether the bounded hosted billing recovery worker starts. Defaults off.
+    pub billing_recovery_worker_enabled: bool,
+    /// Whether bounded sponsored-operation recovery runs. Defaults off independently of personal recovery.
+    pub sponsored_billing_recovery_worker_enabled: bool,
     /// Resend signing secret used to authenticate delivery feedback.
     pub resend_webhook_secret: Option<String>,
 }
@@ -291,6 +298,13 @@ impl Config {
             feature_flag_is_enabled(std::env::var(CLOUD_CONTACT_EMAIL_SEND_ENV).ok().as_deref());
         let cloud_notice_dispatch_enabled =
             feature_flag_is_enabled(std::env::var(CLOUD_NOTICE_DISPATCH_ENV).ok().as_deref());
+        let billing_recovery_worker_enabled =
+            feature_flag_is_enabled(std::env::var(BILLING_RECOVERY_WORKER_ENV).ok().as_deref());
+        let sponsored_billing_recovery_worker_enabled = feature_flag_is_enabled(
+            std::env::var(SPONSORED_BILLING_RECOVERY_WORKER_ENV)
+                .ok()
+                .as_deref(),
+        );
         let resend_webhook_secret = env_nonempty(RESEND_WEBHOOK_SECRET_ENV);
         let contact_verification = ContactVerificationConfig {
             enrolment_enabled: contact_enrolment_enabled,
@@ -397,6 +411,11 @@ impl Config {
             deployment_mode,
             billing.as_ref(),
         )?;
+        validate_billing_recovery_configuration(
+            billing_recovery_worker_enabled,
+            deployment_mode,
+            billing.as_ref(),
+        )?;
         let telemetry = TelemetryConfig {
             ping_enabled: telemetry_ping_enabled(
                 env_nonempty("SOTTO_TELEMETRY").as_deref(),
@@ -468,6 +487,11 @@ impl Config {
             deployment_mode,
             billing.as_ref(),
         )?;
+        validate_sponsored_billing_recovery_configuration(
+            sponsored_billing_recovery_worker_enabled,
+            deployment_mode,
+            billing.as_ref(),
+        )?;
         validate_cloud_retention_configuration(
             cloud_retention_dry_run_enabled,
             cloud_retention_operator_token.as_deref(),
@@ -513,6 +537,8 @@ impl Config {
             cloud_retention_operator_token,
             contact_verification,
             cloud_notice_dispatch_enabled,
+            billing_recovery_worker_enabled,
+            sponsored_billing_recovery_worker_enabled,
             resend_webhook_secret,
         })
     }
@@ -541,6 +567,27 @@ fn validate_founding_schedule_worker_configuration(
     if billing.cloud_portal_configuration_id.is_none() {
         return Err(Error::Config(
             "founding schedule worker requires STRIPE_CLOUD_PORTAL_CONFIGURATION_ID".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_sponsored_billing_recovery_configuration(
+    enabled: bool,
+    deployment_mode: DeploymentMode,
+    billing: Option<&BillingConfig>,
+) -> Result<()> {
+    if !enabled {
+        return Ok(());
+    }
+    if deployment_mode != DeploymentMode::Cloud
+        || billing
+            .and_then(|config| config.price_catalogue.as_ref())
+            .is_none()
+    {
+        return Err(Error::Config(
+            "sponsored billing recovery requires Cloud mode and the hosted Stripe price catalogue"
+                .into(),
         ));
     }
     Ok(())
@@ -846,6 +893,25 @@ fn validate_billing_transfers_configuration(
     Ok(())
 }
 
+fn validate_billing_recovery_configuration(
+    enabled: bool,
+    deployment_mode: DeploymentMode,
+    billing: Option<&BillingConfig>,
+) -> Result<()> {
+    if !enabled {
+        return Ok(());
+    }
+    let billing = billing.ok_or_else(|| {
+        Error::Config("billing recovery requires configured Cloud Stripe billing".into())
+    })?;
+    if deployment_mode != DeploymentMode::Cloud || billing.price_catalogue.is_none() {
+        return Err(Error::Config(
+            "billing recovery requires cloud mode and all four hosted Stripe prices".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_billing_transfer_execution_configuration(
     _api_enabled: bool,
     execution_enabled: bool,
@@ -1073,16 +1139,17 @@ mod tests {
         billing_price_catalogue_from_values, billing_return_url, feature_flag_is_enabled,
         is_portal_configuration_id, organisation_deletion_retention_from_env_result,
         organisation_deletion_worker_is_enabled, parse_organisation_deletion_retention_days,
-        telemetry_ping_enabled, validate_billing_transfer_execution_configuration,
+        telemetry_ping_enabled, validate_billing_recovery_configuration,
+        validate_billing_transfer_execution_configuration,
         validate_billing_transfer_operator_configuration, validate_billing_transfers_configuration,
         validate_cloud_retention_configuration, validate_cloud_sales_configuration,
         validate_contact_verification_configuration, validate_coverage_authority_configuration,
         validate_deployment_billing_boundary, validate_founding_price_notices_configuration,
         validate_founding_schedule_worker_configuration, validate_notice_dispatch_configuration,
-        validate_provider_refresh_configuration, BillingConfig, BillingPriceIds,
-        ContactVerificationConfig, DeploymentMode, DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
-        MAX_COVERAGE_AUTHORITY_MAX_AGE_SECONDS, MAX_ORGANISATION_DELETION_RETENTION_DAYS,
-        MIN_COVERAGE_AUTHORITY_MAX_AGE_SECONDS,
+        validate_provider_refresh_configuration, validate_sponsored_billing_recovery_configuration,
+        BillingConfig, BillingPriceIds, ContactVerificationConfig, DeploymentMode,
+        DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS, MAX_COVERAGE_AUTHORITY_MAX_AGE_SECONDS,
+        MAX_ORGANISATION_DELETION_RETENTION_DAYS, MIN_COVERAGE_AUTHORITY_MAX_AGE_SECONDS,
     };
 
     #[test]
@@ -1384,6 +1451,38 @@ mod tests {
     }
 
     #[test]
+    fn billing_recovery_is_independent_but_requires_hosted_catalogue_when_enabled() {
+        assert!(
+            validate_billing_recovery_configuration(false, DeploymentMode::SelfHosted, None,)
+                .is_ok()
+        );
+        assert!(
+            validate_billing_recovery_configuration(true, DeploymentMode::SelfHosted, None,)
+                .is_err()
+        );
+        let billing = BillingConfig {
+            api_key: "rk_test_secret".into(),
+            webhook_secret: "whsec_test".into(),
+            price_id: "price_legacy".into(),
+            price_catalogue: Some(BillingPriceIds {
+                standard_monthly: "price_standard_month".into(),
+                standard_annual: "price_standard_year".into(),
+                founding_monthly: "price_founding_month".into(),
+                founding_annual: "price_founding_year".into(),
+            }),
+            cloud_portal_configuration_id: None,
+            cloud_sales_enabled: false,
+            return_url: "https://app.example.test".into(),
+        };
+        assert!(validate_billing_recovery_configuration(
+            true,
+            DeploymentMode::Cloud,
+            Some(&billing),
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn payer_transfer_execution_is_independent_and_off_by_default() {
         assert!(validate_billing_transfer_execution_configuration(
             false,
@@ -1588,6 +1687,50 @@ mod tests {
         assert!(
             validate_founding_schedule_worker_configuration(true, true, Some(&complete)).is_ok()
         );
+    }
+
+    #[test]
+    fn sponsored_billing_recovery_is_opt_in_and_requires_cloud_catalogue() {
+        assert!(validate_sponsored_billing_recovery_configuration(
+            false,
+            DeploymentMode::SelfHosted,
+            None
+        )
+        .is_ok());
+        assert!(validate_sponsored_billing_recovery_configuration(
+            true,
+            DeploymentMode::SelfHosted,
+            None
+        )
+        .is_err());
+        let billing = BillingConfig {
+            api_key: "rk_test_secret".into(),
+            webhook_secret: "whsec_test".into(),
+            price_id: "price_legacy".into(),
+            price_catalogue: Some(BillingPriceIds {
+                standard_monthly: "price_standard_month".into(),
+                standard_annual: "price_standard_year".into(),
+                founding_monthly: "price_founding_month".into(),
+                founding_annual: "price_founding_year".into(),
+            }),
+            cloud_portal_configuration_id: None,
+            cloud_sales_enabled: false,
+            return_url: "https://app.example.test".into(),
+        };
+        assert!(validate_sponsored_billing_recovery_configuration(
+            true,
+            DeploymentMode::Cloud,
+            Some(&billing)
+        )
+        .is_ok());
+        let mut no_catalogue = billing;
+        no_catalogue.price_catalogue = None;
+        assert!(validate_sponsored_billing_recovery_configuration(
+            true,
+            DeploymentMode::Cloud,
+            Some(&no_catalogue)
+        )
+        .is_err());
     }
 
     #[test]
