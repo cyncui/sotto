@@ -8,6 +8,11 @@ import type { EligibilityView } from "../api";
 import { CloudAccountPanel } from "../CloudAccountPanel";
 
 vi.mock("../api", () => ({
+  confirmCloudContactVerification: vi.fn(),
+  fetchCloudContactStatus: vi.fn(),
+  UnsupportedCloudContactError: class UnsupportedCloudContactError extends Error {},
+  revokeCloudContact: vi.fn(),
+  startCloudContactVerification: vi.fn(),
   cancelPersonalBilling: vi.fn(),
   acceptPayerTransfer: vi.fn(),
   beginPayerTransfer: vi.fn(),
@@ -74,6 +79,7 @@ describe("CloudAccountPanel", () => {
     vi.mocked(api.fetchOrgs).mockResolvedValue([]);
     vi.mocked(api.fetchMembers).mockResolvedValue([]);
     vi.mocked(api.fetchCloudNotices).mockResolvedValue([]);
+  vi.mocked(api.fetchCloudContactStatus).mockResolvedValue({ email: null, pendingExpiresAtEpoch: null, enrolmentAvailable: false });
     vi.mocked(api.fetchPersonalLifecycle).mockResolvedValue({
       state: "active", paidThroughDate: null, cancelAtPeriodEnd: false, portalUrl: null,
       foundingPriceEndEpoch: null, standardRenewalAmountPence: null, foundingTransitionStatus: null, foundingTransitionReason: null,
@@ -117,6 +123,29 @@ describe("CloudAccountPanel", () => {
     expect(api.fetchPersonalQuote).toHaveBeenCalledTimes(4);
     expect(api.fetchPersonalQuote).toHaveBeenLastCalledWith("annual");
     expect(api.createPersonalCheckout).not.toHaveBeenCalled();
+  });
+
+  it("shows the verified founding price and interval to the payer without vault unlock", async () => {
+    const effectiveAtEpoch = 1_900_000_000;
+    vi.mocked(api.fetchEligibility).mockResolvedValue({
+      ...base, state: "paid", payer: "personal",
+    });
+    vi.mocked(api.fetchCloudNotices).mockResolvedValue([{
+      noticeId: "notice-price-change", kind: "price_change", channel: "in_app",
+      content: {
+        title: "Your founding price is changing",
+        detail: "Your founding price ends on the date shown. Your next renewal will use the standard monthly price shown.",
+        effectiveAtEpoch, deadlineEpoch: null, amountPence: 299, priceInterval: "month",
+      },
+      dueAtEpoch: effectiveAtEpoch - 60 * 24 * 60 * 60, status: "pending",
+      lastErrorCode: null, deliveredAtEpoch: null, createdAtEpoch: effectiveAtEpoch,
+    }]);
+    render(<CloudAccountPanel />);
+
+    expect(await screen.findByRole("heading", { name: "Account notices" })).toBeInTheDocument();
+    expect(screen.getByText("Your founding price is changing")).toBeInTheDocument();
+    expect(screen.getByText(`From ${new Date(effectiveAtEpoch * 1000).toLocaleDateString("en-GB")}, your price will be £2.99 per month.`)).toBeInTheDocument();
+    expect(api.fetchCloudNotices).toHaveBeenCalledOnce();
   });
 
   it.each(["success", "failure"] as const)(
@@ -197,9 +226,10 @@ describe("CloudAccountPanel", () => {
 
       if (outcome === "failure") {
         view.unmount();
+        const exportDeadline = 1_900_000_000;
         vi.mocked(api.fetchCloudNotices).mockResolvedValue([{
           noticeId: "notice-current", kind: "export_deadline", channel: "in_app",
-          content: { title: "Current export notice", detail: "Keep your encrypted recovery materials.", effectiveAtEpoch: null, deadlineEpoch: null, amountPence: null },
+          content: { title: "Current export notice", detail: "Keep your encrypted recovery materials.", effectiveAtEpoch: 1_800_000_000, deadlineEpoch: exportDeadline, amountPence: null },
           dueAtEpoch: 1_900_000_000, status: "pending", lastErrorCode: null,
           deliveredAtEpoch: null, createdAtEpoch: 1_900_000_000,
         }]);
@@ -207,6 +237,7 @@ describe("CloudAccountPanel", () => {
         expect(await screen.findByRole("heading", { name: "Account notices" })).toBeInTheDocument();
         expect(screen.getByText("Current export notice")).toBeInTheDocument();
         expect(screen.getByText("Keep your encrypted recovery materials.")).toBeInTheDocument();
+        expect(screen.getByText(`Deadline: ${new Date(exportDeadline * 1000).toLocaleDateString("en-GB")}`)).toBeInTheDocument();
         expect(api.fetchCloudNotices).toHaveBeenCalledTimes(2);
         expect(screen.getByRole("button", { name: "Download encrypted export" })).toBeEnabled();
         expect(screen.queryByRole("alert")).not.toBeInTheDocument();

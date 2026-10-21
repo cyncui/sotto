@@ -109,11 +109,18 @@ fn app_with_billing_mode(
     let state = AppState {
         deployment_mode,
         telemetry_ingest: false,
+        contact_verification: None,
+        cloud_notice_dispatch_enabled: false,
+        resend_webhook_secret: None,
         cloud_action_enforcement_enabled: false,
+        cloud_coverage_authority_enforcement_enabled: false,
+        cloud_coverage_authority_shadow_enabled: false,
         machine_eligibility_enforcement_enabled: false,
         billing_transfers_enabled: false,
         billing_transfer_execution_enabled: false,
         billing_transfer_setup_enabled: false,
+        cloud_retention_dry_run_enabled: false,
+        cloud_retention_operator_token: None,
         pool,
         oauth: None,
         oauth_config: None,
@@ -315,11 +322,18 @@ fn app_with_provider(pool: PgPool, provider: Arc<dyn SubscriptionProvider>) -> R
     let state = AppState {
         deployment_mode: sotto_server::config::DeploymentMode::SelfHosted,
         telemetry_ingest: false,
+        contact_verification: None,
+        cloud_notice_dispatch_enabled: false,
+        resend_webhook_secret: None,
         cloud_action_enforcement_enabled: false,
+        cloud_coverage_authority_enforcement_enabled: false,
+        cloud_coverage_authority_shadow_enabled: false,
         machine_eligibility_enforcement_enabled: false,
         billing_transfers_enabled: false,
         billing_transfer_execution_enabled: false,
         billing_transfer_setup_enabled: false,
+        cloud_retention_dry_run_enabled: false,
+        cloud_retention_operator_token: None,
         pool,
         oauth: None,
         oauth_config: None,
@@ -3066,6 +3080,15 @@ async fn delayed_personal_checkout_payment_honours_timely_founding_reservation()
     .expect("read delayed Checkout settlement");
     assert_eq!(account_state, "active");
     assert_eq!(reservation_state, "confirmed");
+    let checkout_notices: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_notice_outbox WHERE recipient_user_id=$1 \
+         AND kind='checkout_outcome' AND channel='in_app' AND policy_key='cloud-checkout-outcome-v1'",
+    )
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load checkout outcome notice created by webhook");
+    assert_eq!(checkout_notices, 1);
 
     sqlx::query("DELETE FROM billing_founding_schedule_jobs WHERE beneficiary_id = $1")
         .bind(&user_id)
@@ -3149,6 +3172,88 @@ async fn personal_incomplete_expired_webhook_cancels_pending_account() {
     .expect("personal account after incomplete expiry");
     assert_eq!(account.0, "canceled");
     assert_eq!(account.1, "sub_personal_expired");
+}
+
+#[tokio::test]
+async fn personal_checkout_expiry_notice_is_independent_of_sponsored_billing() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let user_id = "billing-user-personal-checkout-expiry-notice";
+    seed_user(&pool, user_id).await;
+    let operation_id =
+        seed_personal_account(&pool, user_id, "personal-checkout-expiry-notice").await;
+    sqlx::query("DELETE FROM stripe_webhook_events WHERE event_id = $1")
+        .bind("evt_personal_checkout_expiry_notice")
+        .execute(&pool)
+        .await
+        .expect("pre-clean personal checkout expiry webhook receipt");
+    let app = app_with_provider(
+        pool.clone(),
+        Arc::new(TestProvider {
+            observation: SubscriptionObservation::Missing,
+            personal_period_end: None,
+        }),
+    );
+    let payload = serde_json::json!({
+        "id": "evt_personal_checkout_expiry_notice",
+        "created": 1_800_000_001,
+        "api_version": STRIPE_API_VERSION,
+        "type": "checkout.session.expired",
+        "data": { "object": {
+            "id": "cs_personal_checkout_expired_notice",
+            "client_reference_id": format!("personal:{operation_id}"),
+            "status": "expired",
+            "payment_status": "unpaid"
+        }}
+    })
+    .to_string();
+
+    assert_eq!(
+        post_webhook(&app, &payload, Some(&stripe_signature(&payload))).await,
+        StatusCode::OK
+    );
+    let checkout_notices: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_notice_outbox WHERE recipient_user_id=$1 \
+         AND kind='checkout_outcome' AND channel='in_app' \
+         AND policy_key='cloud-checkout-outcome-v1'",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load personal checkout expiry notice");
+    assert_eq!(checkout_notices, 1);
+
+    sqlx::query("DELETE FROM cloud_notice_outbox WHERE recipient_user_id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("clean personal checkout expiry notice");
+    sqlx::query("DELETE FROM billing_personal_accounts WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("clean personal checkout expiry account");
+    sqlx::query("DELETE FROM billing_personal_events WHERE operation_id = $1")
+        .bind(&operation_id)
+        .execute(&pool)
+        .await
+        .expect("clean personal checkout expiry events");
+    sqlx::query("DELETE FROM billing_operations WHERE operation_id = $1")
+        .bind(operation_id)
+        .execute(&pool)
+        .await
+        .expect("clean personal checkout expiry operation");
+    sqlx::query("DELETE FROM stripe_webhook_events WHERE event_id = $1")
+        .bind("evt_personal_checkout_expiry_notice")
+        .execute(&pool)
+        .await
+        .expect("clean personal checkout expiry webhook receipt");
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("clean personal checkout expiry user");
 }
 
 #[tokio::test]

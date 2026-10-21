@@ -23,6 +23,8 @@ use sotto_server::cloud_provider_stripe_http::StripeReadLimits;
 #[cfg(not(feature = "e2e-mock-billing"))]
 use sotto_server::cloud_provider_stripe_sponsored::SponsoredStripeCoverageConfig;
 use sotto_server::config::Config;
+use sotto_server::contact_email::ResendSender;
+use sotto_server::contact_verification::ContactVerificationService;
 use sotto_server::db;
 use sotto_server::error::{Error, Result};
 use sotto_server::state::AppState;
@@ -90,6 +92,7 @@ async fn run() -> Result<()> {
                 if config.provider_refresh_ingest_enabled
                     || config.provider_refresh_worker_enabled
                     || config.provider_refresh_reconciliation_enabled
+                    || config.provider_authority_revalidation_enabled
                 {
                     let account_id = config.stripe_account_id.as_deref().ok_or_else(|| {
                         Error::Config("provider refresh requires STRIPE_ACCOUNT_ID".into())
@@ -167,6 +170,62 @@ async fn run() -> Result<()> {
     // AppState owns billing; keep only the provider handle for the optional worker.
     let worker_provider = billing.as_ref().map(BillingState::provider);
 
+    let contact_verification = if config.contact_verification.enrolment_enabled
+        && config.contact_verification.email_sends_enabled
+    {
+        let sender = ResendSender::new(
+            config
+                .contact_verification
+                .resend_api_key
+                .clone()
+                .expect("contact email configuration validated at startup"),
+            config
+                .contact_verification
+                .from_address
+                .clone()
+                .expect("contact email configuration validated at startup"),
+            config
+                .contact_verification
+                .web_origin
+                .clone()
+                .expect("contact email configuration validated at startup"),
+        )?;
+        let origin = config
+            .contact_verification
+            .web_origin
+            .as_deref()
+            .expect("contact email configuration validated at startup");
+        Some(Arc::new(ContactVerificationService::new(
+            config.contact_verification.enrolment_enabled,
+            true,
+            origin,
+            Arc::new(sender),
+        )?))
+    } else {
+        None
+    };
+    let notice_sender = if config.cloud_notice_dispatch_enabled {
+        Some(ResendSender::new(
+            config
+                .contact_verification
+                .resend_api_key
+                .clone()
+                .expect("notice dispatch configuration validated at startup"),
+            config
+                .contact_verification
+                .from_address
+                .clone()
+                .expect("notice dispatch configuration validated at startup"),
+            config
+                .contact_verification
+                .web_origin
+                .clone()
+                .expect("notice dispatch configuration validated at startup"),
+        )?)
+    } else {
+        None
+    };
+
     let repair_billing = billing.clone();
     let repair_runtime = personal_coverage_runtime.clone();
     let billing_transfer_operator_review_enabled = config.billing_transfer_operator_token.is_some();
@@ -176,6 +235,12 @@ async fn run() -> Result<()> {
         oauth,
         oauth_config: config.oauth.clone(),
         billing,
+        contact_verification,
+        cloud_notice_dispatch_enabled: config.cloud_notice_dispatch_enabled,
+        resend_webhook_secret: config
+            .cloud_notice_dispatch_enabled
+            .then(|| config.resend_webhook_secret.clone())
+            .flatten(),
         telemetry_ingest: config.telemetry.ingest_enabled,
         // One opt-in drives both halves: the routes that accept work and the worker that performs
         // it. Splitting them would let a deployment freeze organisations it can never purge.
@@ -185,19 +250,40 @@ async fn run() -> Result<()> {
         organisation_deletion_operator_token: config.organisation_deletion_operator_token,
         billing_transfer_operator_token: config.billing_transfer_operator_token,
         cloud_action_enforcement_enabled: config.cloud_action_enforcement_enabled,
+        cloud_coverage_authority_enforcement_enabled: config
+            .cloud_coverage_authority_enforcement_enabled,
+        cloud_coverage_authority_shadow_enabled: config.cloud_coverage_authority_shadow_enabled,
         machine_eligibility_enforcement_enabled: config.machine_eligibility_enforcement_enabled,
         billing_transfers_enabled: config.billing_transfers_enabled,
         billing_transfer_execution_enabled: config.billing_transfer_execution_enabled,
         billing_transfer_setup_enabled: config.billing_transfer_setup_enabled,
+        cloud_retention_dry_run_enabled: config.cloud_retention_dry_run_enabled,
+        cloud_retention_operator_token: config.cloud_retention_operator_token.clone(),
     };
 
     println!("deployment mode: {}", config.deployment_mode.as_str());
     println!("cloud sales: {}", config.cloud_sales_enabled);
     println!(
+        "cloud contact enrolment: {}, email sends: {}",
+        config.contact_verification.enrolment_enabled,
+        config.contact_verification.email_sends_enabled
+    );
+    println!(
+        "Cloud lifecycle notice email dispatch: {}",
+        config.cloud_notice_dispatch_enabled
+    );
+    println!(
         "provider refresh: ingest={}, worker={}, reconciliation={}",
         config.provider_refresh_ingest_enabled,
         config.provider_refresh_worker_enabled,
         config.provider_refresh_reconciliation_enabled
+    );
+    println!(
+        "coverage authority: revalidation={}, shadow={}, enforcement={}, max_age_seconds={:?}",
+        config.provider_authority_revalidation_enabled,
+        config.cloud_coverage_authority_shadow_enabled,
+        config.cloud_coverage_authority_enforcement_enabled,
+        config.cloud_coverage_authority_max_age_seconds,
     );
     println!(
         "cloud action enforcement: {}",
@@ -236,6 +322,10 @@ async fn run() -> Result<()> {
         "organisation deletion routes and worker: {}",
         config.organisation_deletion_worker_enabled
     );
+    println!(
+        "Cloud personal retention dry run: {}",
+        config.cloud_retention_dry_run_enabled
+    );
 
     // Default-on telemetry must never be a surprise: say so at boot, with the off switch.
     if config.telemetry.ping_enabled && !config.telemetry.ingest_enabled {
@@ -246,6 +336,9 @@ async fn run() -> Result<()> {
     }
     if config.organisation_deletion_worker_enabled {
         sotto_server::org_deletion_worker::spawn(pool.clone(), worker_provider.clone());
+    }
+    if config.cloud_retention_dry_run_enabled {
+        sotto_server::cloud_retention_lifecycle::spawn(state.clone());
     }
     if config.founding_schedule_worker_enabled {
         #[cfg(not(feature = "e2e-mock-billing"))]
@@ -286,6 +379,12 @@ async fn run() -> Result<()> {
             })?;
         sotto_server::founding_schedule_worker::spawn(pool.clone(), provider, catalogue);
     }
+    if config.founding_price_notices_enabled {
+        sotto_server::founding_price_notices::spawn(pool.clone());
+    }
+    if let Some(sender) = notice_sender {
+        sotto_server::notifications::spawn(pool.clone(), sender);
+    }
     if config.billing_transfer_execution_enabled {
         let provider = worker_provider.as_ref().ok_or_else(|| {
             Error::Config("payer transfer execution requires Stripe billing".into())
@@ -310,6 +409,27 @@ async fn run() -> Result<()> {
             stripe,
             coverage,
             sponsored_coverage,
+            config
+                .provider_authority_revalidation_enabled
+                .then_some(config.cloud_coverage_authority_max_age_seconds)
+                .flatten(),
+        );
+    }
+    if config.provider_authority_revalidation_enabled {
+        let Some((coverage, sponsored_coverage, stripe)) = personal_coverage_runtime.clone() else {
+            return Err(Error::Config(
+                "Cloud authority revalidation requires configured Stripe coverage".into(),
+            ));
+        };
+        let max_age = config
+            .cloud_coverage_authority_max_age_seconds
+            .ok_or_else(|| Error::Config("Cloud authority max age is required".into()))?;
+        sotto_server::cloud_provider_stripe_refresh_executor::spawn_revalidation(
+            pool.clone(),
+            stripe,
+            coverage,
+            sponsored_coverage,
+            max_age,
         );
     }
     if config.provider_refresh_reconciliation_enabled {

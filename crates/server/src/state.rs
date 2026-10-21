@@ -7,6 +7,7 @@ use sqlx::PgPool;
 use crate::auth::OAuthProvider;
 use crate::billing::BillingState;
 use crate::config::{DeploymentMode, OAuthConfig};
+use crate::contact_verification::ContactVerificationService;
 
 /// Cloneable handle to the resources every request needs.
 ///
@@ -19,6 +20,12 @@ pub struct AppState {
     pub oauth: Option<Arc<dyn OAuthProvider>>,
     pub oauth_config: Option<OAuthConfig>,
     pub billing: Option<BillingState>,
+    /// Contact enrolment and verification transport. `None` keeps the feature unavailable.
+    pub contact_verification: Option<Arc<ContactVerificationService>>,
+    /// Whether bounded Cloud lifecycle email dispatch and its Resend callback are enabled.
+    pub cloud_notice_dispatch_enabled: bool,
+    /// Resend Svix signing secret; absent keeps provider feedback unavailable.
+    pub resend_webhook_secret: Option<String>,
     /// Whether this instance accepts telemetry pings (`SOTTO_TELEMETRY_INGEST=1`, hosted only).
     pub telemetry_ingest: bool,
     /// Whether the organisation-deletion API is registered on this instance.
@@ -37,6 +44,10 @@ pub struct AppState {
     pub billing_transfer_operator_token: Option<String>,
     /// Whether the dormant human hosted action policy rejects ineligible requests.
     pub cloud_action_enforcement_enabled: bool,
+    /// Whether Cloud eligibility requires a fresh, complete provider authority receipt.
+    pub cloud_coverage_authority_enforcement_enabled: bool,
+    /// Whether authority freshness participates in non-blocking shadow decisions.
+    pub cloud_coverage_authority_shadow_enabled: bool,
     /// Whether hosted machine retrieval and creation apply the accountable beneficiary policy.
     pub machine_eligibility_enforcement_enabled: bool,
     /// Whether consented payer-transfer API routes are registered.
@@ -45,4 +56,8 @@ pub struct AppState {
     pub billing_transfer_execution_enabled: bool,
     /// Whether a beneficiary may create a Checkout setup session for a personal transfer.
     pub billing_transfer_setup_enabled: bool,
+    /// Whether the dormant Cloud retention candidate and dry-run worker is started.
+    pub cloud_retention_dry_run_enabled: bool,
+    /// Dedicated bearer token for Cloud retention operator routes.
+    pub cloud_retention_operator_token: Option<String>,
 }

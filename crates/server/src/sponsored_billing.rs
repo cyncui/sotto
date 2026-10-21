@@ -603,6 +603,7 @@ pub async fn record_checkout(
     .bind(operation_id)
     .execute(&mut **tx)
     .await?;
+    retire_founding_notice_for_pending_removal(tx, operation_id).await?;
     load_operation(tx, operation_id).await
 }
 
@@ -673,6 +674,7 @@ pub async fn record_provider_update(
     .bind(current_period_end)
     .execute(&mut **tx)
     .await?;
+    retire_founding_notice_for_pending_removal(tx, operation_id).await?;
     sqlx::query(
         "UPDATE billing_sponsored_seats SET effective_from = GREATEST(\
              effective_from, COALESCE($2, 0)\
@@ -684,6 +686,41 @@ pub async fn record_provider_update(
     .execute(&mut **tx)
     .await?;
     load_operation(tx, operation_id).await
+}
+
+async fn retire_founding_notice_for_pending_removal(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "WITH retiring AS ( \
+             SELECT award.award_id, notice.transition_epoch \
+             FROM billing_sponsored_operations operation \
+             JOIN billing_sponsored_seats seat ON seat.operation_id <> operation.operation_id \
+               AND seat.organization_id=operation.organization_id \
+               AND seat.beneficiary_id=operation.beneficiary_id \
+             JOIN billing_founding_awards award ON award.beneficiary_id=seat.beneficiary_id \
+               AND award.payer_kind='sponsor' AND award.payer_id=seat.organization_id \
+             JOIN billing_founding_price_notice_state notice ON notice.award_id=award.award_id \
+             WHERE operation.operation_id=$1 AND operation.action IN ('remove','replace') \
+               AND seat.effective_until IS NOT NULL AND seat.effective_until <= notice.transition_epoch \
+               AND notice.outcome <> 'retired' \
+         ), retired AS ( \
+             UPDATE billing_founding_price_notice_state notice SET outcome='retired', \
+               reason_code='subscription_ending', updated_at=now() \
+             FROM retiring WHERE notice.award_id=retiring.award_id \
+             RETURNING notice.award_id, notice.transition_epoch \
+         ) \
+         UPDATE cloud_notice_outbox outbox SET status='cancelled', cancelled_at=now(), updated_at=now() \
+         FROM retired WHERE outbox.event_key = \
+           'founding-price-change:' || retired.award_id || ':' || retired.transition_epoch::text \
+           AND outbox.kind='price_change' AND outbox.policy_key='founding-standard-price-v1' \
+           AND outbox.status IN ('pending','leased')",
+    )
+    .bind(operation_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 pub async fn record_provider_item(

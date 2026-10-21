@@ -58,17 +58,23 @@ function withTransfer(transfers: PayerTransfer[], updated: PayerTransfer): Payer
   return next.sort((left, right) => right.transferId.localeCompare(left.transferId));
 }
 
+// setTimeout cannot wait longer than 2^31 - 1 ms; a longer wait re-arms when the timer fires.
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
 export function PayerTransferInbox() {
   const [available, setAvailable] = useState(false);
   const [setupAvailable, setSetupAvailable] = useState(false);
   const [userId, setUserId] = useState<string | null>(null);
   const [transfers, setTransfers] = useState<PayerTransfer[]>([]);
+  // The list has been received at least once, so an empty one really means no requests.
+  const [listLoaded, setListLoaded] = useState(false);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [expiryTick, setExpiryTick] = useState(0);
 
   async function refresh() {
     setLoading(true);
@@ -77,6 +83,7 @@ export function PayerTransferInbox() {
       const page = await fetchPayerTransfers();
       setTransfers(page.transfers);
       setNextCursor(page.nextCursor);
+      setListLoaded(true);
     } catch (e) {
       setError(message(e));
     } finally {
@@ -125,6 +132,19 @@ export function PayerTransferInbox() {
     window.addEventListener("sotto:payer-transfer-updated", onTransferUpdated);
     return () => window.removeEventListener("sotto:payer-transfer-updated", onTransferUpdated);
   }, [available]);
+
+  useEffect(() => {
+    // Re-render when the nearest open invitation reaches its deadline, so expiry shows without a refresh.
+    const nowMs = Date.now();
+    const deadlines = transfers
+      .filter((transfer) => transfer.state === "awaiting_consent")
+      .map((transfer) => Math.min(transfer.consentExpiresAtEpoch, transfer.effectiveFrom) * 1000)
+      .filter((deadlineMs) => deadlineMs > nowMs);
+    if (deadlines.length === 0) return;
+    const delay = Math.min(Math.min(...deadlines) - nowMs, MAX_TIMER_DELAY_MS);
+    const timer = window.setTimeout(() => setExpiryTick((tick) => tick + 1), delay);
+    return () => window.clearTimeout(timer);
+  }, [transfers, expiryTick]);
 
   useEffect(() => {
     if (loading) return;
@@ -188,7 +208,7 @@ export function PayerTransferInbox() {
     {notice !== null && <p className="notice" role="status">{notice}</p>}
     <button disabled={loading || loadingMore || busyId !== null} onClick={() => void refresh()}>{loading ? "Refreshing transfers…" : "Refresh transfers"}</button>
     {loading && <p className="muted" role="status">Loading transfer requests…</p>}
-    {!loading && transfers.length === 0 && <p className="muted">There are no payer transfer requests for this account.</p>}
+    {!loading && listLoaded && transfers.length === 0 && <p className="muted">There are no payer transfer requests for this account.</p>}
     <ul className="items">
       {transfers.map((transfer) => {
         const incoming = transfer.participantRole === "counterparty";

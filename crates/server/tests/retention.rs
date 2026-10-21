@@ -168,13 +168,13 @@ async fn dry_run_is_idempotent_and_purge_deletes_only_the_explicit_personal_scop
         .expect("dry run should claim a job");
     assert_eq!(dry_run.state, RetentionState::DryRun);
     assert_eq!(dry_run.processed_items, 1);
-    let repeated_dry_run =
+    assert!(
         retention::run_once(&pool, "retention-test-dry-run-again", RetentionMode::DryRun)
             .await
             .expect("repeat retention dry run")
-            .expect("repeat dry run should claim the same job");
-    assert_eq!(repeated_dry_run.state, RetentionState::DryRun);
-    assert_eq!(repeated_dry_run.processed_items, 1);
+            .is_none(),
+        "a completed dry run is not claimed again until an operator retries it"
+    );
     let project_exists: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM projects WHERE id=$1)")
             .bind(PROJECT_ID)
@@ -224,6 +224,82 @@ async fn dry_run_is_idempotent_and_purge_deletes_only_the_explicit_personal_scop
     assert_eq!(journal.get::<String, _>("expected_owner_id"), USER_ID);
     assert!(journal.get::<i64, _>("expected_created_at") > 0);
     cleanup(&pool, JOB_ID, USER_ID, PROJECT_ID).await;
+}
+
+#[tokio::test]
+async fn changed_revision_reopens_an_unfinished_personal_episode_for_recheck() {
+    let _guard = retention_test_lock().lock().await;
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let suffix = uuid::Uuid::new_v4();
+    let user_id = format!("retention-revision-user-{suffix}");
+    let job_id = format!("retention:revision-{suffix}");
+    let project_id = format!("revision-project-{suffix}");
+    cleanup(&pool, &job_id, &user_id, &project_id).await;
+    seed_user_and_project(&pool, &user_id, &project_id).await;
+
+    let mut original = intent(&job_id, &user_id);
+    original.expected_coverage_revision = Some(17);
+    assert_eq!(
+        retention::enqueue(&pool, &original)
+            .await
+            .expect("enqueue initial revision"),
+        EnqueueOutcome::Enqueued
+    );
+    sqlx::query(
+        r#"UPDATE cloud_retention_jobs SET state='held', hold_code='coverage_revision_changed',
+             dry_run_completed_at=now() WHERE job_id=$1"#,
+    )
+    .bind(&job_id)
+    .execute(&pool)
+    .await
+    .expect("simulate hold on the old coverage revision");
+    sqlx::query(
+        r#"INSERT INTO cloud_retention_scope_items
+           (job_id,resource_kind,resource_id,ownership_kind,expected_created_at,expected_revision,state)
+           VALUES ($1,'project',$2,'personal',1,NULL,'dry_run')"#,
+    )
+    .bind(&job_id)
+    .bind(&project_id)
+    .execute(&pool)
+    .await
+    .expect("seed an item that must be rechecked");
+
+    let mut refreshed = original;
+    refreshed.job_id = format!("{job_id}:new-attempt");
+    refreshed.expected_coverage_revision = Some(18);
+    assert_eq!(
+        retention::enqueue(&pool, &refreshed)
+            .await
+            .expect("same episode with refreshed coverage is rechecked"),
+        EnqueueOutcome::AlreadyQueued
+    );
+    let job = sqlx::query(
+        "SELECT expected_coverage_revision,state,hold_code,dry_run_completed_at IS NULL AS dry_run_reset
+         FROM cloud_retention_jobs WHERE job_id=$1",
+    )
+    .bind(&job_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read refreshed retention job");
+    assert_eq!(
+        job.get::<Option<i64>, _>("expected_coverage_revision"),
+        Some(18)
+    );
+    assert_eq!(job.get::<String, _>("state"), "ready");
+    assert_eq!(job.get::<Option<String>, _>("hold_code"), None);
+    assert!(job.get::<bool, _>("dry_run_reset"));
+    let item_state: String = sqlx::query_scalar(
+        "SELECT state FROM cloud_retention_scope_items WHERE job_id=$1 AND resource_id=$2",
+    )
+    .bind(&job_id)
+    .bind(&project_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read recheck item state");
+    assert_eq!(item_state, "planned");
+    cleanup(&pool, &job_id, &user_id, &project_id).await;
 }
 
 #[tokio::test]

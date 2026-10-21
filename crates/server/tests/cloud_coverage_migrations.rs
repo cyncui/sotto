@@ -942,3 +942,98 @@ async fn migration_0038_allows_named_allocations_to_share_a_provider_item() {
     assert_eq!(count, 2);
     database.cleanup().await;
 }
+
+#[tokio::test]
+async fn migration_0067_queues_registered_sources_for_authority_revalidation() {
+    let Some(database) = DisposableDatabase::create().await else {
+        return;
+    };
+    db::migrate(&database.pool)
+        .await
+        .expect("apply all migrations");
+    let beneficiary = format!("authority-migration-{}", uuid::Uuid::new_v4());
+    sqlx::query(
+        "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ($1, 'authority-migration', $1)",
+    )
+    .bind(&beneficiary)
+    .execute(&database.pool)
+    .await
+    .expect("insert beneficiary");
+    let source = SourceBinding {
+        beneficiary_id: beneficiary.clone(),
+        source_id: format!("{beneficiary}:source"),
+        provider_namespace: "stripe".into(),
+        external_allocation_reference: format!("{beneficiary}:allocation"),
+        ownership_evidence_reference: format!("{beneficiary}:ownership"),
+    };
+    let mut tx = database.pool.begin().await.expect("begin registration");
+    register_source(&mut tx, &format!("{beneficiary}:registration"), &source)
+        .await
+        .expect("register source");
+    tx.commit().await.expect("commit registration");
+    let generation_before: i64 = sqlx::query_scalar(
+        "SELECT provider_invalidation_generation FROM cloud_coverage_coordinators WHERE beneficiary_id = $1",
+    )
+    .bind(&beneficiary)
+    .fetch_one(&database.pool)
+    .await
+    .expect("read pre-correction generation");
+    sqlx::query(
+        "INSERT INTO billing_correction_requests \
+         (request_id, requester_user_id, beneficiary_id, payer_kind, payment_reference, \
+          subscription_id, reason, policy_version, idempotency_key, request_hash, \
+          full_refund_requested, state, preserve_paid_term, early_termination_confirmed_at_epoch, \
+          effective_at_epoch, result_code) \
+         VALUES ($1, $2, $2, 'personal', 'pi_authority_test', 'sub_authority_test', \
+                 'billing_error', 'policy-v1', $3, 'hash-v1', TRUE, 'refunded', FALSE, \
+                 1800000000, 1800000000, 'succeeded')",
+    )
+    .bind(format!("{beneficiary}:correction"))
+    .bind(&beneficiary)
+    .bind(format!("{beneficiary}:idempotency"))
+    .execute(&database.pool)
+    .await
+    .expect("insert confirmed early termination");
+    let generation_after: i64 = sqlx::query_scalar(
+        "SELECT provider_invalidation_generation FROM cloud_coverage_coordinators WHERE beneficiary_id = $1",
+    )
+    .bind(&beneficiary)
+    .fetch_one(&database.pool)
+    .await
+    .expect("read post-correction generation");
+    assert_eq!(generation_after, generation_before + 1);
+    let queued: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM cloud_coverage_revalidation_jobs \
+         WHERE beneficiary_id = $1 AND status = 'pending' AND next_attempt_at <= now())",
+    )
+    .bind(&beneficiary)
+    .fetch_one(&database.pool)
+    .await
+    .expect("read revalidation job");
+    assert!(
+        queued,
+        "a new source must be scheduled independently of events"
+    );
+    sqlx::query("DELETE FROM cloud_coverage_sources WHERE beneficiary_id = $1")
+        .bind(&beneficiary)
+        .execute(&database.pool)
+        .await
+        .expect("delete registered source");
+    sqlx::query("DELETE FROM cloud_coverage_coordinators WHERE beneficiary_id = $1")
+        .bind(&beneficiary)
+        .execute(&database.pool)
+        .await
+        .expect("delete coordinator with derived revalidation job");
+    let job_remains: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM cloud_coverage_revalidation_jobs WHERE beneficiary_id = $1)",
+    )
+    .bind(&beneficiary)
+    .fetch_one(&database.pool)
+    .await
+    .expect("check coordinator cleanup");
+    assert!(
+        !job_remains,
+        "coordinator deletion cascades its derived queue row"
+    );
+    database.cleanup().await;
+}
