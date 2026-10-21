@@ -8,6 +8,11 @@ import type { EligibilityView, PersonalLifecycle } from "../api";
 import { CloudAccountPanel } from "../CloudAccountPanel";
 
 vi.mock("../api", () => ({
+  confirmCloudContactVerification: vi.fn(),
+  fetchCloudContactStatus: vi.fn(),
+  UnsupportedCloudContactError: class UnsupportedCloudContactError extends Error {},
+  revokeCloudContact: vi.fn(),
+  startCloudContactVerification: vi.fn(),
   cancelPersonalBilling: vi.fn(),
   createPersonalCheckout: vi.fn(),
   createPersonalPortal: vi.fn(),
@@ -47,6 +52,9 @@ afterEach(cleanup);
 describe("CloudAccountPanel cancellation", () => {
   beforeEach(() => {
     vi.resetAllMocks();
+    vi.mocked(api.fetchCloudContactStatus).mockResolvedValue({
+      email: null, pendingExpiresAtEpoch: null, enrolmentAvailable: false,
+    });
     vi.mocked(api.fetchCloudNotices).mockResolvedValue([]);
     vi.mocked(api.fetchPersonalLifecycle).mockResolvedValue(activeLifecycle);
     vi.mocked(api.fetchPayerTransferCapabilities).mockResolvedValue({ available: false, setupAvailable: false });
