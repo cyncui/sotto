@@ -25,6 +25,7 @@ pub mod auth;
 pub mod billing;
 pub mod billing_catalogue;
 pub mod billing_operations;
+pub mod billing_recovery_executor;
 #[doc(hidden)]
 pub mod billing_refunds;
 #[doc(hidden)]
@@ -38,7 +39,9 @@ pub mod billing_transfers;
 #[doc(hidden)]
 pub mod cloud_action_policy;
 pub mod cloud_coverage;
+pub mod cloud_coverage_authority;
 pub mod cloud_coverage_reconciliation;
+pub mod cloud_coverage_revalidation;
 pub mod cloud_coverage_store;
 pub mod cloud_provider;
 pub mod cloud_provider_refresh;
@@ -56,6 +59,7 @@ pub mod cloud_provider_stripe_corrections;
 #[doc(hidden)]
 pub mod cloud_provider_stripe_coverage;
 pub mod founding_allocator;
+pub mod founding_price_notices;
 pub mod founding_schedule;
 pub mod founding_schedule_worker;
 // Dormant Stripe history transport; it remains unwired until the complete-history contract lands.
@@ -84,8 +88,12 @@ pub mod cloud_provider_stripe_sponsored_adapter;
 pub mod cloud_provider_stripe_sponsored_refresh;
 #[doc(hidden)]
 pub mod cloud_provider_stripe_sponsored_store;
+#[doc(hidden)]
+pub mod cloud_retention_lifecycle;
 pub mod community;
 pub mod config;
+pub mod contact_email;
+pub mod contact_verification;
 pub mod db;
 pub mod encoding;
 pub mod entitlements;
@@ -101,6 +109,8 @@ pub mod person_eligibility;
 pub mod personal_billing;
 #[doc(hidden)]
 pub mod retention;
+#[doc(hidden)]
+pub mod retention_ops;
 // The lifecycle seam, HTTP adapter, and worker remain doc-hidden: deletion is enabled per
 // deployment rather than presented as a stable public API surface, and the internal seam is not
 // something an embedder should call directly.
@@ -120,6 +130,7 @@ pub mod server_info;
 pub mod share;
 #[doc(hidden)]
 pub mod sponsored_billing;
+pub mod sponsored_billing_recovery_executor;
 pub mod state;
 pub mod sync;
 pub mod telemetry;
@@ -159,6 +170,16 @@ pub fn app(state: AppState) -> Router {
     } else {
         Router::new()
     };
+    let cloud_retention_ops = if state.cloud_retention_operator_token.is_some() {
+        retention_ops::router()
+    } else {
+        Router::new()
+    };
+    let cloud_notice_ops = if state.cloud_retention_operator_token.is_some() {
+        notifications::operator_router()
+    } else {
+        Router::new()
+    };
     Router::new()
         .merge(health::router())
         .merge(auth::router())
@@ -172,8 +193,16 @@ pub fn app(state: AppState) -> Router {
         .merge(billing_transfers)
         .merge(billing_transfer_setup)
         .merge(billing_transfer_ops)
+        .merge(cloud_retention_ops)
+        .merge(cloud_notice_ops)
+        .merge(if state.billing_transfer_operator_token.is_some() {
+            founding_price_notices::operator_router()
+        } else {
+            Router::new()
+        })
         .merge(machine::router())
         .merge(notifications::router())
+        .merge(contact_verification::router())
         .merge(sync::router())
         .merge(share::router())
         .merge(server_info::router())

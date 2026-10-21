@@ -70,6 +70,10 @@ interval-change protection, safe Customer Portal configuration, and complete sch
 flow have passed a Stripe test-mode rehearsal. The worker requires
 `STRIPE_CLOUD_PORTAL_CONFIGURATION_ID` even when new sales are off. Set the preflight value to `1`
 only after recording that evidence. The worker switch does not enable Cloud sales by itself.
+Founding price-change notices have their own default-off `SOTTO_FOUNDING_PRICE_NOTICES_ENABLED`
+switch. It requires Cloud mode, the founding schedule worker, the hosted catalogue, and the
+protected billing operator token so late or unresolved notice cohorts can be reviewed. It creates
+only in-app notices after a schedule has been verified; it does not send email or change billing.
 
 Create a dedicated Stripe Customer Portal configuration for Cloud and set its id in
 `STRIPE_CLOUD_PORTAL_CONFIGURATION_ID`. Enable payment-method updates and period-end cancellation
@@ -104,6 +108,18 @@ Checkout subscription is linked is retried without recording a receipt. Neither 
 sales, reconciliation, or Cloud action enforcement; leave these values disabled until the hosted
 provider lifecycle has been exercised and reviewed.
 
+Coverage authority is a separate opt-in. `SOTTO_PROVIDER_AUTHORITY_REVALIDATION_ENABLED=1` starts
+the durable full-source scheduler; set `SOTTO_CLOUD_COVERAGE_AUTHORITY_MAX_AGE_SECONDS` to a
+positive freshness window between 60 seconds and 400 days. New and existing registered sources
+are queued independently of Stripe event ids, and a complete, generation-matched collection is
+required before it can be treated as current. Existing projections without an authority receipt
+remain unavailable to strict authority checks until revalidated. `SOTTO_CLOUD_COVERAGE_AUTHORITY_SHADOW=1`
+uses that result in non-blocking policy observations. Retention always requires current authority
+and holds candidates when it is missing or stale. Keep
+`SOTTO_CLOUD_COVERAGE_AUTHORITY_ENFORCEMENT=0` until the annual/no-event, mixed-source, invalidation,
+and restart cases have passed the pinned-version rehearsal. Enabling shadow or enforcement without
+scheduled revalidation is rejected at startup.
+
 Human hosted action checks are shadow-only by default. They record would-deny decisions while
 existing ACL, grant, lifecycle, and export responses remain unchanged. Do not set
 `SOTTO_CLOUD_ACTION_ENFORCEMENT=1` until the Cloud transition and export gates have been
@@ -131,6 +147,20 @@ the window for new requests. The organisation stays frozen for the whole configu
 Changing it never shortens an existing operation's stored `purge_after` deadline.
 Choose a value that covers the managed-backup and export lifecycle: backups taken before purge can
 retain ciphertext after the recovery window, and self-hosted operators must remove unmanaged copies.
+
+Personal Cloud expiry review is separately disabled by default. `SOTTO_CLOUD_RETENTION_DRY_RUN_ENABLED=1`
+starts a bounded reconciler that snapshots only explicitly personal resources and validates them
+after the person's existing export deadline. It never deletes resources, writes deletion receipts or
+tombstones, or enables the retention purge path. Keep it off until a current-candidate backup and
+tombstone restore has been verified and the customer-notice evidence has been reviewed.
+
+The protected `/ops/cloud/retention` inspection and action routes are mounted only when
+`SOTTO_CLOUD_RETENTION_OPERATOR_TOKEN` is configured. Use a dedicated value of at least 32
+characters; do not reuse a billing, deployment, or metrics token. The surface returns fixed reason
+codes, counts, deadlines, and opaque job fingerprints. `hold`, `cancel`, and `retry_dry_run` never
+enable purge; an operator-supplied label is audit text, not an authenticated identity. A successful
+dry run is review evidence, not permission to delete data. This slice deliberately has no purge
+route or purge-worker switch.
 
 On a 1 GB host, give the kernel some headroom before the first start:
 
@@ -1124,6 +1154,55 @@ organisation whose purge has already begun. Existing operations keep their store
 deadline; the routes return `404` again and the worker stops advancing the queue, leaving frozen
 organisations frozen until deletion is re-enabled or an operator recovers them through the runbook.
 
+## Cloud lifecycle email contacts
+
+Contact enrolment is optional and independent of billing and vault access. Both
+`SOTTO_CLOUD_CONTACT_ENROLMENT_ENABLED` and `SOTTO_CLOUD_CONTACT_EMAIL_SEND_ENABLED` default to
+`0` and must be enabled together; the server rejects a partial configuration. Keep both off until
+the sender domain is authenticated and a test recipient has completed the full challenge flow.
+The server requires an HTTPS `SOTTO_WEB_ORIGIN`, a configured sender address, and the transport
+credential from the deployment secret store. Do not put the credential in a checked-in file or
+pass it on a command line.
+
+The contact endpoints let a signed-in user set, verify, view, and revoke their own lifecycle email
+address without unlocking the vault. Verification proves control of that address; it does not
+change billing, access, or export rights, and it does not mean future notices have been delivered.
+The verification callback token is one-use and short-lived. The server stores only its digest.
+
+To disable the journey, turn both flags off and restart the server. Existing verified contacts are
+retained, and users can still revoke their own contact. Re-enabling the flags does not resend an
+old challenge; the user starts a fresh verification request.
+
+Lifecycle-notice email dispatch is a separate Cloud-only control:
+`SOTTO_CLOUD_NOTICE_DISPATCH_ENABLED` defaults to `0`. It requires the configured Resend API
+credential, sender address and webhook signing secret. The callback path is rate-limited at the
+edge and accepts only signed provider feedback. Relay acceptance is recorded separately from a
+verified delivery event. Notices with a future due date are not sent early; uncertain sends are
+retried with one stable message identity only inside the provider's idempotency window. The
+dispatcher never enables sales or coverage enforcement and is not started on self-hosted instances.
+Each email links to the no-vault `/cloud` account surface.
+Impending-purge email remains unavailable until the purge notice timing policy is approved; dispatch
+does not infer a cadence from the retention deadline.
+
+Email intents are recorded for users with a verified contact even while dispatch is disabled. Before
+enabling dispatch after contact enrolment has been available, review the pending queue through the
+protected notice diagnostics and suppress notices that are no longer timely; due backlog becomes
+eligible for sending as soon as the worker starts. A send whose outcome remains unknown is moved to
+`delivery_unknown` 23 hours after its first attempt to stay inside Resend's idempotency window. Check
+the provider dashboard before deciding how to handle that notice; do not create a new message identity
+to retry it.
+
+The recovery-period warning is scheduled three days before the recovery deadline and is sent only
+while the same renewal remains in recovery. If payment resolves or the recovery period ends before the
+warning is delivered, current eligibility suppresses it.
+
+Protected notice diagnostics are available at `/ops/cloud/notices` when the existing Cloud retention
+operator token is configured. The endpoint returns bounded opaque fingerprints and fixed reason
+codes only. `retry` is limited to a known rejected request with a current verified contact and a
+remaining idempotency window; `suppress` only stops work that has not been accepted by the provider.
+Operator labels are declared audit text, not authenticated identities. A sent message cannot be
+recalled, and this surface is not a live-delivery rehearsal.
+
 ## Database security
 
 The default `docker-compose.prod.yml` keeps Postgres on the **internal compose network only** - it
@@ -1192,6 +1271,155 @@ Card data never touches the server - checkout and subscription management happen
 Stripe-hosted pages, and the webhook only assigns the org's tier.
 
 ## Operations
+
+The default-off `SOTTO_BILLING_RECOVERY_WORKER_ENABLED` retries interrupted personal Checkout
+creation from the stored offer, allocation, expiry and original Stripe idempotency key. It only
+creates or reopens the same Checkout session; payment and coverage still require the signed
+`invoice.paid` webhook. Retries stop before Stripe's documented idempotency-key pruning window, and
+ambiguous older operations are parked for review. The worker also checks Stripe's current status
+for locally expired pending personal accounts with a stored Checkout session id. For older rows
+that contain only the Checkout URL, it extracts the session id from the URL path; it also accepts
+`provider_operation_id` when that field actually contains a Checkout session id. Stripe's response
+must confirm the exact personal operation before the account is released, and the session must be
+expired and unpaid. This repairs missed or previously acknowledged expiry events; an open or
+completed session is never released by this check. This switch does not enable sales.
+
+The default-off `SOTTO_SPONSORED_BILLING_RECOVERY_WORKER_ENABLED` reconciles saved sponsored
+Checkout and shared-subscription schedule requests. It reuses the exact saved request and original
+Stripe idempotency key, and parks missing, changed or out-of-window evidence for review. Signed
+payment webhooks remain authoritative for activating sponsored seats. This switch requires Cloud
+mode and the hosted Stripe price catalogue, and it does not enable sponsored sales or refund
+processing. Older unresolved operations without saved request facts are parked by migration 0071;
+do not reconstruct a provider request manually.
+
+Signed Stripe expiry and paid webhooks can still close an operation while it is in `manual_review`.
+For an operation parked without a recorded Checkout session, first search Stripe for
+`client_reference_id=sponsored:<operation_id>`, subscription metadata
+`sponsored_operation_id=<operation_id>`, and related invoices and payments. Do not clear the seat
+or founding reservation if any provider object or payment may exist. If Stripe confirms that no
+Checkout session, subscription, invoice, or payment exists, record the incident and perform this
+guarded repair. The capacity row and operation query must each return exactly one row; the seat
+query may return zero or one pending seat; the reservation query may return zero or one reserved
+reservation. Roll back if another state or provider reference is present. The three updates must
+affect one operation and no more than one seat or reservation; otherwise roll back and investigate.
+
+```sql
+BEGIN;
+SELECT singleton FROM billing_founding_capacity WHERE singleton = TRUE FOR UPDATE;
+SELECT operation_id FROM billing_sponsored_operations
+ WHERE operation_id = '<operation_id>'
+   AND state = 'manual_review'
+   AND recovery_manual_review_required = TRUE
+   AND action = 'add'
+   AND provider_customer_id IS NULL
+   AND provider_subscription_id IS NULL
+   AND provider_checkout_session_id IS NULL
+   AND provider_payment_reference IS NULL
+   AND provider_item_id IS NULL
+   AND provider_operation_id IS NULL
+   AND provider_checkout_url IS NULL
+ FOR UPDATE;
+SELECT seat_id FROM billing_sponsored_seats
+ WHERE operation_id = '<operation_id>' AND state = 'pending'
+ FOR UPDATE;
+SELECT reservation_id FROM billing_founding_reservations
+ WHERE operation_id = '<operation_id>' AND status = 'reserved'
+ FOR UPDATE;
+UPDATE billing_founding_reservations
+   SET status = 'released', updated_at = now()
+ WHERE operation_id = '<operation_id>' AND status = 'reserved';
+UPDATE billing_sponsored_seats
+   SET state = 'canceled', updated_at = now()
+ WHERE operation_id = '<operation_id>' AND state = 'pending';
+UPDATE billing_sponsored_operations
+   SET state = 'failed', result_code = 'operator_confirmed_no_provider_object',
+       recovery_manual_review_required = FALSE,
+       recovery_last_error_code = 'operator_confirmed_no_provider_object',
+       recovery_lease_token = NULL, recovery_lease_until = NULL, updated_at = now()
+ WHERE operation_id = '<operation_id>'
+   AND state = 'manual_review'
+   AND recovery_manual_review_required = TRUE
+   AND action = 'add'
+   AND provider_customer_id IS NULL
+   AND provider_subscription_id IS NULL
+   AND provider_checkout_session_id IS NULL
+   AND provider_payment_reference IS NULL
+   AND provider_item_id IS NULL
+   AND provider_operation_id IS NULL
+   AND provider_checkout_url IS NULL
+ RETURNING operation_id;
+COMMIT;
+```
+
+Notify the organisation owner and beneficiary after commit. If the session, subscription, invoice,
+or payment cannot be ruled out, leave the operation and seat parked and escalate; do not create a
+replacement Checkout or rebuild the missing request.
+
+For a parked personal Checkout with no session id, do not clear the account because its local
+deadline elapsed. Check Stripe's event log and the customer's Checkout/subscription/payment history
+for the exact `client_reference_id` `personal:<operation_id>`. If a session exists, keep the account
+blocked and have an operator record its exact `cs_…` id on that operation so the recovery worker can
+verify its status. Bind it only when the row is still parked for this reason; require one returned
+row, then let the worker inspect Stripe before changing the account:
+
+```sql
+UPDATE billing_operations
+   SET provider_checkout_session_id = '<cs_session_id>',
+       reconciliation_next_attempt_at = now(), updated_at = now()
+ WHERE operation_id = '<operation_id>'
+   AND state = 'manual_review'
+   AND result_code = 'provider_idempotency_window_elapsed'
+   AND provider_checkout_session_id IS NULL
+   AND provider_operation_id IS NULL
+   AND provider_checkout_url IS NULL
+   AND EXISTS (SELECT 1 FROM billing_personal_accounts AS account
+                WHERE account.operation_id = billing_operations.operation_id
+                  AND account.state = 'pending'
+                  AND account.pending_expires_at_epoch <= extract(epoch FROM now())::bigint)
+ RETURNING operation_id;
+```
+
+If Stripe confirms that no session, payment, invoice or subscription exists,
+perform the following guarded repair in one database transaction. First record the operation id and
+Stripe review in the incident log. The first two `SELECT`s must each return exactly one row; if
+either returns no row or multiple rows, roll back and investigate. The `UPDATE`s must affect one
+operation and one account; otherwise roll back. Notify the customer after commit so they can retry.
+
+```sql
+BEGIN;
+SELECT singleton FROM billing_founding_capacity WHERE singleton = TRUE FOR UPDATE;
+SELECT operation_id FROM billing_operations
+ WHERE operation_id = '<operation_id>'
+   AND state = 'manual_review'
+   AND result_code = 'provider_idempotency_window_elapsed'
+   AND provider_checkout_session_id IS NULL
+   AND provider_operation_id IS NULL
+   AND provider_checkout_url IS NULL
+ FOR UPDATE;
+SELECT operation_id FROM billing_personal_accounts
+ WHERE operation_id = '<operation_id>'
+   AND state = 'pending'
+   AND pending_expires_at_epoch <= extract(epoch FROM now())::bigint
+ FOR UPDATE;
+UPDATE billing_founding_reservations SET status = 'released', updated_at = now()
+ WHERE operation_id = '<operation_id>' AND status = 'reserved';
+UPDATE billing_personal_accounts SET state = 'canceled', updated_at = now()
+ WHERE operation_id = '<operation_id>' AND state = 'pending';
+UPDATE billing_operations SET state = 'failed', result_code = 'operator_confirmed_no_session',
+       reconciliation_manual_review_required = FALSE,
+       reconciliation_last_error_code = 'operator_confirmed_no_session',
+       reconciliation_lease_token = NULL, reconciliation_lease_until = NULL, updated_at = now()
+ WHERE operation_id = '<operation_id>'
+   AND state = 'manual_review'
+   AND result_code = 'provider_idempotency_window_elapsed'
+   AND provider_checkout_session_id IS NULL
+   AND provider_operation_id IS NULL
+   AND provider_checkout_url IS NULL;
+COMMIT;
+```
+
+If a provider session or payment cannot be ruled out, leave the operation parked and escalate; do
+not create another Checkout or mark the account canceled.
 
 ```sh
 docker compose -f docker-compose.prod.yml logs -f server   # API logs

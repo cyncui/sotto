@@ -17,7 +17,7 @@ use sotto_server::{
     billing_catalogue::BillingPriceIds,
     db,
     founding_allocator::{FoundingDate, FoundingOffer, FoundingPayerKind},
-    founding_schedule, founding_schedule_worker,
+    founding_price_notices, founding_schedule, founding_schedule_worker,
 };
 
 mod support {
@@ -217,6 +217,16 @@ async fn founding_schedule_retargets_and_cancellation_wins_provider_races() {
     db::migrate(pool)
         .await
         .expect("apply founding schedule migration");
+    let legacy_notice_eligible: bool = sqlx::query_scalar(
+        "SELECT price_notice_eligible FROM billing_founding_schedule_jobs WHERE award_id='founding-schedule-award'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("read migrated legacy notice eligibility");
+    assert!(
+        !legacy_notice_eligible,
+        "migration must not backfill notices for pre-existing awards"
+    );
     assert!(sqlx::query(
         "UPDATE billing_founding_awards SET original_start_epoch = NULL, original_end_epoch = 1 \
          WHERE award_id = 'founding-schedule-award'",
@@ -501,6 +511,38 @@ async fn founding_schedule_retargets_and_cancellation_wins_provider_races() {
     .await
     .expect("read raced cancellation completion");
     assert_eq!(completed, ("not_required".into(), true));
+
+    // A legacy award can still be transferred, but the transfer must not opt a row with no
+    // verified boundary into repeated notice reconciliation.
+    sqlx::query(
+        "UPDATE billing_founding_awards SET payer_kind='sponsor', payer_id='legacy-sponsor' \
+         WHERE award_id='founding-schedule-award'",
+    )
+    .execute(pool)
+    .await
+    .expect("simulate transfer of a legacy award without a verified boundary");
+    let mut transferred_legacy_award = award.clone();
+    transferred_legacy_award.payer_kind = FoundingPayerKind::Sponsor;
+    transferred_legacy_award.payer_id = "legacy-sponsor".into();
+    let mut tx = pool.begin().await.expect("begin legacy transfer enqueue");
+    founding_schedule::enqueue(&mut tx, &transferred_legacy_award, "sub_legacy_sponsor")
+        .await
+        .expect("retarget the legacy award schedule");
+    tx.commit().await.expect("commit legacy transfer enqueue");
+    let eligible: bool = sqlx::query_scalar(
+        "SELECT price_notice_eligible FROM billing_founding_schedule_jobs \
+         WHERE award_id='founding-schedule-award'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("read legacy transfer notice eligibility");
+    assert!(!eligible);
+    assert!(
+        !founding_price_notices::run_once(pool, 1_900_000_000)
+            .await
+            .expect("legacy award is excluded from notice reconciliation"),
+        "an award without a verified boundary must not be selected on every worker poll"
+    );
 
     database.cleanup().await;
 }

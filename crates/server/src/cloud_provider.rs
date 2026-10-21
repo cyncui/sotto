@@ -16,8 +16,8 @@ use tokio::time::timeout;
 
 use crate::cloud_coverage::{normalise_confirmed_intervals, ConfirmedPaidInterval, PersonCoverage};
 use crate::cloud_coverage_reconciliation::{
-    begin_collection, finish_collection, register_source, CollectionStatus, ReconciliationError,
-    SourceBinding, SourceObservation,
+    begin_collection, finish_collection, finish_collection_with_authority, register_source,
+    AuthorityReceiptInput, CollectionStatus, ReconciliationError, SourceBinding, SourceObservation,
 };
 use crate::cloud_coverage_store::PublicationOutcome;
 use crate::cloud_provider_refresh_jobs::{self, RefreshJobError};
@@ -763,6 +763,16 @@ pub async fn accept_provider_invalidation(
     if updated.rows_affected() != 1 {
         return Err(ProviderAdapterError::InvalidationConflict);
     }
+    sqlx::query(
+        "INSERT INTO cloud_coverage_revalidation_jobs (beneficiary_id) \
+         VALUES ($1) ON CONFLICT (beneficiary_id) DO UPDATE \
+         SET status = 'pending', next_attempt_at = now(), attempt_count = 0, \
+             lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, \
+             last_error_code = NULL, updated_at = now()",
+    )
+    .bind(&allocation.beneficiary_id)
+    .execute(&mut **tx)
+    .await?;
     ensure_event_scope(tx, context, event, &allocation.beneficiary_id).await?;
     if ingest_enabled {
         enqueue_refresh_job(tx, context, event, allocation).await?;
@@ -1158,6 +1168,27 @@ pub async fn complete_verified_event(
     preparation: &CollectionPreparation,
     collection: &VerifiedCollection,
 ) -> Result<ApplyReceipt, ProviderAdapterError> {
+    complete_verified_event_with_authority(
+        tx,
+        context,
+        event,
+        allocation,
+        preparation,
+        collection,
+        None,
+    )
+    .await
+}
+
+pub async fn complete_verified_event_with_authority(
+    tx: &mut Transaction<'_, Postgres>,
+    context: &ProviderContext,
+    event: &VerifiedProviderEvent,
+    allocation: &VerifiedAllocation,
+    preparation: &CollectionPreparation,
+    collection: &VerifiedCollection,
+    authority: Option<&AuthorityReceiptInput>,
+) -> Result<ApplyReceipt, ProviderAdapterError> {
     context.validate()?;
     event.validate()?;
     allocation.validate()?;
@@ -1217,11 +1248,12 @@ pub async fn complete_verified_event(
     ensure_allocation(tx, context, allocation).await?;
     validate_provider_bindings(tx, context, &preparation.ticket.source_bindings).await?;
     validate_collection_sources(collection, &preparation.ticket.source_bindings)?;
-    let completed = finish_collection(
+    let completed = finish_collection_with_authority(
         tx,
         &preparation.ticket,
         &collection.aggregate_evidence_reference,
         &collection.observations,
+        authority,
     )
     .await
     .map_err(|error| match error {

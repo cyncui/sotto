@@ -42,6 +42,9 @@ fn app(pool: PgPool) -> axum::Router {
         oauth_config: None,
         billing: None,
         telemetry_ingest: false,
+        contact_verification: None,
+        cloud_notice_dispatch_enabled: false,
+        resend_webhook_secret: None,
         organisation_deletion_enabled: false,
         organisation_deletion_retention_days:
             sotto_server::config::DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
@@ -49,10 +52,14 @@ fn app(pool: PgPool) -> axum::Router {
         organisation_deletion_operator_token: None,
         billing_transfer_operator_token: None,
         cloud_action_enforcement_enabled: false,
+        cloud_coverage_authority_enforcement_enabled: false,
+        cloud_coverage_authority_shadow_enabled: false,
         machine_eligibility_enforcement_enabled: false,
         billing_transfers_enabled: false,
         billing_transfer_execution_enabled: false,
         billing_transfer_setup_enabled: false,
+        cloud_retention_dry_run_enabled: false,
+        cloud_retention_operator_token: None,
     })
 }
 

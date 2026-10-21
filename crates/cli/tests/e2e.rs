@@ -67,11 +67,16 @@ impl TestServer {
                 let state = sotto_server::state::AppState {
                     deployment_mode: sotto_server::config::DeploymentMode::SelfHosted,
                     telemetry_ingest: false,
+                    contact_verification: None,
                     cloud_action_enforcement_enabled: false,
+                    cloud_coverage_authority_enforcement_enabled: false,
+                    cloud_coverage_authority_shadow_enabled: false,
                     machine_eligibility_enforcement_enabled: false,
                     billing_transfers_enabled: false,
                     billing_transfer_execution_enabled: false,
                     billing_transfer_setup_enabled: false,
+                    cloud_notice_dispatch_enabled: false,
+                    resend_webhook_secret: None,
                     pool,
                     oauth: None,
                     oauth_config: None,
@@ -82,6 +87,8 @@ impl TestServer {
                     organisation_deletion_metrics_token: None,
                     organisation_deletion_operator_token: None,
                     billing_transfer_operator_token: None,
+                    cloud_retention_dry_run_enabled: false,
+                    cloud_retention_operator_token: None,
                 };
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                     .await

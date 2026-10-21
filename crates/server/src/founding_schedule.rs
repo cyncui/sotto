@@ -36,14 +36,18 @@ pub async fn enqueue(
     }
     let job_id = format!("founding-schedule:{}", award.award_id);
     let idempotency_key = format!("founding-transition:{}:1", award.award_id);
+    let price_notice_eligible = award
+        .original_end_epoch
+        .is_some_and(|transition_epoch| transition_epoch > 0);
     sqlx::query(
         "INSERT INTO billing_founding_schedule_jobs \
          (job_id, award_id, beneficiary_id, payer_kind, payer_id, provider_subscription_id, \
-          provider_idempotency_key) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7) \
+          provider_idempotency_key, price_notice_eligible) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) \
          ON CONFLICT (award_id) DO UPDATE SET \
            beneficiary_id = EXCLUDED.beneficiary_id, payer_kind = EXCLUDED.payer_kind, \
            payer_id = EXCLUDED.payer_id, provider_subscription_id = EXCLUDED.provider_subscription_id, \
+           price_notice_eligible = EXCLUDED.price_notice_eligible, \
            state = 'pending', provider_schedule_id = NULL, attempt_count = 0, last_error_code = NULL, \
            next_attempt_at = now(), \
            version = billing_founding_schedule_jobs.version + 1, \
@@ -62,6 +66,7 @@ pub async fn enqueue(
     .bind(&award.payer_id)
     .bind(subscription_id)
     .bind(idempotency_key)
+    .bind(price_notice_eligible)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -93,6 +98,7 @@ pub async fn mark_invoice_unresolved(
     .bind(error_code)
     .execute(&mut **tx)
     .await?;
+    crate::founding_price_notices::mark_award_schedule_unresolved(tx, award_id).await?;
     Ok(())
 }
 
@@ -198,6 +204,7 @@ pub async fn mark_not_required(
     pool: &PgPool,
     job: &FoundingScheduleJob,
 ) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
     let changed = sqlx::query(
         "UPDATE billing_founding_schedule_jobs SET state = 'not_required', \
            last_error_code = 'subscription_terminates_before_transition', lease_token = NULL, \
@@ -206,9 +213,18 @@ pub async fn mark_not_required(
     )
     .bind(&job.job_id)
     .bind(&job.lease_token)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?
     .rows_affected();
+    if changed == 1 {
+        crate::founding_price_notices::retire_award_notice(
+            &mut tx,
+            &job.award_id,
+            "subscription_ending",
+        )
+        .await?;
+    }
+    tx.commit().await?;
     Ok(changed == 1)
 }
 
@@ -285,6 +301,24 @@ pub async fn record_personal_cancellation(
     .bind(subscription_id)
     .execute(&mut *tx)
     .await?;
+    let award_id: Option<String> = sqlx::query_scalar(
+        "SELECT award.award_id FROM billing_founding_awards award \
+         JOIN billing_personal_accounts account ON account.user_id=award.beneficiary_id \
+         WHERE award.beneficiary_id=$1 AND award.payer_kind='personal' AND award.payer_id=$1 \
+           AND award.original_end_epoch IS NOT NULL \
+           AND award.original_end_epoch >= COALESCE(account.paid_through_epoch, 0)",
+    )
+    .bind(beneficiary_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(award_id) = award_id {
+        crate::founding_price_notices::retire_award_notice(
+            &mut tx,
+            &award_id,
+            "subscription_ending",
+        )
+        .await?;
+    }
     tx.commit().await
 }
 
