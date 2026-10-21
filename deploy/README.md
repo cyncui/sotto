@@ -154,13 +154,62 @@ after the person's existing export deadline. It never deletes resources, writes 
 tombstones, or enables the retention purge path. Keep it off until a current-candidate backup and
 tombstone restore has been verified and the customer-notice evidence has been reviewed.
 
+Shared organisation expiry review has a separate default-off switch:
+`SOTTO_CLOUD_SHARED_RETENTION_DRY_RUN_ENABLED=1`. It scans organisations whose current owners and
+admins have all lost Cloud eligibility, queues an in-app export notice for each, and starts the
+30-day shared-data export window no earlier than when those notices are first queued. The worker
+snapshots shared scope and performs validation-only dry runs; it cannot purge shared data. Keep this
+switch off until the shared-scope evidence, customer notices, backup and tombstone restore have been
+reviewed. Enabling personal expiry review does not enable the shared scanner.
+
 The protected `/ops/cloud/retention` inspection and action routes are mounted only when
 `SOTTO_CLOUD_RETENTION_OPERATOR_TOKEN` is configured. Use a dedicated value of at least 32
 characters; do not reuse a billing, deployment, or metrics token. The surface returns fixed reason
 codes, counts, deadlines, and opaque job fingerprints. `hold`, `cancel`, and `retry_dry_run` never
 enable purge; an operator-supplied label is audit text, not an authenticated identity. A successful
-dry run is review evidence, not permission to delete data. This slice deliberately has no purge
-route or purge-worker switch.
+dry run is review evidence, not permission to delete data. The purge route and worker have a
+separate default-off gate: `SOTTO_CLOUD_RETENTION_PURGE_ENABLED=1`. They also require a distinct
+destructive operator token, a separate evidence HMAC key, and the exact running build SHA. The
+server binary embeds its build SHA, and startup rejects a runtime SHA that differs from that
+compiled identity. Published images embed the GitHub commit that built them. For a source build,
+set `SOTTO_BUILD_SHA` to the checked-out commit before building and set
+`SOTTO_CLOUD_RETENTION_BUILD_SHA` to the same value at runtime. A source build without embedded
+identity cannot mount or run purge controls. The server refuses incomplete configuration and
+non-Cloud deployment mode. Keep this switch off
+until the current retention policy, customer notices, exact candidate scope, backup and tombstone
+restore rehearsal have all been independently reviewed. Enabling it does not delete anything by
+itself: a reviewer must register signed restore evidence, inspect the opaque scope fingerprint,
+and approve the exact dry-run candidate. An `operator_hold` can be lifted only by explicitly
+approving the current scope with fresh restore evidence. Before each bounded batch the worker
+rechecks the live approval, scope, eligibility, notice and restore-evidence journal count. A
+successful batch adds tombstones, invalidates that approval, and holds the remaining work for a
+fresh restore rehearsal and approval. The destructive operator label is audit text, not an
+authenticated individual; use the credentials only through the protected operator channel and do
+not place them in logs or support messages.
+
+The signed request is produced offline from the matching backup and sidecar after restoring them
+to a dedicated local database. Name that database `retention_restore_<name>`, export its URL as
+`SOTTO_RETENTION_REHEARSAL_DATABASE_URL` (never pass it as a command-line argument), and materialise
+the evidence HMAC key from the secret store in a file readable only by the operator. From the exact
+release checkout, run:
+
+```sh
+scripts/retention-restore-rehearsal \
+  --backup ./sotto-<stamp>.dump \
+  --journal ./sotto-<stamp>.tombstones.jsonl \
+  --evidence-key-file ./retention-evidence.key \
+  --release-sha "$(git rev-parse HEAD)" \
+  --operator "<operator label>" \
+  --output ./restore-evidence-request.json
+```
+
+The command requires a local scratch database and key file mode `0600`; it validates the restored
+schema before and after replay, runs the matching sidecar twice, checks that the second replay is a
+no-op, and tests stale-incarnation guards against temporary rows in the scratch database. It writes
+the exact JSON body for `/ops/cloud/retention/purge/restore-evidence` with mode `0600`. Review and
+submit that body through the protected operator channel. The script does not contact the live
+service or register evidence itself; the evidence key must match the running build's configured
+key, and the release SHA must match that build.
 
 On a 1 GB host, give the kernel some headroom before the first start:
 
